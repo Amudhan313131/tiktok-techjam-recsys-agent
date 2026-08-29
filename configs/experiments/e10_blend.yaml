@@ -1,0 +1,4 @@
+normalization: percentile
+weights: [0.5, 0.5]
+inputs: [best_pairwise, best_tree_history]
+selection_split: shadow_only

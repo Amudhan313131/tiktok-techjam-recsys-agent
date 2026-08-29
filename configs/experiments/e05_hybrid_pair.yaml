@@ -1,0 +1,7 @@
+plugin: rex.models.rank_fm:RankFMPlugin
+k: 16
+lr: 0.001
+epochs: 8
+pair_batch_size: 4096
+negatives_per_positive: 3
+bce_weight: 0.05
