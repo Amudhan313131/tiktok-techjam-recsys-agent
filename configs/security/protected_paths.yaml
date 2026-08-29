@@ -1,0 +1,23 @@
+schema_version: "1.0"
+allow:
+  - src/rex/models/experimental/**
+  - src/rex/features/experimental/**
+  - src/rex/losses/experimental/**
+  - configs/experiments/**
+  - tests/experiments/**
+deny:
+  - kuairand-starter-kit/**
+  - configs/frozen/**
+  - configs/security/**
+  - src/rex/contracts.py
+  - src/rex/control/**
+  - src/rex/data/**
+  - src/rex/evaluation/**
+  - src/rex/agents/**
+  - src/rex/execution/artifacts.py
+  - src/rex/execution/patch_guard.py
+  - src/rex/store/**
+  - tests/security/**
+reject_symlinks: true
+reject_binary_patches: true
+reject_submodules: true

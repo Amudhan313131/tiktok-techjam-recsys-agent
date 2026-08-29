@@ -1,0 +1,8 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ExperimentProposal",
+  "description": "Generated authoritatively at runtime from rex.contracts.ExperimentProposal.",
+  "type": "object",
+  "required": ["experiment_id", "operator", "hypothesis", "mechanism", "primary_change", "files_to_change", "falsifier", "leakage_analysis", "estimated_seconds", "cheap_rung", "full_rung"],
+  "additionalProperties": true
+}

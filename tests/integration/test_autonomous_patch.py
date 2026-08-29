@@ -1,0 +1,103 @@
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+
+from rex.agents.coordinator import PatchTransactionCoordinator
+from rex.agents.patch_guard import PatchPolicy
+from rex.agents.provider import FakeProvider
+from rex.agents.services import CodingService, ProposalService
+from rex.contracts import ExperimentState
+from rex.control.budget import deadline_epoch_ms
+from rex.store.db import Database
+from rex.store.repository import ExperimentRepository
+
+
+HASH = "0" * 64
+
+
+def git(cwd: Path, *arguments: str) -> str:
+    result = subprocess.run(["git", *arguments], cwd=cwd, text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr
+    return result.stdout.strip()
+
+
+def test_agent_patch_transaction_commits_in_isolated_worktree(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    model = project / "src/rex/models/experimental/model.py"
+    fixture = project / "tests/fixture/test_smoke.py"
+    model.parent.mkdir(parents=True)
+    fixture.parent.mkdir(parents=True)
+    model.write_text("VALUE = 1\n", encoding="utf-8")
+    fixture.write_text("def test_smoke():\n    assert True\n", encoding="utf-8")
+    git(project, "init")
+    git(project, "config", "user.email", "rex@example.invalid")
+    git(project, "config", "user.name", "REX Fixture")
+    git(project, "add", "--all")
+    git(project, "commit", "-m", "fixture root")
+    parent = git(project, "rev-parse", "HEAD")
+
+    database = Database(tmp_path / "state.sqlite3")
+    database.initialize()
+    repository = ExperimentRepository(database)
+    repository.create_run(
+        run_id="run",
+        deadline_epoch_ms=deadline_epoch_ms(60),
+        root_commit=parent,
+        environment_sha256=HASH,
+        data_manifest_sha256=HASH,
+        evaluator_sha256=HASH,
+    )
+    proposal = {
+        "experiment_id": "accepted-patch",
+        "parent_id": None,
+        "operator": "HYPERPARAMETER",
+        "hypothesis": "Increasing the fixture value verifies isolated autonomous patching.",
+        "mechanism": "A declared one-line model edit traverses all preparation gates.",
+        "primary_change": "fixture value",
+        "files_to_change": ["src/rex/models/experimental/model.py"],
+        "expected_metric_effects": {"fixture": "pass"},
+        "falsifier": "Static or fixture command fails.",
+        "leakage_analysis": "The patch contains no data or target access.",
+        "estimated_seconds": 5,
+        "cheap_rung": {"fixture": True},
+        "full_rung": {"fixture": True},
+    }
+    patch = {
+        "patch": (
+            "--- a/src/rex/models/experimental/model.py\n"
+            "+++ b/src/rex/models/experimental/model.py\n"
+            "@@ -1 +1 @@\n"
+            "-VALUE = 1\n"
+            "+VALUE = 2\n"
+        ),
+        "rationale": "Exercises the accepted patch transaction.",
+        "tests": ["fixture value equals two"],
+    }
+    provider = FakeProvider([proposal, patch])
+    coordinator = PatchTransactionCoordinator(
+        repository=repository,
+        proposal_service=ProposalService(provider),
+        coding_service=CodingService(provider),
+        project_root=project,
+        worktree_root=tmp_path / "worktrees",
+        patch_policy=PatchPolicy(
+            allowed=("src/rex/models/experimental/**",),
+            denied=("src/rex/evaluation/**",),
+        ),
+        static_command=("python3", "-m", "compileall", "-q", "src"),
+        fixture_command=(
+            "python3",
+            "-c",
+            "from pathlib import Path; assert 'VALUE = 2' in Path('src/rex/models/experimental/model.py').read_text()",
+        ),
+    )
+    prepared = coordinator.prepare(
+        run_id="run",
+        parent_commit=parent,
+        proposal_context={"artifact_ids": []},
+        coding_context={"artifact_ids": []},
+    )
+    assert repository.get_experiment("accepted-patch")["state"] == ExperimentState.FIXTURE_VALID
+    assert git(prepared.workspace.root, "show", "HEAD:src/rex/models/experimental/model.py") == "VALUE = 2"
+    assert prepared.commit_sha != parent
