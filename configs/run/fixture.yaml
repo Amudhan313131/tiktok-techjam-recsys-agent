@@ -1,0 +1,30 @@
+schema_version: "1.0"
+execution_mode: fixture
+runs_dir: runs
+budget_config: configs/budget.yaml
+protected_paths: configs/security/protected_paths.yaml
+max_fixture_hypotheses: 3
+attempt_timeout_seconds: 30
+fixture_wall_clock_seconds: 900
+process_stale_after_seconds: 90
+fixture_full_threshold: 0.001
+inject_worker_nan_once: false
+inject_worker_nan_always_iteration: null
+
+llm:
+  mode: fixed
+  retries: 2
+  timeout_seconds: 180
+  max_output_tokens_per_call: 3000
+  codex_cli:
+    executable: codex
+    model: null
+  openai_api:
+    api_key_env: OPENAI_API_KEY
+    model_env: OPENAI_MODEL
+    store: false
+    max_calls_per_run: 60
+    max_total_tokens: 300000
+  auto:
+    provider_order: [codex_cli, openai_api, fixed]
+    allow_paid_api_fallback: false

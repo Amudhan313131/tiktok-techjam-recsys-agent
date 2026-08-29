@@ -1,0 +1,11 @@
+schema_version: "1.0"
+execution_mode: production_science_disabled
+benchmark_manifest: configs/frozen/benchmark.json
+starter_manifest: configs/frozen/starter_manifest.json
+protected_paths: configs/security/protected_paths.yaml
+budget_config: configs/budget.yaml
+data_dir: data/KuaiRand-Pure/data
+runs_dir: runs
+max_timeout_retries: 1
+active_branches: 3
+offline_provider: false
