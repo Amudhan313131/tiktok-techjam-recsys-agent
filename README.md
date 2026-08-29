@@ -96,7 +96,28 @@ codex login
 .venv/bin/python -m rex.cli run --llm codex_cli
 ```
 
-## LLM option 2: OpenAI API key
+## LLM option 2: your locally authenticated Claude CLI
+
+This uses `claude --print` through the installed Claude Code CLI. REX disables
+Claude tools, slash commands, Chrome, MCP servers, settings sources, and session
+persistence. Calls run from an empty temporary directory and require Claude's
+JSON Schema output.
+
+```bash
+# First log in if needed.
+claude auth login
+
+# Check installation/auth without making a live model request.
+.venv/bin/python -m rex.cli doctor --llm claude_cli
+
+# Make one explicit live structured health request.
+.venv/bin/python -m rex.cli doctor --llm claude_cli --live
+
+# Run the generated-fixture autopilot with Claude as the researcher.
+.venv/bin/python -m rex.cli run --llm claude_cli
+```
+
+## LLM option 3: OpenAI API key
 
 Secrets are read from environment variables only. An API key in YAML is
 rejected, error messages are redacted, API-side response storage is disabled,
@@ -113,8 +134,8 @@ export OPENAI_MODEL='your-available-model-id'
 .venv/bin/python -m rex.cli run --llm openai_api
 ```
 
-Automatic routing tries Codex first. Paid API fallback is off by default and
-must be explicitly enabled:
+Automatic routing tries Codex and then local Claude before the fixed provider.
+Paid OpenAI API fallback is off by default and must be explicitly enabled:
 
 ```bash
 .venv/bin/python -m rex.cli run \

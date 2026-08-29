@@ -16,7 +16,7 @@ Explicit exclusions:
 - no six-hour dress rehearsal;
 - no final test prediction or competition submission.
 
-## 1. Dual structured LLM providers
+## 1. Structured LLM providers
 
 Implement one `StructuredProvider` contract for proposal, patch, and diagnosis
 roles.
@@ -29,6 +29,14 @@ Codex CLI route:
 - kill the process group on timeout;
 - record bounded stdout/stderr, request ID, tokens, model, and elapsed time.
 
+Claude CLI route:
+
+- call locally authenticated `claude --print`;
+- require JSON Schema output and disable tools, slash commands, Chrome, MCP,
+  settings sources, and session persistence;
+- run from an empty temporary directory by default;
+- kill the process group on timeout and record bounded structured evidence.
+
 OpenAI API route:
 
 - read `OPENAI_API_KEY` and the model from environment variables only;
@@ -39,7 +47,7 @@ OpenAI API route:
 
 Routing:
 
-- support `codex_cli`, `openai_api`, `fixed`, and `auto` modes;
+- support `codex_cli`, `claude_cli`, `openai_api`, `fixed`, and `auto` modes;
 - retry a provider no more than two times after its first attempt;
 - keep paid API fallback disabled unless explicitly authorized;
 - persist fallback/degradation evidence without starting a new hypothesis.

@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from rex.agents.provider import (
+    ClaudeCLIProvider,
     CodexCLIProvider,
     CommandResult,
     FixedQueueProvider,
@@ -114,6 +115,13 @@ def test_provider_config_defaults_to_codex_without_paid_fallback() -> None:
     assert config.mode == "codex_cli"
     assert config.retries == 2
     assert not config.auto.allow_paid_api_fallback
+    assert config.auto.provider_order == (
+        "codex_cli",
+        "claude_cli",
+        "openai_api",
+        "fixed",
+    )
+    assert config.claude_cli.executable == "claude"
     assert config.openai_api.api_key_env == "OPENAI_API_KEY"
 
 
@@ -130,7 +138,7 @@ def test_provider_config_validates_auto_order_and_budgets() -> None:
             "mode": "auto",
             "openai_api": {"max_calls_per_run": 4, "max_total_tokens": 99},
             "auto": {
-                "provider_order": ["codex_cli", "openai_api", "fixed"],
+                "provider_order": ["codex_cli", "claude_cli", "openai_api", "fixed"],
                 "allow_paid_api_fallback": True,
             },
         }
@@ -232,6 +240,105 @@ def test_codex_cli_normalizes_timeout() -> None:
 
     with pytest.raises(ProviderTimeoutError) as raised:
         generate(CodexCLIProvider(command_runner=runner))
+    assert raised.value.retryable
+
+
+def test_claude_cli_uses_tool_free_ephemeral_structured_mode(tmp_path: Path) -> None:
+    observed: dict[str, Any] = {}
+
+    def runner(
+        args: list[str], input_text: str, timeout: float, working_directory: Path
+    ) -> CommandResult:
+        observed.update(
+            args=args,
+            input_text=input_text,
+            timeout=timeout,
+            working_directory=working_directory,
+        )
+        return CommandResult(
+            0,
+            json.dumps(
+                {
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": False,
+                    "structured_output": {"decision": "ship"},
+                    "session_id": "session_123",
+                    "usage": {"input_tokens": 13, "output_tokens": 5},
+                }
+            ),
+            "",
+            0.3,
+        )
+
+    response = generate(
+        ClaudeCLIProvider(
+            model="sonnet",
+            working_directory=tmp_path,
+            timeout_seconds=19,
+            command_runner=runner,
+        )
+    )
+
+    args = observed["args"]
+    assert args[:4] == ["claude", "--print", "--output-format", "json"]
+    assert json.loads(args[args.index("--json-schema") + 1]) == SCHEMA
+    assert args[args.index("--permission-mode") + 1] == "dontAsk"
+    assert args[args.index("--tools") + 1] == ""
+    assert args[args.index("--mcp-config") + 1] == '{"mcpServers":{}}'
+    assert args[args.index("--setting-sources") + 1] == ""
+    assert "--no-session-persistence" in args
+    assert "--disable-slash-commands" in args
+    assert observed["working_directory"] == tmp_path.resolve()
+    assert observed["timeout"] == 19
+    assert "system" in observed["input_text"]
+    assert response.value == {"decision": "ship"}
+    assert response.request_id == "session_123"
+    assert (response.input_tokens, response.output_tokens) == (13, 5)
+
+
+def test_claude_cli_defaults_to_empty_context_and_rejects_bad_schema() -> None:
+    observed_directory: Path | None = None
+
+    def safe_runner(
+        _: list[str], __: str, ___: float, working_directory: Path
+    ) -> CommandResult:
+        nonlocal observed_directory
+        observed_directory = working_directory
+        assert working_directory != Path.cwd().resolve()
+        assert list(working_directory.iterdir()) == []
+        return CommandResult(
+            0,
+            json.dumps({"structured_output": {"decision": "safe"}}),
+            "",
+            0.01,
+        )
+
+    assert generate(ClaudeCLIProvider(command_runner=safe_runner)).value == {
+        "decision": "safe"
+    }
+    assert observed_directory is not None
+
+    def bad_runner(
+        _: list[str], __: str, ___: float, ____: Path
+    ) -> CommandResult:
+        return CommandResult(
+            0,
+            json.dumps({"structured_output": {"wrong": "value"}}),
+            "",
+            0.01,
+        )
+
+    with pytest.raises(ProviderSchemaError):
+        generate(ClaudeCLIProvider(command_runner=bad_runner))
+
+
+def test_claude_cli_normalizes_timeout() -> None:
+    def runner(_: list[str], __: str, timeout: float, ___: Path) -> CommandResult:
+        raise subprocess.TimeoutExpired("claude", timeout)
+
+    with pytest.raises(ProviderTimeoutError) as raised:
+        generate(ClaudeCLIProvider(command_runner=runner))
     assert raised.value.retryable
 
 
@@ -344,35 +451,47 @@ def test_openai_budget_can_resume_and_fails_closed_on_oversized_response() -> No
     assert oversized.tokens_used > oversized.max_total_tokens
 
 
-def test_auto_mode_does_not_use_paid_api_without_explicit_permission() -> None:
+def test_auto_mode_prefers_local_claude_without_paid_api_permission() -> None:
     codex = AlwaysFailProvider(ProviderTimeoutError())
+    claude = CountingProvider("claude_cli")
     api = CountingProvider("openai_api")
     fixed = FixedQueueProvider([{"decision": "fixed"}])
     router = ProviderRouter(
-        {"codex_cli": codex, "openai_api": api, "fixed": fixed},
+        {
+            "codex_cli": codex,
+            "claude_cli": claude,
+            "openai_api": api,
+            "fixed": fixed,
+        },
         mode="auto",
         retries=0,
     )
     response = generate(router)
-    assert response.provider == "fixed"
-    assert response.fallback_chain == ("codex_cli", "fixed")
+    assert response.provider == "claude_cli"
+    assert response.fallback_chain == ("codex_cli", "claude_cli")
     assert api.calls == 0
     assert router.events[0]["type"] == "provider_degraded"
 
 
 def test_auto_mode_uses_paid_api_when_explicitly_enabled() -> None:
     codex = AlwaysFailProvider(ProviderExecutionError("offline", code="offline"))
+    claude = AlwaysFailProvider(ProviderExecutionError("offline", code="offline"))
     api = CountingProvider("openai_api")
     fixed = CountingProvider("fixed")
     router = ProviderRouter(
-        {"codex_cli": codex, "openai_api": api, "fixed": fixed},
+        {
+            "codex_cli": codex,
+            "claude_cli": claude,
+            "openai_api": api,
+            "fixed": fixed,
+        },
         mode="auto",
         retries=0,
         allow_paid_api_fallback=True,
     )
     response = generate(router)
     assert response.provider == "openai_api"
-    assert response.fallback_chain == ("codex_cli", "openai_api")
+    assert response.fallback_chain == ("codex_cli", "claude_cli", "openai_api")
     assert api.calls == 1
     assert fixed.calls == 0
 

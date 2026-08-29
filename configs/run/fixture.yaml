@@ -19,6 +19,9 @@ llm:
   codex_cli:
     executable: codex
     model: null
+  claude_cli:
+    executable: claude
+    model: null
   openai_api:
     api_key_env: OPENAI_API_KEY
     model_env: OPENAI_MODEL
@@ -26,5 +29,5 @@ llm:
     max_calls_per_run: 60
     max_total_tokens: 300000
   auto:
-    provider_order: [codex_cli, openai_api, fixed]
+    provider_order: [codex_cli, claude_cli, openai_api, fixed]
     allow_paid_api_fallback: false

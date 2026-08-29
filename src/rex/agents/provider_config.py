@@ -7,13 +7,20 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-_MODES = {"codex_cli", "openai_api", "auto", "fixed"}
-_AUTO_PROVIDERS = {"codex_cli", "openai_api", "fixed"}
+_MODES = {"codex_cli", "claude_cli", "openai_api", "auto", "fixed"}
+_AUTO_PROVIDERS = {"codex_cli", "claude_cli", "openai_api", "fixed"}
 
 
 @dataclass(frozen=True)
 class CodexCLIConfig:
     executable: str = "codex"
+    model: str | None = None
+    working_directory: Path | None = None
+
+
+@dataclass(frozen=True)
+class ClaudeCLIConfig:
+    executable: str = "claude"
     model: str | None = None
     working_directory: Path | None = None
 
@@ -29,7 +36,12 @@ class OpenAIAPIConfig:
 
 @dataclass(frozen=True)
 class AutoProviderConfig:
-    provider_order: tuple[str, ...] = ("codex_cli", "openai_api", "fixed")
+    provider_order: tuple[str, ...] = (
+        "codex_cli",
+        "claude_cli",
+        "openai_api",
+        "fixed",
+    )
     allow_paid_api_fallback: bool = False
 
 
@@ -41,6 +53,7 @@ class ProviderConfig:
     max_output_tokens_per_call: int = 3000
     retry_backoff_seconds: float = 0.0
     codex_cli: CodexCLIConfig = field(default_factory=CodexCLIConfig)
+    claude_cli: ClaudeCLIConfig = field(default_factory=ClaudeCLIConfig)
     openai_api: OpenAIAPIConfig = field(default_factory=OpenAIAPIConfig)
     auto: AutoProviderConfig = field(default_factory=AutoProviderConfig)
 
@@ -58,6 +71,7 @@ def load_provider_config(value: Mapping[str, Any] | None) -> ProviderConfig:
             "max_output_tokens_per_call",
             "retry_backoff_seconds",
             "codex_cli",
+            "claude_cli",
             "openai_api",
             "auto",
         },
@@ -74,6 +88,23 @@ def load_provider_config(value: Mapping[str, Any] | None) -> ProviderConfig:
         executable=str(codex_raw.get("executable", "codex")),
         model=_optional_string(codex_raw.get("model")),
         working_directory=Path(working_directory).expanduser() if working_directory else None,
+    )
+
+    claude_raw = _mapping(raw.get("claude_cli"), "llm.claude_cli")
+    _reject_unknown(
+        claude_raw,
+        {"executable", "model", "working_directory"},
+        "llm.claude_cli",
+    )
+    claude_working_directory = claude_raw.get("working_directory")
+    claude = ClaudeCLIConfig(
+        executable=str(claude_raw.get("executable", "claude")),
+        model=_optional_string(claude_raw.get("model")),
+        working_directory=(
+            Path(claude_working_directory).expanduser()
+            if claude_working_directory
+            else None
+        ),
     )
 
     openai_raw = _mapping(raw.get("openai_api"), "llm.openai_api")
@@ -107,7 +138,9 @@ def load_provider_config(value: Mapping[str, Any] | None) -> ProviderConfig:
 
     auto_raw = _mapping(raw.get("auto"), "llm.auto")
     _reject_unknown(auto_raw, {"provider_order", "allow_paid_api_fallback"}, "llm.auto")
-    provider_order_value = auto_raw.get("provider_order", ("codex_cli", "openai_api", "fixed"))
+    provider_order_value = auto_raw.get(
+        "provider_order", ("codex_cli", "claude_cli", "openai_api", "fixed")
+    )
     if not isinstance(provider_order_value, (list, tuple)):
         raise ValueError("llm.auto.provider_order must be a list")
     provider_order = tuple(str(item) for item in provider_order_value)
@@ -138,6 +171,7 @@ def load_provider_config(value: Mapping[str, Any] | None) -> ProviderConfig:
         max_output_tokens_per_call=max_output_tokens,
         retry_backoff_seconds=retry_backoff,
         codex_cli=codex,
+        claude_cli=claude,
         openai_api=openai,
         auto=auto,
     )

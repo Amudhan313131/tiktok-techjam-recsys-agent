@@ -97,6 +97,7 @@ class CommandResult:
 
 
 CommandRunner = Callable[[list[str], str, float], CommandResult]
+DirectoryCommandRunner = Callable[[list[str], str, float, Path], CommandResult]
 ClientFactory = Callable[..., Any]
 
 
@@ -321,6 +322,112 @@ class CodexCLIProvider:
             )
 
 
+class ClaudeCLIProvider:
+    """Structured provider backed by a locally authenticated ``claude -p``."""
+
+    def __init__(
+        self,
+        *,
+        executable: str = "claude",
+        model: str | None = None,
+        working_directory: str | Path | None = None,
+        timeout_seconds: float = 180.0,
+        max_output_tokens: int = 3000,
+        command_runner: DirectoryCommandRunner | None = None,
+    ):
+        self.executable = executable
+        self.model = model
+        self.working_directory = (
+            None if working_directory is None else Path(working_directory).resolve()
+        )
+        self.timeout_seconds = timeout_seconds
+        # Claude Code does not expose a portable output-token ceiling in print mode.
+        self.max_output_tokens = max_output_tokens
+        self._command_runner = command_runner or _run_command_in_directory
+
+    def generate(
+        self,
+        *,
+        role: str,
+        system: str,
+        prompt: str,
+        schema: dict[str, Any],
+    ) -> ProviderResponse:
+        started = time.monotonic()
+        with tempfile.TemporaryDirectory(prefix="rex-claude-") as temporary_directory:
+            temp = Path(temporary_directory)
+            working_directory = self.working_directory or temp
+            args = [
+                self.executable,
+                "--print",
+                "--output-format",
+                "json",
+                "--json-schema",
+                _canonical_json(schema),
+                "--permission-mode",
+                "dontAsk",
+                "--tools",
+                "",
+                "--disable-slash-commands",
+                "--no-session-persistence",
+                "--no-chrome",
+                "--strict-mcp-config",
+                "--mcp-config",
+                '{"mcpServers":{}}',
+                "--setting-sources",
+                "",
+            ]
+            if self.model:
+                args.extend(["--model", self.model])
+            input_text = (
+                f"{system.strip()}\n\n"
+                f"Return only the required structured {role} object.\n\n{prompt}"
+            )
+            try:
+                result = self._command_runner(
+                    args, input_text, self.timeout_seconds, working_directory
+                )
+            except (subprocess.TimeoutExpired, TimeoutError) as error:
+                raise ProviderTimeoutError() from error
+            except OSError as error:
+                raise ProviderExecutionError(
+                    f"could not execute Claude CLI: {type(error).__name__}",
+                    code="cli_unavailable",
+                    retryable=False,
+                ) from error
+
+            safe_stdout = redact_secrets(result.stdout)
+            safe_stderr = redact_secrets(result.stderr)
+            if result.returncode != 0:
+                message = _bounded_error(safe_stderr or "Claude CLI exited unsuccessfully")
+                raise ProviderExecutionError(
+                    message,
+                    code="cli_exit",
+                    retryable=_claude_failure_is_retryable(result.stderr),
+                )
+            envelope = _claude_envelope(result.stdout)
+            if envelope.get("is_error") is True:
+                raise ProviderExecutionError(
+                    _bounded_error(str(envelope.get("result") or "Claude CLI failed")),
+                    code="cli_result_error",
+                    retryable=_claude_failure_is_retryable(str(envelope.get("result", ""))),
+                )
+            value = _claude_structured_value(envelope, schema)
+            input_tokens, output_tokens, request_id = _claude_metadata(envelope)
+            return ProviderResponse(
+                value=value,
+                provider="claude_cli",
+                model=self.model or str(envelope.get("model") or "claude-configured-default"),
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                request_id=request_id,
+                wall_seconds=result.wall_seconds or (time.monotonic() - started),
+                raw_response=_canonical_json(value),
+                stdout=safe_stdout,
+                stderr=safe_stderr,
+            )
+
+
 class OpenAIResponsesProvider:
     """OpenAI Responses API adapter using an environment-supplied API key."""
 
@@ -473,12 +580,17 @@ class ProviderRouter:
         *,
         mode: str = "codex_cli",
         retries: int = 2,
-        provider_order: tuple[str, ...] = ("codex_cli", "openai_api", "fixed"),
+        provider_order: tuple[str, ...] = (
+            "codex_cli",
+            "claude_cli",
+            "openai_api",
+            "fixed",
+        ),
         allow_paid_api_fallback: bool = False,
         backoff_seconds: float = 0.0,
         sleeper: Callable[[float], None] = time.sleep,
     ):
-        if mode not in {"codex_cli", "openai_api", "auto", "fixed"}:
+        if mode not in {"codex_cli", "claude_cli", "openai_api", "auto", "fixed"}:
             raise ProviderConfigurationError(f"unsupported provider mode {mode!r}")
         if retries < 0:
             raise ProviderConfigurationError("provider retries must be non-negative")
@@ -498,6 +610,7 @@ class ProviderRouter:
         *,
         fixed_provider: StructuredProvider | None = None,
         codex_command_runner: CommandRunner | None = None,
+        claude_command_runner: DirectoryCommandRunner | None = None,
         openai_client_factory: ClientFactory | None = None,
         environ: Mapping[str, str] | None = None,
         initial_openai_calls: int = 0,
@@ -511,6 +624,14 @@ class ProviderRouter:
                 timeout_seconds=config.timeout_seconds,
                 max_output_tokens=config.max_output_tokens_per_call,
                 command_runner=codex_command_runner,
+            ),
+            "claude_cli": ClaudeCLIProvider(
+                executable=config.claude_cli.executable,
+                model=config.claude_cli.model,
+                working_directory=config.claude_cli.working_directory,
+                timeout_seconds=config.timeout_seconds,
+                max_output_tokens=config.max_output_tokens_per_call,
+                command_runner=claude_command_runner,
             ),
             "openai_api": OpenAIResponsesProvider(
                 model=config.openai_api.model,
@@ -605,7 +726,7 @@ class ProviderRouter:
     def _route(self) -> tuple[str, ...]:
         if self.mode == "fixed":
             return ("fixed",)
-        if self.mode in {"codex_cli", "openai_api"}:
+        if self.mode in {"codex_cli", "claude_cli", "openai_api"}:
             return (self.mode,)
         route: list[str] = []
         for provider_name in self.provider_order:
@@ -633,6 +754,12 @@ def redact_secrets(text: str, *secrets: str | None) -> str:
 
 
 def _run_command(args: list[str], input_text: str, timeout_seconds: float) -> CommandResult:
+    return _run_command_in_directory(args, input_text, timeout_seconds, Path.cwd())
+
+
+def _run_command_in_directory(
+    args: list[str], input_text: str, timeout_seconds: float, working_directory: Path
+) -> CommandResult:
     started = time.monotonic()
     process = subprocess.Popen(  # noqa: S603 - exact executable is operator configuration
         args,
@@ -641,6 +768,7 @@ def _run_command(args: list[str], input_text: str, timeout_seconds: float) -> Co
         stderr=subprocess.PIPE,
         text=True,
         start_new_session=True,
+        cwd=working_directory,
     )
     try:
         stdout, stderr = process.communicate(input_text, timeout=timeout_seconds)
@@ -716,6 +844,39 @@ def _codex_metadata(stdout: str) -> tuple[int, int, str | None]:
     return input_tokens, output_tokens, request_id
 
 
+def _claude_envelope(stdout: str) -> dict[str, Any]:
+    try:
+        envelope = json.loads(stdout)
+    except (json.JSONDecodeError, TypeError) as error:
+        raise ProviderSchemaError("Claude CLI returned invalid JSON") from error
+    if not isinstance(envelope, dict):
+        raise ProviderSchemaError("Claude CLI response envelope must be a JSON object")
+    return envelope
+
+
+def _claude_structured_value(
+    envelope: dict[str, Any], schema: dict[str, Any]
+) -> dict[str, Any]:
+    value = envelope.get("structured_output")
+    if isinstance(value, dict):
+        _validate_value(value, schema)
+        return value
+    result = envelope.get("result")
+    if isinstance(result, str):
+        return _parse_and_validate(result, schema)
+    raise ProviderSchemaError("Claude CLI did not return structured_output")
+
+
+def _claude_metadata(envelope: dict[str, Any]) -> tuple[int, int, str | None]:
+    usage = envelope.get("usage")
+    if not isinstance(usage, dict):
+        usage = {}
+    input_tokens = int(usage.get("input_tokens", 0) or 0)
+    output_tokens = int(usage.get("output_tokens", 0) or 0)
+    request_id = envelope.get("session_id") or envelope.get("request_id")
+    return input_tokens, output_tokens, None if request_id is None else str(request_id)
+
+
 def _openai_usage(response: Any) -> tuple[int, int, int]:
     usage = getattr(response, "usage", None)
     input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
@@ -752,6 +913,22 @@ def _classify_openai_error(error: Exception, api_key: str | None) -> ProviderErr
 def _codex_failure_is_retryable(stderr: str) -> bool:
     lowered = stderr.lower()
     transient_terms = ("timeout", "timed out", "rate limit", "429", "temporar", "connection")
+    return any(term in lowered for term in transient_terms) or bool(
+        re.search(r"\b5\d\d\b", lowered)
+    )
+
+
+def _claude_failure_is_retryable(message: str) -> bool:
+    lowered = message.lower()
+    transient_terms = (
+        "timeout",
+        "timed out",
+        "rate limit",
+        "overloaded",
+        "429",
+        "temporar",
+        "connection",
+    )
     return any(term in lowered for term in transient_terms) or bool(
         re.search(r"\b5\d\d\b", lowered)
     )

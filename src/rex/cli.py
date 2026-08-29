@@ -124,6 +124,50 @@ def _llm_doctor(args: argparse.Namespace) -> dict[str, object] | None:
         }
         if args.llm == "codex_cli" and not (compatible and authenticated):
             checks["ok"] = False
+    if args.llm in {"claude_cli", "auto"}:
+        executable = shutil.which(config.claude_cli.executable)
+        compatible = False
+        authenticated = False
+        if executable is not None:
+            try:
+                probe = subprocess.run(
+                    [executable, "--help"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                required_flags = (
+                    "--print",
+                    "--output-format",
+                    "--json-schema",
+                    "--no-session-persistence",
+                    "--tools",
+                )
+                compatible = probe.returncode == 0 and all(
+                    flag in probe.stdout for flag in required_flags
+                )
+                auth_probe = subprocess.run(
+                    [executable, "auth", "status"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                auth_status = json.loads(auth_probe.stdout) if auth_probe.returncode == 0 else {}
+                authenticated = bool(
+                    isinstance(auth_status, dict) and auth_status.get("loggedIn") is True
+                )
+            except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+                compatible = False
+        checks["claude_cli"] = {
+            "executable": executable,
+            "available": executable is not None,
+            "noninteractive_flags_compatible": compatible,
+            "authenticated": authenticated,
+        }
+        if args.llm == "claude_cli" and not (compatible and authenticated):
+            checks["ok"] = False
     if args.llm in {"openai_api", "auto"}:
         try:
             sdk_version = importlib.metadata.version("openai")
@@ -330,7 +374,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="rex")
     sub = parser.add_subparsers(dest="command", required=True)
     doctor = sub.add_parser("doctor", help="verify frozen contracts and local prerequisites")
-    doctor.add_argument("--llm", choices=["codex_cli", "openai_api", "auto", "fixed"])
+    doctor.add_argument(
+        "--llm", choices=["codex_cli", "claude_cli", "openai_api", "auto", "fixed"]
+    )
     doctor.add_argument("--live", action="store_true", help="perform an explicit live LLM call")
     doctor.add_argument("--tree", action="store_true", help="run the synthetic LightGBM doctor")
     doctor.add_argument("--config", type=Path, default=root / "configs/run/fixture.yaml")
@@ -338,11 +384,13 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="run or resume the fixture-only autonomous loop")
     run.add_argument("--config", type=Path, default=root / "configs/run/fixture.yaml")
     run.add_argument("--resume", metavar="RUN_ID")
-    run.add_argument("--llm", choices=["codex_cli", "openai_api", "auto", "fixed"])
+    run.add_argument(
+        "--llm", choices=["codex_cli", "claude_cli", "openai_api", "auto", "fixed"]
+    )
     run.add_argument(
         "--allow-paid-api-fallback",
         action="store_true",
-        help="allow auto mode to fall back from Codex CLI to the paid OpenAI API",
+        help="allow auto mode to fall back from local CLIs to the paid OpenAI API",
     )
     run.set_defaults(handler=command_run)
     status = sub.add_parser("status", help="show durable fixture-run state")
