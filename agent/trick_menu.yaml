@@ -1,0 +1,113 @@
+# The Trick Menu
+#
+# This is the domain knowledge that turns a generic code-mutation agent into a
+# recsys specialist. The LLM does NOT invent moves from scratch — it selects
+# from this menu, guided by diagnosis_rules below, which map observed
+# symptoms to candidate moves.
+#
+# Target label: long_view (NOT click). Metrics: GAUC + nDCG@5, averaged into
+# "primary". Reference anchors on hidden test: random=0.4753, popularity-only
+# =0.5715, official baseline=0.5946, ceiling=0.8645 (NOT 1.0).
+
+moves:
+  feature:
+    - id: feature_crossing
+      description: >
+        Combine two features (e.g. user_activity_level x video_category) so the
+        model can learn interactions, not just individual signals.
+      cost: low
+
+    - id: sequence_features
+      description: >
+        Encode the user's last N interactions (video categories, long_view
+        history) as a feature, not just static user/item IDs. Strong general
+        signal but weak for cold users with little history.
+      cost: medium
+
+    - id: embedding_size_search
+      description: >
+        Sweep embedding dimension for user/item IDs (organizer baseline uses
+        k=16). Larger embeddings capture more nuance but risk overfitting on
+        sparse IDs; smaller trains faster and generalizes better on rare IDs.
+      cost: low
+
+  model:
+    - id: deepfm_crossing_layer
+      description: >
+        Add an automatic feature-crossing layer (FM/DeepFM-style) instead of
+        hand-picked crosses. Use when manual feature_crossing attempts show
+        promise but more useful combinations likely exist than can be
+        hand-enumerated.
+      cost: medium
+
+    - id: multitask_mmoe
+      description: >
+        Train on multiple KuaiRand feedback signals jointly (click, like,
+        follow, play_time, etc.) with long_view as the scored primary task and
+        the rest as auxiliary tasks, using a Mixture-of-Experts architecture
+        with shared + task-specific experts. Note long_view is logged on every
+        impression (not just clicked ones), so classic sample-selection bias
+        does not apply here — this is purely about exploiting correlated
+        signals. Watch for the seesaw problem (see diagnosis_rules).
+      cost: high
+
+    - id: censored_watchtime_loss
+      description: >
+        Advanced/bonus move, explicitly referenced by the organizers (CWM,
+        KDD 2024): a completed play means true watch time was truncated by
+        video length, so a one-sided (censored-regression) loss can model
+        watch time more faithfully than squared error. Optional — pursue only
+        after the core moves above show diminishing returns, since it's the
+        most implementation-heavy option and the paper's reference code
+        requires an old torch version and reports different metrics
+        (nDCG@1/3/5 on a rebuilt label) — treat it as inspiration for a loss
+        function, not a drop-in.
+      cost: high
+
+  training:
+    - id: class_weighting_longview
+      description: >
+        Rebalance or downweight the dominant "not long_view" class if
+        long_view turns out to be as imbalanced as click typically is in this
+        kind of data. Check EDA first — don't assume the imbalance ratio.
+      cost: low
+
+    - id: hyperparameter_tuning
+      description: >
+        Standard learning rate / regularization sweep. Lowest priority — only
+        pursue after feature/model-side moves show diminishing returns.
+      cost: low
+
+# Diagnosis rules: observed symptom -> recommended move(s) to try next.
+# Anchored against the real reference numbers so evidence is specific, not vague.
+diagnosis_rules:
+  - symptom: "model predicts 'not long_view' for nearly all examples; accuracy high but recall near zero"
+    suggest: [class_weighting_longview]
+
+  - symptom: "many users/items have very little interaction history (cold start)"
+    suggest: [feature_crossing]
+    avoid: [sequence_features]  # weak signal for cold users specifically
+
+  - symptom: "auxiliary signals (click, like, follow) are strongly correlated with long_view in EDA"
+    suggest: [multitask_mmoe]
+
+  - symptom: "after adding multitask_mmoe, auxiliary task metrics rose but primary (long_view) score fell"
+    suggest: [multitask_mmoe]  # revisit with more task-specific expert capacity
+    phenomenon: seesaw_problem
+
+  - symptom: "score improved sharply on 5% dev_mode sample but barely moved on full run"
+    phenomenon: feature_sparsity
+    suggest: [embedding_size_search]
+
+  - symptom: "primary score is only marginally above 0.5715 (the popularity-only reference)"
+    phenomenon: popularity_bias
+    suggest: [feature_crossing, multitask_mmoe]
+    note: "model may just be riding item popularity rather than personalizing — check ranking correlation with raw popularity"
+
+  - symptom: "GAUC improved but nDCG@5 dropped (or vice versa) between iterations"
+    phenomenon: seesaw_problem
+    note: "metric-level seesaw, distinct from the task-level seesaw above — the model may be trading off overall ranking quality against top-5 precision"
+
+  - symptom: "validation primary score plateaued for multiple iterations across several move categories"
+    suggest: [hyperparameter_tuning]
+    note: "last resort — only after feature/model moves are exhausted"

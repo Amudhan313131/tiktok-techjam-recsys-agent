@@ -1,0 +1,5 @@
+anthropic>=0.40.0
+numpy
+pandas
+pyyaml
+jsonschema

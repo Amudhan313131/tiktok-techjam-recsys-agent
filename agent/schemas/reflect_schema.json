@@ -1,0 +1,53 @@
+{
+  "name": "recsys_reflection",
+  "description": "Structured diagnosis of the last training iteration's result. Forces the agent to name a real recsys phenomenon with evidence, rather than giving vague free-text reflection.",
+  "input_schema": {
+    "type": "object",
+    "properties": {
+      "recsys_phenomenon_identified": {
+        "type": "string",
+        "enum": [
+          "seesaw_problem",
+          "popularity_bias",
+          "cold_start_failure",
+          "feature_sparsity",
+          "sample_selection_bias",
+          "overfitting",
+          "underfitting",
+          "no_clear_phenomenon",
+          "other"
+        ],
+        "description": "The named phenomenon best explaining this iteration's result. Use 'other' only if none of the above fit, and explain in notes."
+      },
+      "evidence": {
+        "type": "string",
+        "description": "The specific metric evidence supporting this diagnosis, e.g. 'GAUC +0.006, nDCG@5 -0.011, primary 0.601 vs popularity-only anchor 0.5715'. Must reference actual GAUC/nDCG@5/primary numbers from this run, anchored against the known reference points (random=0.4753, popularity=0.5715, baseline=0.5946, ceiling=0.8645) where relevant — not general reasoning."
+      },
+      "confidence": {
+        "type": "string",
+        "enum": ["low", "medium", "high"],
+        "description": "How confident the diagnosis is given the evidence available."
+      },
+      "notes": {
+        "type": "string",
+        "description": "Free text. Required and must explain the phenomenon if 'other' or 'no_clear_phenomenon' was selected. Optional otherwise."
+      },
+      "next_action": {
+        "type": "string",
+        "description": "The specific next move to try from the trick menu, and why it follows from this diagnosis."
+      },
+      "next_action_category": {
+        "type": "string",
+        "enum": ["feature", "model", "training", "abandon_branch"],
+        "description": "Which part of the trick menu the next action pulls from."
+      }
+    },
+    "required": [
+      "recsys_phenomenon_identified",
+      "evidence",
+      "confidence",
+      "next_action",
+      "next_action_category"
+    ]
+  }
+}

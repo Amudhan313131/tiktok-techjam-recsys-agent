@@ -1,0 +1,24 @@
+# Hard caps, matching the official problem statement exactly.
+# This benchmark is CPU-only (numpy baseline runs in ~40s on one core) so
+# there is no GPU budget to track — wall-clock and tokens are what's scored.
+
+max_iterations: 50               # hard cap per the spec
+max_wall_clock_seconds: 21600    # 6 hours — official backstop
+
+# Convergence rule (separate from the hard caps above) — exact numbers from
+# the problem statement, not approximated. See docs/spec.md section 3 for
+# the full plateau-tracker vs best-ever-tracker distinction.
+convergence:
+  epsilon: 0.002    # min primary-score improvement to NOT count as plateaued
+  patience_n: 3      # consecutive non-improving iterations before declaring converged
+
+# Feasibility is reported, not capped, on tokens — but keep a dead-man's-switch
+# ceiling anyway so an LLM loop bug can't run away unattended overnight.
+max_tokens_total: 1500000
+
+# Stage 5 subprocess timeout, per training run attempt. Single-core numpy
+# baseline finishes in well under a minute, so this is generous, not tight.
+training_timeout_seconds: 300
+
+# Heartbeat gap that flags a likely-unlogged restart (see agent/state.py)
+restart_gap_threshold_seconds: 300

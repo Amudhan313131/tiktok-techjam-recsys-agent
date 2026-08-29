@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+data/
+logs/*.json
+logs/iterations/
+logs/checkpoints/
+logs/run_console.log
+*.ckpt
+.ipynb_checkpoints/
