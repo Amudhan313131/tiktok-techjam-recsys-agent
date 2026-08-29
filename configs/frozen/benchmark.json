@@ -1,0 +1,49 @@
+{
+  "schema_version": "1.0",
+  "dataset": "KuaiRand-Pure",
+  "task": "within-user ranking over logged impressions",
+  "label": "long_view",
+  "metrics": ["GAUC", "nDCG@5"],
+  "primary_formula": "(GAUC + nDCG@5) / 2",
+  "splits": {
+    "train": {"split_start": 20220408, "split_end": 20220421, "observed_date_min": 20220409, "observed_date_max": 20220421, "rows": 1141112},
+    "valid": {"split_start": 20220422, "split_end": 20220428, "observed_date_min": 20220422, "observed_date_max": 20220428, "rows": 124909},
+    "test": {"split_start": 20220429, "split_end": 20220508, "observed_date_min": 20220429, "observed_date_max": 20220508, "rows": 170588}
+  },
+  "references": {
+    "valid": {
+      "random": {"GAUC": 0.4993, "nDCG@5": 0.4675, "primary": 0.4834},
+      "item_popularity": {"GAUC": 0.6387, "nDCG@5": 0.5227, "primary": 0.5807},
+      "fm": {"GAUC": 0.6674, "nDCG@5": 0.5357, "primary": 0.6016},
+      "oracle": {"GAUC": 1.0, "nDCG@5": 0.6968, "primary": 0.8484}
+    },
+    "published_hidden_test": {
+      "random": {"GAUC": 0.4996, "nDCG@5": 0.4511, "primary": 0.4753},
+      "item_popularity": {"GAUC": 0.6308, "nDCG@5": 0.5121, "primary": 0.5715},
+      "fm": {"GAUC": 0.6610, "nDCG@5": 0.5282, "primary": 0.5946},
+      "oracle": {"GAUC": 1.0, "nDCG@5": 0.7289, "primary": 0.8645}
+    }
+  },
+  "limits": {
+    "max_hypotheses": 50,
+    "max_official_evaluations": 50,
+    "wall_clock_seconds": 21600,
+    "finalization_reserve_seconds": 1200,
+    "convergence_epsilon": 0.002,
+    "convergence_patience": 3
+  },
+  "submission_header": ["row_id", "user_id", "video_id", "score"],
+  "forbidden_inference_columns": [
+    "long_view",
+    "play_time_ms",
+    "is_click",
+    "is_like",
+    "is_follow",
+    "is_comment",
+    "is_forward",
+    "is_hate",
+    "profile_stay_time",
+    "comment_stay_time",
+    "is_profile_enter"
+  ]
+}

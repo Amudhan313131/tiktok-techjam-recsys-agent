@@ -1,6 +1,12 @@
 # Autonomous ML Research Agent for Recommender Systems
 ## Final Product Spec — Team of 2 (v2, matches official spec update)
 
+> **Archived design note.** This document predates the repository-wide audit and
+> contains superseded compute, autonomy, and convergence assumptions. The runtime
+> authority is [`task_contract.md`](task_contract.md); the current build sequence
+> is [`implementation_plan.md`](implementation_plan.md). Do not use this file as
+> an execution contract.
+
 ---
 
 ## 1. What we're building, in one sentence
