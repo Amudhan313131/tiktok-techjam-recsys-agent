@@ -1122,6 +1122,9 @@ class R3Envelope:
             "request_sha256=m['request_sha256'],execution_sha256=m['execution_sha256']); "
             "print(json.dumps(r))"
         )
+        environment = dict(os.environ)
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        environment["PYTHONPATH"] = str(self.clone / "src")
         for lease_path in sorted(run_dir.glob("**/worker_lease.json")):
             try:
                 marker = _read_json(lease_path)
@@ -1136,6 +1139,7 @@ class R3Envelope:
             result = subprocess.run(
                 [self._python(), "-c", helper, str(lease_path)],
                 cwd=self.clone,
+                env=environment,
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,

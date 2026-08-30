@@ -312,6 +312,58 @@ def test_controlled_failure_kills_only_verified_lease_owner_once(tmp_path: Path)
         os.kill(process.pid, 0)
 
 
+def test_failure_cleanup_imports_recovery_code_from_clean_clone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    data = tmp_path / "data"
+    source.joinpath("src").mkdir(parents=True)
+    data.mkdir()
+    envelope = R3Envelope(
+        R3Options(
+            source,
+            "HEAD",
+            data,
+            tmp_path / "output",
+            "codex_cli",
+            run_id="r3-cleanup",
+            wall_clock_seconds=60,
+            finalization_reserve_seconds=10,
+            skip_dependency_install=True,
+        )
+    )
+    envelope.clone = source
+    lease = envelope.runs / envelope.run_id / "attempt" / "worker_lease.json"
+    lease.parent.mkdir(parents=True)
+    lease.write_text(
+        json.dumps(
+            {
+                "state": "active",
+                "request_sha256": "a" * 64,
+                "execution_sha256": "b" * 64,
+            }
+        ),
+        encoding="utf-8",
+    )
+    invocation: dict[str, object] = {}
+
+    def run(command, **kwargs):
+        invocation["command"] = command
+        invocation.update(kwargs)
+        return subprocess.CompletedProcess(command, 0, '{"outcome":"recovered"}\n', "")
+
+    monkeypatch.setattr(rehearsal_clean.subprocess, "run", run)
+
+    recovered = envelope._recover_active_workers()
+
+    environment = invocation["env"]
+    assert isinstance(environment, dict)
+    assert environment["PYTHONPATH"] == str(source / "src")
+    assert environment["PYTHONDONTWRITEBYTECODE"] == "1"
+    assert invocation["cwd"] == source
+    assert recovered[0]["return_code"] == 0
+
+
 def test_pre_injection_recovery_accepts_fixture_valid_progress_and_rejects_loops(
     tmp_path: Path,
 ) -> None:
