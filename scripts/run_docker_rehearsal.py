@@ -244,8 +244,8 @@ class Supervisor:
             if os.environ.get(key):
                 arguments.extend(("--env", key))
         for host_path, target in (
-            (self.args.codex_home, "/tmp/rex-home/.codex"),
-            (self.args.claude_home, "/tmp/rex-home/.claude"),
+            (self.args.codex_home, "/run/rex-auth/codex"),
+            (self.args.claude_home, "/run/rex-auth/claude"),
         ):
             if host_path:
                 arguments.extend(

@@ -135,3 +135,14 @@ def test_controller_environment_resolves_exact_id_with_stable_session_host(
     assert environment["REX_CONTROLLER_CONTAINER_ID"] == full_id
     assert environment["REX_CONTROLLER_ID"] == full_id
     assert environment["REX_PROCESS_SESSION_HOST"] == "stable-rehearsal-controller"
+
+
+def test_docker_rehearsal_keeps_read_only_auth_mounts_outside_cli_home() -> None:
+    rehearsal = (Path(__file__).resolve().parents[2] / "scripts/run_docker_rehearsal.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert '(self.args.codex_home, "/run/rex-auth/codex")' in rehearsal
+    assert '(self.args.claude_home, "/run/rex-auth/claude")' in rehearsal
+    assert '(self.args.codex_home, "/tmp/rex-home/.codex")' not in rehearsal
+    assert '(self.args.claude_home, "/tmp/rex-home/.claude")' not in rehearsal
