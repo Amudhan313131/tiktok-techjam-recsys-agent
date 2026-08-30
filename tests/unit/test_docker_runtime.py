@@ -163,7 +163,7 @@ class FakeDockerClient:
                     "Type": "local",
                     "Config": {
                         "compress": "true",
-                        "max-file": "1",
+                        "max-file": "2",
                         "max-size": str(request.log_bytes_limit),
                     },
                 },
@@ -621,10 +621,10 @@ def test_runtime_verifies_bounded_logs_fsize_and_resource_labels(tmp_path: Path)
     }["fsize"] == (4 * 1024 * 1024, 4 * 1024 * 1024)
     assert inspection["HostConfig"]["LogConfig"] == {
         "Type": "local",
-        "Config": {"compress": "true", "max-file": "1", "max-size": "1024"},
+        "Config": {"compress": "true", "max-file": "2", "max-size": "1024"},
     }
 
-    inspection["HostConfig"]["LogConfig"]["Config"]["max-file"] = "2"
+    inspection["HostConfig"]["LogConfig"]["Config"]["max-file"] = "3"
     with pytest.raises(DockerRuntimeError, match="log-driver bounds drifted"):
         runtime._verify_inspection(
             inspection,

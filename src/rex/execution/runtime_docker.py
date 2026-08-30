@@ -148,7 +148,7 @@ _SECURITY_POLICY = {
     "docker_socket": False,
     "single_writable_bind": True,
     "writable_bind_target": "/output",
-    "bounded_log_driver": "local:max-file=1",
+    "bounded_log_driver": "local:max-file=2",
     "controller_output_budget": True,
     "tmpfs": "/tmp:rw,noexec,nosuid,nodev",
     "entrypoint": "/usr/bin/tini --",
@@ -380,7 +380,7 @@ class DockerCLIClient:
             "--log-opt",
             f"max-size={request.log_bytes_limit}",
             "--log-opt",
-            "max-file=1",
+            "max-file=2",
             "--log-opt",
             "compress=true",
             "--workdir",
@@ -786,7 +786,7 @@ class DockerExecutionRuntime:
         log_options = log_config.get("Config")
         if not isinstance(log_options, Mapping) or dict(log_options) != {
             "compress": "true",
-            "max-file": "1",
+            "max-file": "2",
             "max-size": str(request.log_bytes_limit),
         }:
             raise DockerRuntimeError("created container log-driver bounds drifted")
