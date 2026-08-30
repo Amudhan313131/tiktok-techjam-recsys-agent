@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+import yaml
+
 from rex.agents.patch_guard import PatchPolicy, validate_patch
 from rex.agents.provider import ProviderResponse
 from rex.agents.services import AgentDecision, CodingService, PatchResponse, ProposalService
@@ -40,6 +42,15 @@ class PatchRepairsExhausted(RuntimeError):
 
 class CandidateGateRejected(RuntimeError):
     """Candidate code ran in a gate but did not satisfy it."""
+
+
+def plugin_source_path(plugin: str) -> str:
+    """Return the repository-relative source file executed by a plugin binding."""
+
+    module = plugin.split(":", 1)[0].strip()
+    if not module:
+        raise CandidateGateRejected("bound config names an empty model plugin")
+    return f"src/{module.replace('.', '/')}.py"
 
 
 @dataclass(frozen=True)
@@ -369,6 +380,8 @@ class PatchTransactionCoordinator:
             failure_stage = "application"
             try:
                 paths = self._apply_or_verify_patch(workspace, patch, proposal)
+                failure_stage = "executed_change_contract"
+                self._validate_executed_change(workspace.root, paths, context)
                 failure_stage = "static_audit"
                 audit_changed_files(workspace.root, paths)
                 if context.get("fixture_only"):
@@ -467,6 +480,41 @@ class PatchTransactionCoordinator:
                 fixture_log_artifact_id=fixture_ref.artifact_id,
             )
         raise PatchRepairsExhausted("patch repair loop ended without a validated diff")
+
+    @staticmethod
+    def _validate_executed_change(
+        workspace_root: Path,
+        paths: tuple[str, ...],
+        context: dict[str, Any],
+    ) -> None:
+        if not context.get("require_executed_change"):
+            return
+        relative_config = str(context.get("bound_config") or "").strip()
+        if not relative_config:
+            raise CandidateGateRejected("executed-change contract lacks a bound config")
+        config_path = workspace_root / relative_config
+        try:
+            config_value = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError) as error:
+            raise CandidateGateRejected(
+                f"cannot read executed model config {relative_config}: {error}"
+            ) from error
+        if not isinstance(config_value, dict) or not isinstance(
+            config_value.get("plugin"), str
+        ):
+            raise CandidateGateRejected("bound config must name the exact model plugin")
+        executed_plugin_path = plugin_source_path(str(config_value["plugin"]))
+        if relative_config not in paths and executed_plugin_path not in paths:
+            raise CandidateGateRejected(
+                "live patch does not change the bound config or the plugin it executes"
+            )
+        allowed_namespace = str(context.get("allowed_model_namespace") or "").strip()
+        if allowed_namespace:
+            namespace_prefix = allowed_namespace.split("*", 1)[0]
+            if not executed_plugin_path.startswith(namespace_prefix):
+                raise CandidateGateRejected(
+                    "live candidate plugin is outside the experimental allowlist"
+                )
 
     def _accepted_patch_validation(self, artifact_dir: Path) -> dict[str, Any] | None:
         for attempt in range(self.max_patch_repairs + 1, 0, -1):

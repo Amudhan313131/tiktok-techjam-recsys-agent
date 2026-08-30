@@ -23,7 +23,11 @@ from typing import Any, Callable
 import numpy as np
 import yaml
 
-from rex.agents.coordinator import PatchRepairsExhausted, PatchTransactionCoordinator
+from rex.agents.coordinator import (
+    PatchRepairsExhausted,
+    PatchTransactionCoordinator,
+    plugin_source_path,
+)
 from rex.agents.patch_guard import PatchPolicy, changed_paths
 from rex.agents.provider import ProviderError, StructuredProvider, redact_secrets
 from rex.agents.services import CodingService, ProposalService
@@ -1200,6 +1204,7 @@ class ProductionScientificHooks(ProductionHooks):
                     "bound_config": relative_config,
                     "allowed_file_snapshots": allowed_file_snapshots,
                     "require_executed_change": True,
+                    "allowed_model_namespace": "src/rex/models/experimental/**",
                     "test_scored": False,
                 },
                 external_parent=True,
@@ -1220,8 +1225,7 @@ class ProductionScientificHooks(ProductionHooks):
                 config_value.get("plugin"), str
             ):
                 raise RuntimeError("live candidate config must name the exact model plugin")
-            plugin_module = str(config_value["plugin"]).split(":", 1)[0]
-            plugin_path = plugin_module.replace(".", "/") + ".py"
+            plugin_path = plugin_source_path(str(config_value["plugin"]))
             if relative_config not in paths and plugin_path not in paths:
                 raise RuntimeError(
                     "live patch does not change the bound config or the plugin it executes"

@@ -29,6 +29,133 @@ def git(cwd: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
+def test_executed_plugin_only_patch_is_accepted_after_unrelated_patch_repair(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    model = project / "src/rex/models/experimental/tree_history.py"
+    helper = project / "src/rex/models/experimental/helper.py"
+    config = project / "configs/experiments/e03_candidate_history.yaml"
+    fixture = project / "tests/fixture/test_smoke.py"
+    model.parent.mkdir(parents=True)
+    config.parent.mkdir(parents=True)
+    fixture.parent.mkdir(parents=True)
+    model.write_text("VALUE = 1\n", encoding="utf-8")
+    helper.write_text("HELPER = 1\n", encoding="utf-8")
+    config.write_text(
+        "plugin: rex.models.experimental.tree_history:ExperimentalTreeHistoryPlugin\n",
+        encoding="utf-8",
+    )
+    fixture.write_text("def test_smoke():\n    assert True\n", encoding="utf-8")
+    git(project, "init")
+    git(project, "config", "user.email", "rex@example.invalid")
+    git(project, "config", "user.name", "REX Executed Plugin Regression")
+    git(project, "add", "--all")
+    git(project, "commit", "-m", "executed plugin root")
+    parent = git(project, "rev-parse", "HEAD")
+
+    database = Database(tmp_path / "state.sqlite3")
+    database.initialize()
+    repository = ExperimentRepository(database)
+    repository.create_run(
+        run_id="run",
+        deadline_epoch_ms=deadline_epoch_ms(60),
+        root_commit=parent,
+        environment_sha256=HASH,
+        data_manifest_sha256=HASH,
+        evaluator_sha256=HASH,
+    )
+    proposal = {
+        "experiment_id": "executed-plugin-regression",
+        "parent_id": None,
+        "operator": "FEATURE",
+        "hypothesis": "The executed history plugin should implement the candidate change.",
+        "mechanism": "Only code reached through the bound plugin can affect predictions.",
+        "primary_change": "executed plugin behavior",
+        "files_to_change": [
+            "src/rex/models/experimental/helper.py",
+            "src/rex/models/experimental/tree_history.py",
+        ],
+        "expected_metric_effects": {"primary": "increase"},
+        "falsifier": "The executed plugin is unchanged or the preparation gate fails.",
+        "leakage_analysis": "The patch has no label or evaluator access.",
+        "estimated_seconds": 5,
+        "cheap_rung": {"fold": "A"},
+        "full_rung": {"folds": ["A", "B", "C"]},
+    }
+    unrelated_patch = {
+        "patch": (
+            "--- a/src/rex/models/experimental/helper.py\n"
+            "+++ b/src/rex/models/experimental/helper.py\n"
+            "@@ -1 +1 @@\n"
+            "-HELPER = 1\n"
+            "+HELPER = 2\n"
+        ),
+        "rationale": "This first attempt does not affect the configured plugin.",
+        "tests": ["fixture"],
+    }
+    plugin_patch = {
+        "patch": (
+            "--- a/src/rex/models/experimental/tree_history.py\n"
+            "+++ b/src/rex/models/experimental/tree_history.py\n"
+            "@@ -1 +1 @@\n"
+            "-VALUE = 1\n"
+            "+VALUE = 2\n"
+        ),
+        "rationale": "The repair changes the exact plugin executed by the bound config.",
+        "tests": ["fixture"],
+    }
+    provider = FakeProvider([proposal, unrelated_patch, plugin_patch])
+    coordinator = PatchTransactionCoordinator(
+        repository=repository,
+        proposal_service=ProposalService(provider),
+        coding_service=CodingService(provider),
+        project_root=project,
+        worktree_root=tmp_path / "worktrees",
+        patch_policy=PatchPolicy(
+            allowed=("src/rex/models/experimental/**",),
+            denied=(),
+        ),
+        max_patch_repairs=1,
+    )
+    prepared = coordinator.prepare(
+        run_id="run",
+        parent_commit=parent,
+        proposal_context={
+            "experiment_id": "executed-plugin-regression",
+            "artifact_ids": [],
+        },
+        coding_context={
+            "bound_config": "configs/experiments/e03_candidate_history.yaml",
+            "require_executed_change": True,
+            "allowed_model_namespace": "src/rex/models/experimental/**",
+            "allowed_file_snapshots": {
+                "src/rex/models/experimental/helper.py": helper.read_text(encoding="utf-8"),
+                "src/rex/models/experimental/tree_history.py": model.read_text(
+                    encoding="utf-8"
+                ),
+            },
+        },
+    )
+
+    rejection = json.loads(
+        (
+            tmp_path
+            / "worktrees/_artifacts/executed-plugin-regression/patch-attempt-1-rejection.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert rejection["failure_stage"] == "executed_change_contract"
+    assert repository.experiment_repairs_used("executed-plugin-regression") == 1
+    assert repository.get_experiment("executed-plugin-regression")["state"] == (
+        ExperimentState.FIXTURE_VALID
+    )
+    assert git(
+        prepared.workspace.root,
+        "show",
+        "HEAD:src/rex/models/experimental/tree_history.py",
+    ) == "VALUE = 2"
+
+
 def test_agent_patch_transaction_commits_in_isolated_worktree(tmp_path: Path) -> None:
     project = tmp_path / "project"
     model = project / "src/rex/models/experimental/model.py"
