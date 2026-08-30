@@ -1,171 +1,349 @@
-# Current Phase Implementation Plan
+# Current Phase: Clean Rehearsal and Submission Release Path
 
 Date: 2026-08-30
 
-Status: implemented and verified
+Status: the validation search, clean R3 envelope, and final-submission state
+machine are implemented. Independent data/baseline evidence is recorded; the
+fixed-provider production search reached its genuine convergence stop on real
+validation data. No experimental candidate beat the selected FM baseline. A
+new R3 invocation and any final test prediction remain separate runtime actions
+whose results must be reported from their emitted evidence, not assumed from
+implementation alone.
 
-## Scope
+## Scope boundary
 
-This phase builds and verifies the autonomous control plane without performing
-scientific model search. All end-to-end execution uses generated fixture data.
+This phase connects the production research loop through validation-best model
+freezing, a clean one-command rehearsal, and a separately authorized final
+submission job. It includes real data verification, leakage-safe temporal
+experiments, fixed and LLM-authored research paths, production sandboxing,
+durable recovery, bounded offline crash rehearsals, clean-environment recovery,
+and check-only final packaging.
 
-Explicit exclusions:
+The six-hour value is a maximum that covers clean setup, search, recovery,
+reporting, and sealing. The run may stop earlier through convergence or a cap.
+The R3 envelope remains validation-only; hidden-test prediction is never an
+implicit continuation of autonomous search.
 
-- no ranking-loss, history-feature, LightGBM, or ensemble comparison;
-- no three-fold or three-seed winning-model confirmation;
-- no six-hour dress rehearsal;
-- no final test prediction or competition submission.
+## 1. Independent data and baseline gate
 
-## 1. Structured LLM providers
+The bootstrap path verifies the frozen raw CSV hashes before materializing any
+view. It enforces the official dates and row counts, creates sequential row IDs,
+separates train/validation targets into a label vault, and emits a test feature
+view with no target path. Forbidden current-row outcome columns cannot enter an
+inference view.
 
-Implement one `StructuredProvider` contract for proposal, patch, and diagnosis
-roles.
+Observed dataset contract:
 
-Codex CLI route:
+| Split | Rows | Observed dates | Target available to development code |
+|---|---:|---|---|
+| Train | 1,141,112 | 2022-04-09–2022-04-21 | yes, isolated vault |
+| Validation | 124,909 | 2022-04-22–2022-04-28 | yes, trusted evaluator only |
+| Hidden test | 170,588 | 2022-04-29–2022-05-08 | no |
 
-- call locally authenticated `codex exec`;
-- use ephemeral, read-only, non-interactive execution;
-- require a role-specific JSON Schema and a final response file;
-- kill the process group on timeout;
-- record bounded stdout/stderr, request ID, tokens, model, and elapsed time.
+Independent validation-only reproduction:
 
-Claude CLI route:
+| Control | Primary |
+|---|---:|
+| Random | 0.4826598382 |
+| Item popularity | 0.5807219293 |
+| FM, five-seed mean | 0.6015720538 |
+| FM, five-seed standard deviation | 0.0003161765 |
 
-- call locally authenticated `claude --print`;
-- require JSON Schema output and disable tools, slash commands, Chrome, MCP,
-  settings sources, and session persistence;
-- run from an empty temporary directory by default;
-- kill the process group on timeout and record bounded structured evidence.
+The frozen official FM validation reference is 0.6016. The baseline gate stores
+all supporting artifact IDs before allowing search. It never reads or scores a
+hidden-test target.
 
-OpenAI API route:
+Observed production run `production-20260830-165853-15087c` selected the best
+baseline seed at `0.6020372016` primary (`0.6679479199` GAUC,
+`0.5361264833` nDCG@5). The fixed queue then recorded three consecutive
+non-improving transactions and stopped with `epsilon_plateau`:
 
-- read `OPENAI_API_KEY` and the model from environment variables only;
-- use the Responses API with strict structured output, `store=false`, and no tools;
-- disable SDK retries so the control plane owns retry accounting;
-- enforce call and token ceilings and rehydrate durable successful usage on resume;
-- redact credentials and authorization headers from persisted errors.
+| Card | Evidence reached | Decision |
+|---|---|---|
+| E01 pairwise FM | full A/B/C | rejected; mean shadow delta `-0.01753` |
+| E02 tree + point-in-time video/author rates | official validation | rejected; valid primary `0.5978742`, delta `-0.0041630` |
+| E03 history length | cheap A | rejected; primary delta `+0.0005442`, below the `+0.001` cheap gate |
 
-Routing:
+The exact baseline checkpoint/config/predictions remain frozen in that run's
+`best-valid` bundle. Confirmation, test prediction, and submission were not
+performed.
 
-- support `codex_cli`, `claude_cli`, `openai_api`, `fixed`, and `auto` modes;
-- retry a provider no more than two times after its first attempt;
-- keep paid API fallback disabled unless explicitly authorized;
-- persist fallback/degradation evidence without starting a new hypothesis.
+## 2. Leakage-safe experimental views
 
-Acceptance: provider schema, timeout, error classification, redaction, retry,
-budget, and fallback tests all pass without live credentials.
+The data layer materializes chronological shadow folds A, B, and C plus a
+complete-user 10% cheap view of fold A. Feature recipes use only state available
+strictly before the row being scored and are cached with data, recipe, and code
+identities.
 
-## 2. Durable ownership and exactly-once persistence
+Implemented recipes and controls include:
 
-Extend SQLite with:
+- point-in-time video statistics and a no-stat tree control;
+- history length / simple candidate history;
+- repeat exposure, prior outcome, and elapsed time;
+- user-author and duration affinity;
+- recency-decayed history;
+- control recipes that preserve the same pipeline while zeroing the intended
+  treatment feature.
 
-- durable experiment worktree/branch/commit/config provenance;
-- process sessions with PID, host, heartbeat, staleness, and exit reason;
-- pre-execution attempt reservations;
-- immutable artifact ownership links;
-- exactly-once LLM, attempt, metric, artifact, resource, and event writes;
-- atomic, replay-safe JSONL event export.
+Tags are not silently synthesized when the safe source schema cannot support
+them. A method must be evaluated using the actually materialized columns, not a
+claim in its prose description.
 
-Resume behavior:
+## 3. Connected scientific supervisor
 
-- a live owner blocks a second coordinator;
-- a stale owner is explicitly closed by takeover;
-- the new coordinator dispatches from the persisted experiment state;
-- repeated result ingestion must either be identical or fail closed.
-
-Acceptance: stale takeover, duplicate replay, interrupted event export, and
-repair-number tests preserve all prior state and incumbent fields.
-
-## 3. Isolated model workspaces and complete bundles
-
-For every candidate:
-
-- create a disposable Git repository containing only source, fixture tests, and
-  frozen firewall contracts;
-- create a candidate worktree from an exact parent commit;
-- accept diffs only in the experimental allowlist;
-- run path, AST/capability, compile, and fixture gates before execution;
-- require fixture LLM patches to change only the approved finite numeric
-  `DEFAULT_BIAS` assignment;
-- commit the accepted diff and execute the worker from that clean worktree;
-- reject dirty worktrees and commit mismatches.
-
-Training emits a complete model bundle manifest with member hashes, plugin,
-commit, config, data, and feature-schema provenance. Prediction loads the bundle
-without mutating the experiment config.
-
-Acceptance: corrupt or incomplete bundles, missing predictions, NaN values, and
-wrong workspaces cannot be interpreted as successful attempts.
-
-## 4. Connected fixture-only autopilot
-
-Expose one command that performs:
+`configs/run/production.yaml` enables a single validation-only command. The
+supervisor owns one durable hypothesis transaction at a time:
 
 ```text
-proposal -> patch -> safety gates -> cheap fixture run -> conditional full
-fixture run -> metric record -> diagnosis -> reject/close -> next proposal
+eligible method card
+  -> durable proposal and effective config
+  -> isolated worktree and safety gates
+  -> cheap fold A
+  -> full shadow A/B/C when promising
+  -> official validation when promising
+  -> diagnostics and evidence-bound diagnosis
+  -> validation champion update or rejection
+  -> next eligible card
 ```
 
-The loop:
+The fixed provider executes versioned configs without pretending an LLM wrote a
+patch. Codex CLI, Claude CLI, and OpenAI API modes can propose and diagnose, but
+their patch authority is limited to the card-specific experimental allowlist.
+Each effective config is copied into durable run evidence and checked by hash so
+resume does not depend on a worktree that may have been cleaned.
 
-- generates its own tiny feature and target arrays;
-- never opens competition data or the official evaluator;
-- counts one proposal as one hypothesis transaction;
-- records worktree, LLM, attempt, metric, resource, and evidence artifacts;
-- can resume from durable experiment states after coordinator interruption;
-- never enters confirmation, submission, or promotion states;
-- reports all production-science and final-submission flags as false.
+Method cards E01–E08 and E10 are wired to executable adapters. E04, E05, and
+later history/blend cards remain prerequisite-gated, so unsupported branches do
+not consume experiments. E09 and neural E11–E13 are not selectable in this
+phase. E14 confirmation remains deferred.
 
-Acceptance: a normal run completes three fixture transactions from one command,
-including one cheap rejection and two evidence-bound diagnoses, with a valid
-event chain. The connected fault rehearsal adds a fourth transaction that must
-reach `FAILED_FINAL` after its initial attempt plus two repairs.
+The trusted comparison gates enforce:
 
-## 5. Optional LightGBM model path
+- one isolated treatment against its intended control;
+- complete-user fold boundaries;
+- cheap rejection before expensive execution;
+- two-of-three temporal support for full-rung promotion;
+- confidence and component-regression checks;
+- official validation against the current validation champion;
+- shadow-only blend weight selection;
+- no test evaluation.
 
-Pin LightGBM and its scikit-learn runtime in the `tree` optional dependency.
-Harden the LambdaRank plugin with deterministic seeds/threads, stable group
-ordering, categorical declarations, date offsets, finite checks, and complete
-bundle metadata.
+Exactly one convergence transaction is counted for each terminal hypothesis,
+including a final failed candidate. A positive delta smaller than or equal to
+epsilon can become the best recorded validation score while still advancing the
+non-improvement streak. The loop stops on queue exhaustion, patience 3, the
+50-hypothesis/evaluation caps, or the wall-clock reserve.
 
-The current phase runs only a tiny synthetic doctor. It does not compare
-LightGBM with FM or make a model-quality claim.
+## 4. Prediction model paths
 
-Acceptance: the doctor trains, predicts, saves, reloads, and validates a finite
-synthetic bundle deterministically.
+The production worker can execute:
 
-## 6. Production-style fault matrix
+- pointwise FM controls;
+- experimental same-user pairwise FM variants;
+- deterministic grouped LightGBM LambdaRank variants;
+- a two-branch pairwise/tree blend whose weights are selected using shadow
+  evidence only.
 
-Intentionally test:
+Training writes a complete bundle manifest with member hashes, plugin identity,
+commit, effective-config hash, environment, data-view identity, and feature
+schema. Prediction reloads that bundle in a new worker process. Missing members,
+hash drift, NaN/Inf values, or row misalignment are typed failures, never valid
+results.
 
-- worker crash, timeout, descendant cleanup, simulated OOM, and interruption;
-- NaN predictions/loss and missing, malformed, or corrupt result artifacts;
-- LLM timeout, API interruption, invalid schema, retry/fallback, and secret redaction;
-- dirty, wrong-commit, out-of-root, or protected worktree changes;
-- stale coordinator takeover and duplicate process ownership;
-- interrupted database-backed event export and exactly-once replay;
-- repair numbers zero, one, and two with no third repair;
-- incumbent invariance after every failed candidate;
-- malformed or incorrectly aligned organizer CSV validation.
+## 5. Production execution boundary
 
-Acceptance: every failure is typed, no broken artifact promotes, repair count is
-bounded at two, prior best fields remain unchanged, and recovery evidence is
-durable.
+Production model and candidate-gate commands run through a fail-closed sandbox.
+On the current implementation this is the macOS `/usr/bin/sandbox-exec`
+backend. It denies network access, removes credentials and the real home
+directory from the child environment, grants only explicit read/write roots,
+applies resource limits, and terminates the complete process group on timeout or
+interruption. Unsupported platforms cannot silently fall back to unsandboxed
+production execution.
 
-## 7. Short integration rehearsal and handoff
+The root project must be a clean committed Git checkout. Candidate worktrees are
+created at exact commits; the supervisor rejects dirty worktrees, wrong commits,
+protected changes, path traversal, out-of-root workspaces, and unsafe Python
+capabilities.
 
-Run a sub-15-minute generated-fixture rehearsal that:
+## 6. LLM provider choices
 
-- starts with one command;
-- injects one retryable provider interruption;
-- injects a one-shot worker NaN and verifies the first repair succeeds;
-- injects a persistent worker NaN and verifies attempts zero, one, and two are
-  recorded before `FAILED_FINAL`, with no third repair;
-- proves a protected patch is rejected;
-- completes the four-transaction fault run without stranding the coordinator;
-- verifies the hash-chained event export;
-- asserts no experiment is promoted.
+All providers implement the same strict structured contract for proposal,
+patch, and diagnosis roles.
 
-Publish setup instructions for fixed, Codex CLI, OpenAI API, and explicit paid
-fallback modes. Run the complete test suite and static checks. Do not commit
-until the user requests a commit.
+- `fixed`: deterministic method-card queue; no LLM call.
+- `codex_cli`: local Codex authentication, empty temporary working directory,
+  read-only and ephemeral `codex exec`, no interactive approval, JSON Schema.
+- `claude_cli`: local Claude authentication, empty temporary working directory,
+  tools/MCP/Chrome/settings/session persistence disabled, JSON Schema.
+- `openai_api`: key and model from environment variables only, Responses API,
+  strict output, `store=false`, no tools, bounded calls/tokens, no SDK retries.
+- `auto`: local Codex then local Claude; paid OpenAI fallback only when the
+  operator passes the explicit authorization flag.
+
+Provider timeouts, invalid schemas, request IDs, token usage, redacted failures,
+and fallback decisions are durable. A failed proposal call can occur before an
+experiment exists, so reporting resolves its artifacts through the run-scoped
+LLM call instead of dropping them.
+
+## 7. Durable ownership and recovery
+
+SQLite stores run ownership, heartbeats, experiments, state transitions,
+attempt reservations, repairs, metrics, immutable artifact provenance, LLM
+calls, resources, lessons, promotions, convergence decisions, and an event
+outbox. Event export is replay-safe and hash chained.
+
+Resume behavior is exact rather than heuristic:
+
+- a live coordinator blocks a second owner;
+- a proven-stale coordinator is explicitly taken over;
+- the existing proposal, effective config, worktree provenance, and current
+  state are reconstructed;
+- repeated writes must be identical or fail closed;
+- an interrupted finalization can be resumed;
+- the prior validation champion remains intact after candidate failure;
+- repairs are numbered one and two, with no third repair.
+
+The finalizer creates a validation-best bundle containing the exact model,
+validation predictions, config, metrics, commit, and evidence index. Its
+manifest explicitly records that no test prediction was created. The release
+job later treats this sealed bundle and the completed production database as
+read-only inputs.
+
+## 8. Crash rehearsal levels
+
+R1 and R2 are short, deterministic, offline production-control rehearsals. They
+operate on a generated committed repository, not KuaiRand data, and therefore
+make no scientific model claim.
+
+R1 covers:
+
+- preparation and finalization interruption/resume;
+- typed timeout, OOM, NaN, corrupt-bundle, evaluator, and alignment failures;
+- database rollback plus stale-owner takeover;
+- a persistent failure through repairs one and two, followed by continuation to
+  the next candidate.
+
+R2 includes R1 and adds:
+
+- interrupted and invalid-schema LLM calls with restart;
+- protected-file and path-traversal patch rejection;
+- sandbox workspace-escape rejection.
+
+The component suite supplies the lower-level evidence for real subprocess
+termination, descendant cleanup, sandbox policy enforcement, resource limits,
+artifact corruption, event replay, and incumbent invariance.
+
+## 9. Commands and acceptance
+
+Prepare data and verify the baseline:
+
+```bash
+.venv/bin/python -m rex.cli bootstrap --output-dir runs/data
+.venv/bin/python -m rex.cli baseline --view-dir runs/data --seeds 0,1,2,3,4
+```
+
+Check production prerequisites, then run or resume:
+
+```bash
+.venv/bin/python -m rex.cli doctor \
+  --config configs/run/production.yaml --tree --llm fixed
+.venv/bin/python -m rex.cli run \
+  --config configs/run/production.yaml --llm fixed
+.venv/bin/python -m rex.cli run \
+  --config configs/run/production.yaml --llm fixed --resume RUN_ID
+```
+
+Run the fault rehearsals:
+
+```bash
+.venv/bin/python -m rex.cli rehearse --level R1 \
+  --output-dir runs/rehearsal-r1
+.venv/bin/python -m rex.cli rehearse --level R2 \
+  --output-dir runs/rehearsal-r2
+```
+
+Phase acceptance requires the complete static and test suites, the opt-in real
+data contract test, the production sandbox doctor on macOS, R1/R2 passing, and a
+clean committed snapshot before real search. Those gates and the fixed-provider
+production run have now completed. The observed search did not establish a
+model improvement, so the baseline remains the truthful validation winner.
+
+## 10. Clean one-command R3 envelope
+
+`scripts/run_clean_rehearsal.py start` is the outer trust boundary for the
+release rehearsal. Its deadline begins before cloning or installing anything.
+It then:
+
+1. requires a clean committed source and resolves one exact commit;
+2. creates a detached clone outside the operator repository and protects its
+   tracked source files from mutation;
+3. creates a fresh Python environment and installs the transitive,
+   platform-specific hash lock using binary wheels only;
+4. records Python, pip, platform, dependency inventory, source-tree, Starter
+   Kit, evaluator, and raw-data identities;
+5. bootstraps sanitized views and proves the test view has 170,588 rows and no
+   target;
+6. runs the LightGBM, sandbox, and explicitly selected live-provider doctors;
+7. starts one production run with a durable external deadline;
+8. waits for a worker lease owned by that coordinator, records the exact
+   attempt/checkpoint, and injects one `SIGKILL`;
+9. resumes the same run ID and external deadline;
+10. proves the attempt exists exactly once, counters did not regress or
+    duplicate, and the pre-fault champion remains in durable evidence;
+11. audits the database, artifacts, requests, and command transcripts for any
+    test prediction or scoring work;
+12. recursively revalidates every winning checkpoint member, report artifact,
+    log, recovery file, and status snapshot before sealing the R3 manifest.
+
+The envelope stops through convergence, the 50-hypothesis/evaluation caps, or
+the external deadline. The six hours are a ceiling, not a target duration. The
+success manifest is removed if contract validation or evidence sealing crosses
+the deadline.
+
+The launcher writes local hourly snapshots without an LLM call. A scheduled
+Codex heartbeat may read `status/latest.json` once per hour and report a compact
+summary; it must never edit source, restart a process, or advance an experiment.
+
+## 11. Final submission state machine
+
+Test prediction is isolated from R3 and the research database. The
+`finalize-submission` command requires `--authorize-test-prediction`, reads only
+a `COMPLETE` production run, and fingerprints its database, report, best-valid
+manifest, config, commit, model bundle, and every checkpoint member.
+
+Its durable states are:
+
+```text
+CREATED -> SOURCE_VERIFIED -> WORKTREE_READY -> PREDICTING -> PREDICTED
+        -> CSV_BUILT -> FIRST_CHECK_VALID -> STAGING -> SECOND_CHECK_VALID
+        -> SEALED -> READY_FOR_HANDOFF -> HANDOFF_IN_PROGRESS -> HANDED_OFF
+```
+
+The prediction request uses the exact winner plugin and bundle, a detached
+exact-commit worktree, the canonical test feature hash, `split=test`,
+`operation=predict`, and `target_view_path=null`. Production sandboxing and the
+normal worker lease/replay logic remain active.
+
+CSV generation preserves canonical row order and duplicate user/video pairs,
+requires finite scores and exactly 170,588 rows, and emits only
+`row_id,user_id,video_id,score`. Both validation gates invoke only
+`submit.py --check --split test`: once before staging and once against the copied
+CSV. `--score` and `--make` are rejected capabilities.
+
+The shared reporting finalizer atomically stages the immutable winner, complete
+source report, predictions, submission, configs, checker transcripts, and
+hashes. Resume reuses identical persisted requests and artifacts rather than
+creating another test prediction. The resulting seal records
+`test_scored: false`.
+
+Filesystem handoff requires `--authorize-once` and the exact sealed-manifest
+SHA-256. A prior handoff can be replay-verified but cannot be redirected to a
+different destination. There is deliberately no automatic organizer upload or
+local hidden-test scoring.
+
+## 12. Deferred until after KuaiRand-Pure
+
+KuaiRand-1k, KuaiRand-27k, randomized-exposure/OPE analysis, neural sequence
+models, multi-task objectives, censored watch-time modeling, and optional demo
+visualizations remain out of the critical path. They do not reduce the required
+KuaiRand-Pure score and must not delay the sealed Pure submission.
