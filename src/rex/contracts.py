@@ -38,6 +38,8 @@ class ExperimentState(StrEnum):
     FULL_RUNNING = "FULL_RUNNING"
     FULL_COMPLETE = "FULL_COMPLETE"
     DIAGNOSED = "DIAGNOSED"
+    OFFICIAL_VALID_RUNNING = "OFFICIAL_VALID_RUNNING"
+    OFFICIAL_VALID_COMPLETE = "OFFICIAL_VALID_COMPLETE"
     CONFIRMING = "CONFIRMING"
     CONFIRMED = "CONFIRMED"
     SUBMISSION_BUILDING = "SUBMISSION_BUILDING"
@@ -155,6 +157,164 @@ class ModelBundleManifest(StrictModel):
         if self.primary_member not in names:
             raise ValueError("model bundle primary_member is not present in members")
         return self
+
+
+class RehearsalR3Spec(StrictModel):
+    """Immutable envelope for a clean, validation-only dress rehearsal."""
+
+    schema_version: str = SCHEMA_VERSION
+    rehearsal_id: str = Field(min_length=1)
+    run_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+    source_commit: str = Field(min_length=7)
+    repository: str = Field(min_length=1)
+    data_dir: str = Field(min_length=1)
+    artifact_root: str = Field(min_length=1)
+    provider_mode: Literal["codex_cli", "claude_cli", "openai_api", "auto"]
+    allow_paid_api: bool = False
+    wall_seconds: int = Field(default=21_600, gt=0, le=21_600)
+    finalization_reserve_seconds: int = Field(default=1_200, ge=0)
+    inject_controlled_failure: bool = True
+    expected_test_rows: int = Field(default=170_588, ge=1)
+
+    @model_validator(mode="after")
+    def validate_r3_policy(self) -> "RehearsalR3Spec":
+        if self.finalization_reserve_seconds >= self.wall_seconds:
+            raise ValueError("R3 finalization reserve must be smaller than the wall ceiling")
+        if self.provider_mode == "openai_api" and not self.allow_paid_api:
+            raise ValueError("OpenAI API mode requires explicit paid-API authorization")
+        return self
+
+
+class RehearsalR3Manifest(StrictModel):
+    """Sealed evidence produced by the outer R3 launcher."""
+
+    schema_version: str = SCHEMA_VERSION
+    level: Literal["R3"] = "R3"
+    rehearsal_id: str
+    run_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+    state: Literal["COMPLETE"]
+    stop_reason: str | None = None
+    started_epoch_ms: int = Field(gt=0)
+    deadline_epoch_ms: int = Field(gt=0)
+    elapsed_seconds: float = Field(ge=0.0)
+    source_commit: str
+    source_tree_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    environment_lock_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    environment_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    data_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    starter_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    evaluator_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    provider_requested: Literal["codex_cli", "claude_cli", "openai_api", "auto"]
+    provider_actual: str = Field(min_length=1)
+    fault_injected: Literal[True]
+    fault_recovered: Literal[True]
+    source_unchanged: Literal[True]
+    best_valid_manifest: ArtifactRef
+    report_artifacts: list[ArtifactRef] = Field(min_length=1)
+    test_prediction_created: Literal[False] = False
+    test_scored: Literal[False] = False
+    submission_created: Literal[False] = False
+    started_at: str
+    completed_at: str
+    wall_clock_ceiling_seconds: int = Field(gt=0, le=21_600)
+    within_six_hour_ceiling: Literal[True]
+    llm: str
+    provider_calls: list[dict[str, Any]] = Field(min_length=1)
+    paid_api_authorized: bool
+    dependency: dict[str, Any]
+    preflight: dict[str, Any]
+    controlled_failure: dict[str, Any]
+    source_audit: dict[str, Any]
+    clone_audit: dict[str, Any]
+    validation: dict[str, Any]
+    winner: dict[str, Any]
+    status: dict[str, Any]
+    hourly_snapshot_count: int = Field(ge=1)
+    evidence: dict[str, dict[str, Any]] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_completed_envelope(self) -> "RehearsalR3Manifest":
+        if self.deadline_epoch_ms <= self.started_epoch_ms:
+            raise ValueError("R3 deadline must be later than its start")
+        if self.elapsed_seconds > self.wall_clock_ceiling_seconds:
+            raise ValueError("R3 elapsed time exceeds its declared ceiling")
+        if self.provider_actual == "fixed" or "fixed" in self.provider_actual.split(","):
+            raise ValueError("R3 must use an authorized live researcher provider")
+        return self
+
+
+class SubmissionJobState(StrEnum):
+    CREATED = "CREATED"
+    SOURCE_VERIFIED = "SOURCE_VERIFIED"
+    WORKTREE_READY = "WORKTREE_READY"
+    PREDICTING = "PREDICTING"
+    PREDICTED = "PREDICTED"
+    CSV_BUILT = "CSV_BUILT"
+    FIRST_CHECK_VALID = "FIRST_CHECK_VALID"
+    STAGING = "STAGING"
+    SECOND_CHECK_VALID = "SECOND_CHECK_VALID"
+    SEALED = "SEALED"
+    READY_FOR_HANDOFF = "READY_FOR_HANDOFF"
+    HANDOFF_IN_PROGRESS = "HANDOFF_IN_PROGRESS"
+    HANDED_OFF = "HANDED_OFF"
+    REJECTED = "REJECTED"
+    FAILED = "FAILED"
+
+
+class SubmissionCheckEvidence(StrictModel):
+    ordinal: Literal[1, 2]
+    command: list[str]
+    checker_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    csv_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    stdout_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    stderr_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    returncode: int
+    valid: bool
+
+    @model_validator(mode="after")
+    def prohibit_test_scoring(self) -> "SubmissionCheckEvidence":
+        forbidden = {"--score", "--make"}
+        if forbidden.intersection(self.command):
+            raise ValueError("submission checker evidence may not contain score/make operations")
+        if self.command.count("--check") != 1:
+            raise ValueError("submission checker command must contain --check exactly once")
+        return self
+
+
+class FinalSubmissionSpec(StrictModel):
+    schema_version: str = SCHEMA_VERSION
+    job_id: str = Field(min_length=1)
+    source_run_id: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+    best_valid_manifest_path: str = Field(min_length=1)
+    best_valid_manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    test_feature_path: str = Field(min_length=1)
+    test_feature_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    data_dir: str = Field(min_length=1)
+    output_dir: str = Field(min_length=1)
+    expected_rows: int = Field(default=170_588, ge=1)
+    authorize_test_prediction: bool = False
+
+    @model_validator(mode="after")
+    def require_test_authorization(self) -> "FinalSubmissionSpec":
+        if not self.authorize_test_prediction:
+            raise ValueError("final submission requires explicit test-prediction authorization")
+        return self
+
+
+class FinalSubmissionManifest(StrictModel):
+    schema_version: str = SCHEMA_VERSION
+    job_id: str
+    source_run_id: str
+    source_experiment_id: str
+    commit_sha: str
+    config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    model_bundle_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    test_feature_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    test_rows: int = Field(default=170_588, ge=1)
+    artifacts: dict[str, ArtifactRef]
+    checks: tuple[SubmissionCheckEvidence, SubmissionCheckEvidence]
+    handoff_id: str
+    test_scored: Literal[False] = False
 
 
 class RunRequest(StrictModel):

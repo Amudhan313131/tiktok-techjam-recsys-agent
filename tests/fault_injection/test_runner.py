@@ -1,14 +1,25 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import shlex
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
+import pytest
+import psutil
+
 from rex.contracts import AttemptStatus, RunRequest
 from rex.data.manifest import sha256_file
+from rex.execution.lease import (
+    WorkerLeaseError,
+    begin_worker_lease,
+    recover_orphan_worker,
+)
 from rex.execution.runner import _typed_failure, execute_request
 
 
@@ -269,3 +280,217 @@ def test_nonfinite_prediction_is_typed_nan(feature_target_paths, tmp_path: Path)
 
 def test_external_worker_signal_is_typed_interrupted() -> None:
     assert _typed_failure("", False, return_code=-signal.SIGKILL) == AttemptStatus.INTERRUPTED
+
+
+def test_completed_worker_result_is_replayed_without_retraining(
+    feature_target_paths, tmp_path: Path
+) -> None:
+    run_request = request(feature_target_paths, tmp_path, {})
+    attempt_dir = tmp_path / "attempt-replay"
+    first = execute_request(run_request, attempt_dir)
+    assert first.status == AttemptStatus.SUCCESS
+    checkpoint = next(item for item in first.artifacts if item.kind == "checkpoint")
+    result_path = attempt_dir / "worker" / "result.json"
+    stdout_path = attempt_dir / "stdout.log"
+    observed = {
+        "checkpoint": Path(checkpoint.path).stat().st_mtime_ns,
+        "result": result_path.stat().st_mtime_ns,
+        "stdout": stdout_path.stat().st_mtime_ns,
+    }
+
+    replayed = execute_request(run_request, attempt_dir)
+
+    assert replayed.status == AttemptStatus.SUCCESS
+    assert Path(checkpoint.path).stat().st_mtime_ns == observed["checkpoint"]
+    assert result_path.stat().st_mtime_ns == observed["result"]
+    assert stdout_path.stat().st_mtime_ns == observed["stdout"]
+    replay_ref = next(item for item in replayed.artifacts if item.kind == "worker_replay")
+    replay = json.loads(Path(replay_ref.path).read_text(encoding="utf-8"))
+    assert replay["outcome"] == "complete-result-replayed"
+
+
+def test_same_attempt_with_conflicting_request_hash_fails_closed(
+    feature_target_paths, tmp_path: Path
+) -> None:
+    original = request(
+        feature_target_paths,
+        tmp_path,
+        {},
+        attempt_id="attempt-request-conflict",
+    )
+    attempt_dir = tmp_path / "attempt-request-conflict"
+    first = execute_request(original, attempt_dir)
+    assert first.status == AttemptStatus.SUCCESS
+    checkpoint = next(item for item in first.artifacts if item.kind == "checkpoint")
+    checkpoint_mtime = Path(checkpoint.path).stat().st_mtime_ns
+    values = original.model_dump()
+    values["seed"] = original.seed + 1
+
+    conflict = execute_request(RunRequest(**values), attempt_dir)
+
+    assert conflict.status == AttemptStatus.CONTRACT
+    assert conflict.error_type == "WorkerLeaseConflict"
+    assert "different request hash" in (conflict.error_summary or "")
+    assert Path(checkpoint.path).stat().st_mtime_ns == checkpoint_mtime
+
+
+def _stopped_or_zombie(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    state = subprocess.run(
+        ["ps", "-o", "stat=", "-p", str(pid)],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    return not state or state.startswith("Z")
+
+
+def test_resume_reaps_verified_orphan_group_after_coordinator_sigkill(
+    feature_target_paths, tmp_path: Path
+) -> None:
+    first_run_marker = tmp_path / "orphan-first-run.marker"
+    descendant_path = tmp_path / "orphan-descendant.pid"
+    fake_worker = tmp_path / "orphan-worker"
+    fake_worker.write_text(
+        "#!/bin/sh\n"
+        f"if [ ! -e {shlex.quote(str(first_run_marker))} ]; then\n"
+        f"  touch {shlex.quote(str(first_run_marker))}\n"
+        "  sleep 30 &\n"
+        "  child=$!\n"
+        f"  printf '%s\\n' \"$child\" > {shlex.quote(str(descendant_path))}\n"
+        "  wait \"$child\"\n"
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_worker.chmod(0o755)
+    run_request = request(
+        feature_target_paths,
+        tmp_path,
+        {},
+        attempt_id="attempt-orphan-recovery",
+        timeout_seconds=20,
+        deadline_epoch_ms=int((time.time() + 30) * 1000),
+    )
+    serialized_request = tmp_path / "orphan-request.json"
+    serialized_request.write_text(run_request.model_dump_json(), encoding="utf-8")
+    attempt_dir = tmp_path / "attempt-orphan-recovery"
+    coordinator_code = (
+        "import sys; from pathlib import Path; from rex.contracts import RunRequest; "
+        "from rex.execution.runner import execute_request; "
+        "request=RunRequest.model_validate_json(Path(sys.argv[1]).read_text()); "
+        "execute_request(request, sys.argv[2], python_executable=sys.argv[3])"
+    )
+    coordinator = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            coordinator_code,
+            str(serialized_request),
+            str(attempt_dir),
+            str(fake_worker),
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        env={**os.environ, "REX_VOLATILE_AMBIENT": "child-coordinator-only"},
+    )
+    lease_path = attempt_dir / "worker_lease.json"
+    deadline = time.monotonic() + 8
+    lease: dict[str, object] | None = None
+    while time.monotonic() < deadline:
+        if lease_path.is_file() and descendant_path.is_file():
+            candidate = json.loads(lease_path.read_text(encoding="utf-8"))
+            if candidate.get("state") == "active":
+                lease = candidate
+                break
+        time.sleep(0.05)
+    assert lease is not None, "coordinator never persisted an active worker lease"
+    old_worker_pid = int(lease["pid"])
+    descendant_pid = int(descendant_path.read_text(encoding="utf-8").strip())
+    assert not _stopped_or_zombie(old_worker_pid)
+    assert not _stopped_or_zombie(descendant_pid)
+    observed_command = psutil.Process(old_worker_pid).cmdline()
+    observed_token_hashes = {
+        hashlib.sha256(argument.encode("utf-8")).hexdigest()
+        for argument in observed_command
+    }
+    assert lease["identity_token_sha256"] in observed_token_hashes
+
+    os.kill(coordinator.pid, signal.SIGKILL)
+    coordinator.wait(timeout=5)
+    assert not _stopped_or_zombie(old_worker_pid)
+
+    resumed = execute_request(run_request, attempt_dir, python_executable=str(fake_worker))
+
+    assert resumed.status == AttemptStatus.INVALID_ARTIFACT, resumed.error_summary
+    recovery_ref = next(item for item in resumed.artifacts if item.kind == "worker_recovery")
+    recovery = json.loads(Path(recovery_ref.path).read_text(encoding="utf-8"))
+    event = recovery["events"][-1]
+    assert event["outcome"] == "orphan-process-group-terminated"
+    assert event["pid"] == old_worker_pid
+    for _ in range(40):
+        if _stopped_or_zombie(old_worker_pid) and _stopped_or_zombie(descendant_pid):
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("verified orphan worker process group survived recovery")
+
+
+def test_pid_reuse_identity_mismatch_never_signals_process(tmp_path: Path) -> None:
+    process = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    lease_path = tmp_path / "reused-pid-lease.json"
+    recovery_path = tmp_path / "reused-pid-recovery.json"
+    try:
+        marker = begin_worker_lease(
+            lease_path,
+            pid=process.pid,
+            request_sha256="1" * 64,
+            execution_sha256="2" * 64,
+            planned_command_sha256="3" * 64,
+        )
+        marker["create_time"] = float(marker["create_time"]) - 60
+        lease_path.write_text(json.dumps(marker), encoding="utf-8")
+        with pytest.raises(WorkerLeaseError, match="PID was reused"):
+            recover_orphan_worker(
+                lease_path,
+                recovery_path,
+                request_sha256="1" * 64,
+                execution_sha256="2" * 64,
+            )
+        assert process.poll() is None
+        recovery = json.loads(recovery_path.read_text(encoding="utf-8"))
+        assert recovery["events"][-1]["outcome"] == "recovery-refused"
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)
+
+
+def test_foreign_active_lease_fails_closed_without_signaling(tmp_path: Path) -> None:
+    process = subprocess.Popen(["sleep", "30"], start_new_session=True)
+    lease_path = tmp_path / "foreign-lease.json"
+    recovery_path = tmp_path / "foreign-recovery.json"
+    try:
+        marker = begin_worker_lease(
+            lease_path,
+            pid=process.pid,
+            request_sha256="4" * 64,
+            execution_sha256="5" * 64,
+            planned_command_sha256="6" * 64,
+        )
+        marker["hostname"] = "different-host.invalid"
+        lease_path.write_text(json.dumps(marker), encoding="utf-8")
+        with pytest.raises(WorkerLeaseError, match="foreign host or boot"):
+            recover_orphan_worker(
+                lease_path,
+                recovery_path,
+                request_sha256="4" * 64,
+                execution_sha256="5" * 64,
+            )
+        assert process.poll() is None
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=5)

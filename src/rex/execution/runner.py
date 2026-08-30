@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import secrets
 import signal
 import subprocess
 import sys
@@ -13,10 +14,48 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from rex.contracts import AttemptStatus, RunRequest, RunResult
+from rex.contracts import ArtifactRef, AttemptStatus, RunRequest, RunResult
 from rex.data.manifest import canonical_json_bytes, repo_root, sha256_file
-from rex.execution.artifacts import artifact_ref, atomic_write_json
+from rex.execution.artifacts import ArtifactError, artifact_ref, atomic_write_json
+from rex.execution.limits import limits_for_request
+from rex.execution.lease import (
+    AttemptLock,
+    WorkerLeaseError,
+    begin_worker_lease,
+    close_worker_lease,
+    command_sha256,
+    recover_orphan_worker,
+)
+from rex.execution.sandbox import (
+    PreparedSandbox,
+    SandboxError,
+    SandboxMode,
+    SandboxPolicy,
+    fixture_environment,
+    production_backend,
+    sanitized_environment,
+)
 from rex.execution.telemetry import ResourceTotals
+from rex.models.bundle import validate_model_bundle
+
+
+_LEASE_WRAPPER = """import os
+import subprocess
+import sys
+import time
+
+launch_gate = sys.argv[2]
+deadline = time.monotonic() + 2.0
+while not os.path.isfile(launch_gate):
+    if time.monotonic() >= deadline:
+        raise SystemExit(125)
+    time.sleep(0.01)
+child = subprocess.Popen(sys.argv[3:])
+code = child.wait()
+if code < 0:
+    os.kill(os.getpid(), -code)
+raise SystemExit(code)
+"""
 
 
 def _typed_failure(
@@ -45,6 +84,92 @@ def _typed_failure(
     if "nan" in lowered or "non-finite" in lowered:
         return AttemptStatus.NAN
     return AttemptStatus.CRASH
+
+
+def _contract_result(
+    request: RunRequest,
+    *,
+    error_type: str,
+    summary: str,
+    command: list[str],
+    started: float,
+    artifacts: list[ArtifactRef] | None = None,
+) -> RunResult:
+    return RunResult(
+        run_id=request.run_id,
+        experiment_id=request.experiment_id,
+        attempt_id=request.attempt_id,
+        status=AttemptStatus.CONTRACT,
+        error_type=error_type,
+        error_summary=summary,
+        command_sha256=hashlib.sha256(canonical_json_bytes(command)).hexdigest(),
+        commit_sha=request.commit_sha,
+        config_sha256=request.config_sha256,
+        data_view_sha256=request.data_view_sha256,
+        environment_sha256=request.environment_sha256,
+        artifacts=[] if artifacts is None else artifacts,
+        wall_seconds=time.monotonic() - started,
+    )
+
+
+def _lease_wrapper_command(
+    command: tuple[str, ...], launch_gate: Path
+) -> tuple[tuple[str, ...], str]:
+    """Keep a stable process-group leader while the sandbox command runs beneath it."""
+
+    token = secrets.token_hex(16)
+    return (
+        sys.executable,
+        "-I",
+        "-c",
+        _LEASE_WRAPPER,
+        token,
+        str(launch_gate),
+        *command,
+    ), token
+
+
+def _validated_replay(request: RunRequest, result_path: Path) -> RunResult | None:
+    """Return a complete prior worker result, or ``None`` for a partial result."""
+
+    if not result_path.is_file():
+        return None
+    try:
+        result = RunResult.model_validate_json(result_path.read_text(encoding="utf-8"))
+        expected_request_hash = hashlib.sha256(
+            canonical_json_bytes(request.model_dump(mode="json"))
+        ).hexdigest()
+        if result.command_sha256 != expected_request_hash:
+            raise ValueError("worker result request hash mismatch")
+        expected = {
+            "run_id": request.run_id,
+            "experiment_id": request.experiment_id,
+            "attempt_id": request.attempt_id,
+            "commit_sha": request.commit_sha,
+            "config_sha256": request.config_sha256,
+            "data_view_sha256": request.data_view_sha256,
+            "environment_sha256": request.environment_sha256,
+        }
+        for field, value in expected.items():
+            if getattr(result, field) != value:
+                raise ValueError(f"worker result {field} mismatch")
+        for ref in result.artifacts:
+            artifact_path = Path(ref.path)
+            if not artifact_path.is_file() or sha256_file(artifact_path) != ref.sha256:
+                raise ValueError(f"worker replay artifact missing or corrupt: {ref.artifact_id}")
+        return result
+    except (OSError, UnicodeError, ValidationError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _append_artifacts(result: RunResult, additions: list[ArtifactRef]) -> RunResult:
+    observed = {ref.artifact_id for ref in result.artifacts}
+    artifacts = [*result.artifacts]
+    for ref in additions:
+        if ref.artifact_id not in observed:
+            artifacts.append(ref)
+            observed.add(ref.artifact_id)
+    return result.model_copy(update={"artifacts": artifacts})
 
 
 def _validated_workspace(
@@ -107,20 +232,119 @@ def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
             pass
 
 
+def _inside(root: Path, candidate: Path, *, label: str) -> Path:
+    root = root.resolve()
+    candidate = candidate.resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError as error:
+        raise SandboxError(f"{label} is outside its trusted root: {candidate}") from error
+    return candidate
+
+
+def _production_plan(
+    request: RunRequest,
+    *,
+    directory: Path,
+    workspace: Path,
+    command: list[str],
+    request_path: Path,
+    result_root: Path,
+    temp_root: Path,
+    policy_path: Path,
+    trusted_output_root: str | Path | None,
+    environment_overrides: dict[str, str] | None,
+) -> PreparedSandbox:
+    """Build and verify the least-authority plan for one production worker."""
+
+    if request.workspace_path is None:
+        raise SandboxError("production execution requires a verified candidate worktree")
+    if trusted_output_root is None:
+        raise SandboxError("production execution requires trusted_output_root")
+    output_root = Path(trusted_output_root).resolve()
+    _inside(output_root, directory, label="attempt directory")
+    output_dir = _inside(output_root, Path(request.output_dir), label="worker output directory")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    config_path = Path(request.config_path).resolve(strict=True)
+    feature_path = Path(request.feature_view_path).resolve(strict=True)
+    read_paths: list[Path] = [workspace, request_path, config_path, feature_path]
+    if request.target_view_path is not None:
+        read_paths.append(Path(request.target_view_path).resolve(strict=True))
+    if request.model_bundle_path is not None:
+        try:
+            bundle = validate_model_bundle(
+                request.model_bundle_path,
+                expected_plugin=request.plugin,
+                expected_config_sha256=request.config_sha256,
+                expected_commit_sha=request.commit_sha,
+            )
+        except ArtifactError as error:
+            raise SandboxError(f"production model bundle is invalid: {error}") from error
+        read_paths.extend((bundle.manifest_path, *bundle.member_paths))
+    elif request.effective_operation == "predict":
+        raise SandboxError("production prediction requires an immutable model bundle")
+    temp_root.mkdir(parents=True, exist_ok=True)
+    result_root.mkdir(parents=True, exist_ok=True)
+    environment = sanitized_environment(
+        workspace=workspace,
+        temp_dir=temp_root,
+        overrides=environment_overrides,
+    )
+    policy = SandboxPolicy(
+        workspace=workspace,
+        read_paths=tuple(dict.fromkeys(path.resolve() for path in read_paths)),
+        write_paths=(output_dir.resolve(), result_root.resolve(), temp_root.resolve()),
+        network_allowed=False,
+        resource_limits=limits_for_request(request.timeout_seconds, request.max_memory_mb),
+    )
+    return production_backend().prepare(policy, command, environment, policy_path)
+
+
+def _fixture_plan(workspace: Path, command: list[str]) -> PreparedSandbox:
+    environment = fixture_environment(workspace)
+    return PreparedSandbox(
+        command=tuple(command),
+        environment=environment,
+        preexec_fn=None,
+        evidence={
+            "schema_version": "1.0",
+            "mode": SandboxMode.FIXTURE.value,
+            "backend": "trusted-fixture-unsandboxed",
+            "sandboxed": False,
+            "reason": "unsandboxed execution is restricted to explicit fixture/test mode",
+            "environment_keys": sorted(environment),
+        },
+    )
+
+
 def execute_request(
     request: RunRequest,
     attempt_dir: str | Path,
     *,
     python_executable: str = sys.executable,
     trusted_worktree_root: str | Path | None = None,
+    sandbox_mode: SandboxMode | str = SandboxMode.FIXTURE,
+    trusted_output_root: str | Path | None = None,
+    environment_overrides: dict[str, str] | None = None,
 ) -> RunResult:
+    started = time.monotonic()
     directory = Path(attempt_dir).resolve()
     directory.mkdir(parents=True, exist_ok=True)
-    request_path = directory / "request.json"
-    result_path = directory / "result.json"
+    request_root = directory / "input"
+    result_root = directory / "worker"
+    temp_root = result_root / "tmp"
+    request_root.mkdir(parents=True, exist_ok=True)
+    result_root.mkdir(parents=True, exist_ok=True)
+    request_path = request_root / "request.json"
+    result_path = result_root / "result.json"
+    policy_path = directory / "sandbox.sb"
+    evidence_path = directory / "sandbox_evidence.json"
+    lease_path = directory / "worker_lease.json"
+    recovery_path = directory / "worker_recovery.json"
+    replay_path = directory / "worker_replay.json"
+    launch_gate_path = result_root / "worker_launch_gate.json"
     stdout_path = directory / "stdout.log"
     stderr_path = directory / "stderr.log"
-    atomic_write_json(request_path, request.model_dump(mode="json", by_alias=True))
     command = [
         python_executable,
         "-m",
@@ -131,63 +355,280 @@ def execute_request(
         str(result_path),
     ]
     command_sha = hashlib.sha256(canonical_json_bytes(command)).hexdigest()
-    started = time.monotonic()
+    request_payload = request.model_dump(mode="json", by_alias=True)
+    request_sha = hashlib.sha256(canonical_json_bytes(request_payload)).hexdigest()
+    try:
+        attempt_lock = AttemptLock.acquire(directory / "worker_lease.lock")
+    except WorkerLeaseError as error:
+        return _contract_result(
+            request,
+            error_type="WorkerLeaseConflict",
+            summary=str(error),
+            command=command,
+            started=started,
+        )
+    if request_path.is_file():
+        try:
+            prior_request = RunRequest.model_validate_json(request_path.read_text(encoding="utf-8"))
+            prior_sha = hashlib.sha256(
+                canonical_json_bytes(prior_request.model_dump(mode="json", by_alias=True))
+            ).hexdigest()
+        except (OSError, UnicodeError, ValidationError, json.JSONDecodeError) as error:
+            attempt_lock.release()
+            return _contract_result(
+                request,
+                error_type="WorkerLeaseConflict",
+                summary=f"attempt request record is corrupt: {error}",
+                command=command,
+                started=started,
+            )
+        if prior_sha != request_sha:
+            attempt_lock.release()
+            return _contract_result(
+                request,
+                error_type="WorkerLeaseConflict",
+                summary="attempt directory belongs to a different request hash",
+                command=command,
+                started=started,
+            )
+    atomic_write_json(request_path, request_payload)
     resources = ResourceTotals()
     timed_out = False
     memory_exceeded = False
     return_code: int | None = None
     invalid_artifact = False
     workspace_error: str | None = None
+    sandbox_error: str | None = None
+    launch_error: str | None = None
+    plan: PreparedSandbox | None = None
+    selected_mode: SandboxMode | None = None
+    execution_sha: str | None = None
     try:
         workspace = _validated_workspace(request, trusted_worktree_root)
     except (OSError, subprocess.SubprocessError, ValueError) as error:
         workspace = repo_root().resolve()
         workspace_error = str(error)
+    if workspace_error is None:
+        try:
+            selected_mode = SandboxMode(sandbox_mode)
+            plan = (
+                _fixture_plan(workspace, command)
+                if selected_mode == SandboxMode.FIXTURE
+                else _production_plan(
+                    request,
+                    directory=directory,
+                    workspace=workspace,
+                    command=command,
+                    request_path=request_path,
+                    result_root=result_root,
+                    temp_root=temp_root,
+                    policy_path=policy_path,
+                    trusted_output_root=trusted_output_root,
+                    environment_overrides=environment_overrides,
+                )
+            )
+            atomic_write_json(evidence_path, plan.evidence)
+        except (OSError, ValueError, SandboxError) as error:
+            sandbox_error = str(error)
+    if workspace_error is None and sandbox_error is None:
+        assert plan is not None
+        assert selected_mode is not None
+        try:
+            requested_executable_sha = sha256_file(Path(python_executable).resolve(strict=True))
+        except OSError as error:
+            sandbox_error = f"requested worker executable is unreadable: {error}"
+            requested_executable_sha = ""
+        execution_sha = hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "request_sha256": request_sha,
+                    "sandbox_mode": selected_mode.value,
+                    "workspace": str(workspace),
+                    "planned_command": list(plan.command),
+                    "requested_executable_sha256": requested_executable_sha,
+                    "declared_environment_sha256": request.environment_sha256,
+                    "environment_overrides_sha256": hashlib.sha256(
+                        canonical_json_bytes(environment_overrides or {})
+                    ).hexdigest(),
+                    "sandbox_policy_sha256": plan.evidence.get("policy_sha256"),
+                    "sandbox_profile_sha256": plan.evidence.get("profile_sha256"),
+                    "lease_wrapper_sha256": hashlib.sha256(
+                        _LEASE_WRAPPER.encode("utf-8")
+                    ).hexdigest(),
+                }
+            )
+        ).hexdigest()
+    if workspace_error is None and sandbox_error is None:
+        assert execution_sha is not None
+        try:
+            recover_orphan_worker(
+                lease_path,
+                recovery_path,
+                request_sha256=request_sha,
+                execution_sha256=execution_sha,
+            )
+        except WorkerLeaseError as error:
+            recovery_ref = (
+                artifact_ref(recovery_path, "worker_recovery")
+                if recovery_path.is_file()
+                else None
+            )
+            attempt_lock.release()
+            return _contract_result(
+                request,
+                error_type="WorkerLeaseConflict",
+                summary=str(error),
+                command=command,
+                started=started,
+                artifacts=[] if recovery_ref is None else [recovery_ref],
+            )
+        replay = _validated_replay(request, result_path)
+        if replay is not None:
+            atomic_write_json(
+                replay_path,
+                {
+                    "schema_version": "1.0",
+                    "outcome": "complete-result-replayed",
+                    "request_sha256": request_sha,
+                    "result_sha256": sha256_file(result_path),
+                    "replayed_at_epoch_ms": int(time.time() * 1000),
+                },
+            )
+            additions: list[ArtifactRef] = [artifact_ref(replay_path, "worker_replay")]
+            for candidate, kind in (
+                (stdout_path, "stdout"),
+                (stderr_path, "stderr"),
+                (evidence_path, "sandbox_evidence"),
+                (policy_path, "sandbox_profile"),
+                (lease_path, "worker_lease"),
+                (recovery_path, "worker_recovery"),
+            ):
+                if candidate.is_file():
+                    additions.append(artifact_ref(candidate, kind))
+            replay = _append_artifacts(replay, additions)
+            attempt_lock.release()
+            return replay
+        if result_path.exists():
+            atomic_write_json(
+                replay_path,
+                {
+                    "schema_version": "1.0",
+                    "outcome": "partial-or-invalid-result-rerun",
+                    "request_sha256": request_sha,
+                    "observed_result_sha256": sha256_file(result_path),
+                    "recorded_at_epoch_ms": int(time.time() * 1000),
+                },
+            )
     with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
         if workspace_error is not None:
             stderr.write(workspace_error.encode("utf-8", errors="replace"))
             stderr.flush()
+        elif sandbox_error is not None:
+            stderr.write(sandbox_error.encode("utf-8", errors="replace"))
+            stderr.flush()
         else:
-            environment = os.environ.copy()
-            source_root = str(workspace / "src")
-            environment["PYTHONPATH"] = (
-                source_root
-                if not environment.get("PYTHONPATH")
-                else source_root + os.pathsep + environment["PYTHONPATH"]
-            )
-            environment["PYTHONDONTWRITEBYTECODE"] = "1"
-            process = subprocess.Popen(
-                command,
-                stdout=stdout,
-                stderr=stderr,
-                start_new_session=True,
-                env=environment,
-                cwd=workspace,
-            )
-            while process.poll() is None:
-                resources.sample(process.pid)
-                elapsed = time.monotonic() - started
-                deadline_reached = int(time.time() * 1000) >= request.deadline_epoch_ms
-                memory_exceeded = bool(
-                    request.max_memory_mb
-                    and resources.peak_rss_bytes > request.max_memory_mb * 1024 * 1024
+            assert plan is not None
+            assert execution_sha is not None
+            active_lease: dict[str, object] | None = None
+            try:
+                launch_gate_path.unlink(missing_ok=True)
+                wrapped_command, identity_token = _lease_wrapper_command(
+                    plan.command, launch_gate_path
                 )
-                if elapsed >= request.timeout_seconds or deadline_reached or memory_exceeded:
-                    timed_out = True
-                    if memory_exceeded:
-                        timed_out = False
+                process = subprocess.Popen(
+                    wrapped_command,
+                    stdout=stdout,
+                    stderr=stderr,
+                    start_new_session=True,
+                    env=plan.environment,
+                    cwd=workspace,
+                    preexec_fn=plan.preexec_fn,
+                )
+                try:
+                    active_lease = begin_worker_lease(
+                        lease_path,
+                        pid=process.pid,
+                        request_sha256=request_sha,
+                        execution_sha256=execution_sha,
+                        planned_command_sha256=command_sha256(plan.command),
+                        identity_token=identity_token,
+                    )
+                    atomic_write_json(
+                        launch_gate_path,
+                        {
+                            "schema_version": "1.0",
+                            "request_sha256": request_sha,
+                            "execution_sha256": execution_sha,
+                            "identity_token_sha256": hashlib.sha256(
+                                identity_token.encode("utf-8")
+                            ).hexdigest(),
+                            "released_at_epoch_ms": int(time.time() * 1000),
+                        },
+                    )
+                except (OSError, WorkerLeaseError) as error:
                     _kill_process_group(process)
-                    break
-                time.sleep(0.05)
-            return_code = process.poll()
-            resources.sample(process.pid)
+                    if active_lease is not None:
+                        close_worker_lease(
+                            lease_path,
+                            active_lease,
+                            reason="launch-handshake-failed",
+                            return_code=process.poll(),
+                        )
+                    raise WorkerLeaseError(
+                        f"worker launched without a durable identity lease: {error}"
+                    ) from error
+                while process.poll() is None:
+                    resources.sample(process.pid)
+                    elapsed = time.monotonic() - started
+                    deadline_reached = int(time.time() * 1000) >= request.deadline_epoch_ms
+                    memory_exceeded = bool(
+                        request.max_memory_mb
+                        and resources.peak_rss_bytes > request.max_memory_mb * 1024 * 1024
+                    )
+                    if elapsed >= request.timeout_seconds or deadline_reached or memory_exceeded:
+                        timed_out = True
+                        if memory_exceeded:
+                            timed_out = False
+                        _kill_process_group(process)
+                        break
+                    time.sleep(0.05)
+                return_code = process.poll()
+                resources.sample(process.pid)
+                close_worker_lease(
+                    lease_path,
+                    active_lease,
+                    reason=(
+                        "memory-limit"
+                        if memory_exceeded
+                        else ("timeout" if timed_out else "process-exit")
+                    ),
+                    return_code=return_code,
+                )
+                launch_gate_path.unlink(missing_ok=True)
+            except (OSError, subprocess.SubprocessError, WorkerLeaseError) as error:
+                launch_error = str(error)
+                stderr.write(launch_error.encode("utf-8", errors="replace"))
+                stderr.flush()
 
     wall_seconds = time.monotonic() - started
     stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")[-4000:]
     stdout_ref = artifact_ref(stdout_path, "stdout")
     stderr_ref = artifact_ref(stderr_path, "stderr")
+    sandbox_ref = artifact_ref(evidence_path, "sandbox_evidence") if evidence_path.is_file() else None
+    profile_ref = artifact_ref(policy_path, "sandbox_profile") if policy_path.is_file() else None
+    lease_ref = artifact_ref(lease_path, "worker_lease") if lease_path.is_file() else None
+    recovery_ref = (
+        artifact_ref(recovery_path, "worker_recovery") if recovery_path.is_file() else None
+    )
+    replay_ref = artifact_ref(replay_path, "worker_replay") if replay_path.is_file() else None
 
-    if result_path.is_file() and not timed_out and workspace_error is None:
+    if (
+        result_path.is_file()
+        and not timed_out
+        and workspace_error is None
+        and sandbox_error is None
+        and launch_error is None
+    ):
         try:
             result = RunResult.model_validate_json(result_path.read_text(encoding="utf-8"))
             if result.command_sha256 != hashlib.sha256(
@@ -195,6 +636,16 @@ def execute_request(
             ).hexdigest():
                 raise ValueError("worker result command hash mismatch")
             artifacts = [*result.artifacts, stdout_ref, stderr_ref]
+            if sandbox_ref is not None:
+                artifacts.append(sandbox_ref)
+            if profile_ref is not None:
+                artifacts.append(profile_ref)
+            if lease_ref is not None:
+                artifacts.append(lease_ref)
+            if recovery_ref is not None:
+                artifacts.append(recovery_ref)
+            if replay_ref is not None:
+                artifacts.append(replay_ref)
             for ref in result.artifacts:
                 artifact_path = Path(ref.path)
                 if not artifact_path.is_file() or sha256_file(artifact_path) != ref.sha256:
@@ -209,24 +660,47 @@ def execute_request(
                 }
             )
             atomic_write_json(result_path, result.model_dump(mode="json", by_alias=True))
+            attempt_lock.release()
             return result
         except (ValidationError, ValueError, json.JSONDecodeError) as error:
             stderr_text += f"\ninvalid worker result: {error}"
             invalid_artifact = True
-    elif return_code == 0 and workspace_error is None and not timed_out:
+    elif (
+        return_code == 0
+        and workspace_error is None
+        and sandbox_error is None
+        and launch_error is None
+        and not timed_out
+    ):
         stderr_text += "\nworker exited successfully without a result artifact"
         invalid_artifact = True
 
     if workspace_error is not None:
         stderr_text = workspace_error
+    elif sandbox_error is not None:
+        stderr_text = sandbox_error
+    elif launch_error is not None:
+        stderr_text = launch_error
 
-    return RunResult(
+    failure_artifacts = [stdout_ref, stderr_ref]
+    if sandbox_ref is not None:
+        failure_artifacts.append(sandbox_ref)
+    if profile_ref is not None:
+        failure_artifacts.append(profile_ref)
+    if lease_ref is not None:
+        failure_artifacts.append(lease_ref)
+    if recovery_ref is not None:
+        failure_artifacts.append(recovery_ref)
+    if replay_ref is not None:
+        failure_artifacts.append(replay_ref)
+
+    failure = RunResult(
         run_id=request.run_id,
         experiment_id=request.experiment_id,
         attempt_id=request.attempt_id,
         status=(
             AttemptStatus.CONTRACT
-            if workspace_error is not None
+            if workspace_error is not None or sandbox_error is not None or launch_error is not None
             else _typed_failure(
                 stderr_text,
                 timed_out,
@@ -241,15 +715,27 @@ def execute_request(
             "WorkspaceViolation"
             if workspace_error is not None
             else (
-                "MemoryLimit"
-                if memory_exceeded
+                "SandboxUnavailable"
+                if sandbox_error is not None
                 else (
-                    "Timeout"
-                    if timed_out
+                    "SandboxLaunchFailure"
+                    if launch_error is not None
                     else (
-                        "InvalidArtifact"
-                        if invalid_artifact
-                        else ("Interrupted" if return_code is not None and return_code < 0 else "WorkerFailure")
+                        "MemoryLimit"
+                        if memory_exceeded
+                        else (
+                            "Timeout"
+                            if timed_out
+                            else (
+                                "InvalidArtifact"
+                                if invalid_artifact
+                                else (
+                                    "Interrupted"
+                                    if return_code is not None and return_code < 0
+                                    else "WorkerFailure"
+                                )
+                            )
+                        )
                     )
                 )
             )
@@ -260,9 +746,11 @@ def execute_request(
         config_sha256=request.config_sha256,
         data_view_sha256=request.data_view_sha256,
         environment_sha256=request.environment_sha256,
-        artifacts=[stdout_ref, stderr_ref],
+        artifacts=failure_artifacts,
         wall_seconds=wall_seconds,
         cpu_user_seconds=resources.cpu_user_seconds,
         cpu_system_seconds=resources.cpu_system_seconds,
         peak_rss_bytes=resources.peak_rss_bytes,
     )
+    attempt_lock.release()
+    return failure
