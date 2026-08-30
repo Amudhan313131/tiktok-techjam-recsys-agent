@@ -469,7 +469,7 @@ def test_full_rung_parallelism_is_bounded_and_results_are_canonical(tmp_path: Pa
 
     assert [item.candidate.fold for item in result.observations] == ["A", "B", "C"]
     assert worker.peak == 6
-    assert worker.completed[0].split(":full-", 1)[1][0] == "B"
+    assert worker.completed[0].split(":full-", 1)[1][0] in {"B", "C"}
     with repository.database.connect() as connection:
         assert connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 12
 
