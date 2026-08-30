@@ -17,6 +17,49 @@ from rex.store.repository import ExperimentRepository
 HASH = "0" * 64
 
 
+def test_baseline_champion_report_uses_the_canonical_metric_scale(tmp_path: Path) -> None:
+    database = Database(tmp_path / "state.sqlite3")
+    database.initialize()
+    repository = ExperimentRepository(database)
+    run_id = "baseline-scale"
+    repository.create_run(
+        run_id=run_id,
+        deadline_epoch_ms=deadline_epoch_ms(100),
+        root_commit="root",
+        environment_sha256=HASH,
+        data_manifest_sha256=HASH,
+        evaluator_sha256=HASH,
+    )
+    repository.transition_run(run_id, RunState.INITIALIZING, RunState.BASELINE_VERIFYING)
+    baseline_path = tmp_path / "baseline.json"
+    baseline_path.write_text('{"accepted":true}\n', encoding="utf-8")
+    baseline_ref = artifact_ref(baseline_path, "baseline_gate")
+    repository.register_artifact(baseline_ref)
+    repository.establish_baseline(
+        run_id=run_id,
+        metrics=Metrics(
+            GAUC=0.6679479198936048,
+            **{"nDCG@5": 0.536126483327846},
+            primary=0.6020372016107254,
+            users=22_377,
+            rows=124_909,
+            evaluator_sha256=HASH,
+            split="valid",
+        ),
+        evidence_artifact_ids=[baseline_ref.artifact_id],
+    )
+
+    output = tmp_path / "report"
+    build_report(database, run_id, output)
+    results = json.loads((output / "results.json").read_text(encoding="utf-8"))
+
+    assert results["validation_best"]["primary"] == pytest.approx(0.602037202)
+    assert results["run_verified_baseline"]["primary"] == pytest.approx(0.602037202)
+    assert results["delta_over_official_baseline"]["primary"] == pytest.approx(
+        0.000437202
+    )
+
+
 def test_report_includes_run_level_baseline_and_pre_experiment_llm_evidence(
     tmp_path: Path,
 ) -> None:

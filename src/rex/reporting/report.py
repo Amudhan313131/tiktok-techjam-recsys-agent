@@ -15,6 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from rex.control.budget import SCALE
 from rex.data.manifest import sha256_file
 from rex.execution.artifacts import artifact_ref, atomic_write_json
 from rex.store.db import Database
@@ -435,7 +436,7 @@ def _validation_results(
         selected = {
             "GAUC": float(baseline_row["gauc"]),
             "nDCG@5": float(baseline_row["ndcg5"]),
-            "primary": float(baseline_row["primary_units"]) / 1_000_000.0,
+            "primary": float(baseline_row["primary_units"]) / SCALE,
             "split": "valid",
         }
     else:
@@ -473,7 +474,7 @@ def _validation_results(
         else {
             "GAUC": float(baseline_row["gauc"]),
             "nDCG@5": float(baseline_row["ndcg5"]),
-            "primary": float(baseline_row["primary_units"]) / 1_000_000.0,
+            "primary": float(baseline_row["primary_units"]) / SCALE,
             "split": "valid",
         }
     )
