@@ -286,7 +286,9 @@ It then:
 6. runs the LightGBM, sandbox, and explicitly selected live-provider doctors;
 7. starts one production run with a durable external deadline;
 8. preserves and retries an inapplicable agent diff at most twice, and permits
-   at most two same-run coordinator relaunches before training only when the
+   the same bounded repairs for syntax, static-gate, and fixture-test failures;
+   rejected patches are rolled back exactly before retry, and at most two
+   same-run coordinator relaunches before training are permitted only when the
    durable preparation progress token changes;
 9. waits for a worker lease owned by that coordinator, records the exact
    attempt/checkpoint, and injects one `SIGKILL`;
@@ -297,6 +299,19 @@ It then:
     test prediction or scoring work;
 13. recursively revalidates every winning checkpoint member, report artifact,
     log, recovery file, and status snapshot before sealing the R3 manifest.
+
+Full folds are scheduled in canonical A/B/C order through a resource-bounded
+executor. Candidate and control pipelines may overlap, but each pipeline keeps
+fit before predict. The 8-core/16-GB rehearsal profile uses six one-thread,
+2-GB workers so all three fold pairs can execute concurrently without allowing
+LightGBM to multiply its own thread pool.
+
+Cross-run baseline and control caches live outside the clean clone and output.
+Keys cover all scientific identities, entries are locked and atomically
+published, and hits are copied into run-local evidence. Baseline hits replay the
+current official evaluator; control metrics are always recalculated. Corrupt
+entries are quarantined and ordinary training resumes. Cache evidence is part
+of the validation-only audit and final R3 seal.
 
 The envelope stops through convergence, the 50-hypothesis/evaluation caps, or
 the external deadline. The six hours are a ceiling, not a target duration. The

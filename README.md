@@ -248,10 +248,27 @@ was recorded once, the prior champion survived, and no test prediction or test
 metric was created.
 
 Agent-authored diffs are checked against byte-exact allowlisted snapshots. An
-inapplicable diff is preserved as evidence and may receive at most two new,
-attempt-scoped coding repairs; protected-path failures are never retried. If the
-coordinator itself exits before training, the envelope may relaunch the same run
-at most twice, only when the database proves preparation made durable progress.
+inapplicable diff, Python syntax error, static-gate failure, or fixture-test
+failure is preserved as evidence and may receive at most two new,
+attempt-scoped coding repairs from one shared budget. Every rejected patch is
+reversed and the parent worktree is verified before another attempt. Protected
+path and sandbox-policy failures are never retried. If the coordinator itself
+exits before training, the envelope may relaunch the same run at most twice,
+only when the database proves preparation made durable progress.
+
+Full-shadow folds use a bounded deterministic executor. The shipped 8-core,
+16-GB rehearsal profile permits six 2-GB, one-thread model pipelines, allowing
+candidate and control for folds A, B, and C to run together. Fit still precedes
+prediction within each pipeline, and evidence is always combined in A/B/C
+order regardless of completion order.
+
+Two optional shared caches avoid scientifically identical work across clean
+runs. The baseline cache is keyed by data, baseline code/config, Python
+environment, and evaluator hashes; every hit replays the official validation
+evaluator. The control cache includes the exact config, data/fold, environment,
+seed, feature provenance, and source commit. Both caches are immutable,
+validation-only, atomically published, copied into run-local evidence, and
+quarantine corrupt entries. They never contain test targets or test scoring.
 
 The output directory must be outside the repository and must not already
 contain another run:
@@ -260,8 +277,13 @@ contain another run:
 python3 scripts/run_clean_rehearsal.py start \
   --data-dir "$PWD/data/KuaiRand-Pure/data" \
   --output-dir /absolute/path/to/rex-r3-output \
+  --baseline-cache-dir /absolute/path/to/rex-shared-cache/baseline \
+  --control-cache-dir /absolute/path/to/rex-shared-cache/controls \
   --llm codex_cli
 ```
+
+The cache flags are optional. Their defaults are sibling directories under
+`.rex-shared-cache`, outside both the source checkout and rehearsal output.
 
 Use `--llm claude_cli` for the locally authenticated Claude CLI. Direct API
 mode additionally requires `--authorize-paid-api`; `auto` uses that flag only
