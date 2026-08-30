@@ -1,12 +1,12 @@
-anthropic>=0.40.0
+anthropic==1.2.0
 jsonschema==4.26.0
 numpy==2.3.5
 openai==3.6.0
-pandas>=2.2.0
+pandas==3.0.5
 psutil==7.1.2
 pydantic==2.12.5
 pyyaml==6.0.3
-
-# Optional model backends. Install only the backend selected for a run.
-# lightgbm==4.7.0
-# scikit-learn==1.9.0
+lightgbm==4.7.0
+scikit-learn==1.9.0
+pytest==9.1.1
+ruff==0.16.5

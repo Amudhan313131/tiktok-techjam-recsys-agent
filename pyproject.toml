@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=75", "wheel"]
+requires = ["setuptools==80.10.2", "wheel==0.46.1"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,11 +8,11 @@ version = "0.1.0"
 description = "Evidence-audited autonomous ML research agent for KuaiRand-Pure"
 requires-python = ">=3.11"
 dependencies = [
-  "anthropic>=0.40.0",
+  "anthropic==1.2.0",
   "jsonschema==4.26.0",
   "numpy==2.3.5",
   "openai==3.6.0",
-  "pandas>=2.2.0",
+  "pandas==3.0.5",
   "psutil==7.1.2",
   "pydantic==2.12.5",
   "pyyaml==6.0.3",
@@ -20,7 +20,7 @@ dependencies = [
 
 [project.optional-dependencies]
 tree = ["lightgbm==4.7.0", "scikit-learn==1.9.0"]
-dev = ["pytest>=9.0.0", "ruff==0.16.5"]
+dev = ["pytest==9.1.1", "ruff==0.16.5"]
 
 [project.scripts]
 rex = "rex.cli:main"
@@ -33,15 +33,22 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "rex.store" = ["schema.sql"]
+"rex.submission" = ["schema.sql"]
 
 [tool.pytest.ini_options]
 addopts = "-ra"
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+  "real_data: requires the local KuaiRand-Pure archive and may take several minutes",
+  "production: exercises the production supervisor rather than generated fixture plumbing",
+  "sandbox: requires a supported operating-system sandbox backend",
+]
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+exclude = ["kuairand-starter-kit"]
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F"]
