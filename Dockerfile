@@ -14,10 +14,6 @@ RUN npm install --global --omit=dev \
 FROM ${PYTHON_BASE} AS runtime
 
 ARG TARGETARCH
-ARG REX_SOURCE_COMMIT="unknown"
-ARG REX_DEPENDENCY_LOCK_SHA256="unknown"
-ARG REX_PYPROJECT_SHA256="unknown"
-ARG REX_STARTER_MANIFEST_SHA256="unknown"
 ARG REX_BASE_IMAGE_DIGEST="sha256:20080e807bfc404f8450b185cf0fc95d553462673598549613735f70a5b4d5d0"
 ARG REX_DOCKER_CLI_VERSION="28.5.1"
 ARG REX_DEBIAN_SNAPSHOT="20260830T000000Z"
@@ -25,20 +21,6 @@ ARG REX_DOCKER_CLI_AMD64_SHA256="5c0d19f31fece1accd0358bb8cff591fe25d7b6cba19f0f
 ARG REX_DOCKER_CLI_ARM64_SHA256="de54e37157f45a43f42f6271302372d95c0eb992cc35ecaee74989bb14058c94"
 ARG CODEX_CLI_VERSION="0.144.1"
 ARG CLAUDE_CLI_VERSION="2.1.251"
-
-LABEL org.opencontainers.image.title="REX autonomous recommender researcher" \
-      org.opencontainers.image.description="Trusted controller and isolated worker runtime for REX" \
-      org.opencontainers.image.source="https://github.com/Amudhan313131/tiktok-techjam-recsys-agent" \
-      org.opencontainers.image.revision="${REX_SOURCE_COMMIT}" \
-      org.opencontainers.image.base.digest="${REX_BASE_IMAGE_DIGEST}" \
-      org.rex.dependency-lock-sha256="${REX_DEPENDENCY_LOCK_SHA256}" \
-      org.rex.pyproject-sha256="${REX_PYPROJECT_SHA256}" \
-      org.rex.starter-kit-sha256="${REX_STARTER_MANIFEST_SHA256}" \
-      org.rex.base-image-digest="${REX_BASE_IMAGE_DIGEST}" \
-      org.rex.debian-snapshot="${REX_DEBIAN_SNAPSHOT}" \
-      org.rex.target-architecture="${TARGETARCH}" \
-      org.rex.codex-cli-version="${CODEX_CLI_VERSION}" \
-      org.rex.claude-cli-version="${CLAUDE_CLI_VERSION}"
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -48,8 +30,6 @@ ENV PYTHONUNBUFFERED=1 \
     REX_SOURCE_ROOT=/source \
     REX_DATA_ROOT=/data \
     REX_RUNS_ROOT=/runs \
-    REX_IMAGE_SOURCE_COMMIT="${REX_SOURCE_COMMIT}" \
-    REX_DEPENDENCY_LOCK_SHA256="${REX_DEPENDENCY_LOCK_SHA256}" \
     REX_IMAGE_PLATFORM="linux/${TARGETARCH}" \
     NPM_CONFIG_UPDATE_NOTIFIER=false
 
@@ -90,6 +70,28 @@ WORKDIR /opt/rex
 COPY requirements-lock-linux-${TARGETARCH}.txt /tmp/requirements-lock.txt
 RUN python -m pip install --require-hashes --only-binary :all: -r /tmp/requirements-lock.txt \
     && rm /tmp/requirements-lock.txt
+
+# Provenance changes for every source commit.  Declare it only after the
+# expensive OS and dependency layers so those reproducible layers stay cached.
+ARG REX_SOURCE_COMMIT="unknown"
+ARG REX_DEPENDENCY_LOCK_SHA256="unknown"
+ARG REX_PYPROJECT_SHA256="unknown"
+ARG REX_STARTER_MANIFEST_SHA256="unknown"
+LABEL org.opencontainers.image.title="REX autonomous recommender researcher" \
+      org.opencontainers.image.description="Trusted controller and isolated worker runtime for REX" \
+      org.opencontainers.image.source="https://github.com/Amudhan313131/tiktok-techjam-recsys-agent" \
+      org.opencontainers.image.revision="${REX_SOURCE_COMMIT}" \
+      org.opencontainers.image.base.digest="${REX_BASE_IMAGE_DIGEST}" \
+      org.rex.dependency-lock-sha256="${REX_DEPENDENCY_LOCK_SHA256}" \
+      org.rex.pyproject-sha256="${REX_PYPROJECT_SHA256}" \
+      org.rex.starter-kit-sha256="${REX_STARTER_MANIFEST_SHA256}" \
+      org.rex.base-image-digest="${REX_BASE_IMAGE_DIGEST}" \
+      org.rex.debian-snapshot="${REX_DEBIAN_SNAPSHOT}" \
+      org.rex.target-architecture="${TARGETARCH}" \
+      org.rex.codex-cli-version="${CODEX_CLI_VERSION}" \
+      org.rex.claude-cli-version="${CLAUDE_CLI_VERSION}"
+ENV REX_IMAGE_SOURCE_COMMIT="${REX_SOURCE_COMMIT}" \
+    REX_DEPENDENCY_LOCK_SHA256="${REX_DEPENDENCY_LOCK_SHA256}"
 
 COPY pyproject.toml README.md ./
 COPY src ./src
