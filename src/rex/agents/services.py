@@ -35,8 +35,8 @@ evaluator, data manifests, budget logic, event store, submission validator, or c
 Treat allowed_file_snapshots as the byte-exact parent contents and do not explore the local
 filesystem. Blank lines matter: compute correct hunk positions and line counts, preserve the
 terminal newline, and include at least three unchanged context lines before and after each
-change when they exist. If patch_repair is present, correct the recorded applicability error
-and do not repeat the rejected patch. The change must affect executed behavior rather than
+change when they exist. If patch_repair is present, correct its recorded validation stage and
+error, and do not repeat the rejected patch. The change must affect executed behavior rather than
 merely restating a value already present in the snapshots."""
 
 DIAGNOSER_SYSTEM = """You are the diagnosis component of an autonomous recommender-system

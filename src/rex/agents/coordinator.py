@@ -13,7 +13,11 @@ from typing import Any, Callable
 from rex.agents.patch_guard import PatchPolicy, validate_patch
 from rex.agents.provider import ProviderResponse
 from rex.agents.services import AgentDecision, CodingService, PatchResponse, ProposalService
-from rex.agents.static_audit import audit_changed_files, audit_fixture_bias_only
+from rex.agents.static_audit import (
+    StaticAuditRejected,
+    audit_changed_files,
+    audit_fixture_bias_only,
+)
 from rex.agents.workspace import GitWorkspace, PatchApplicationRejected
 from rex.contracts import AttemptStatus, ExperimentProposal, ExperimentState
 from rex.execution.artifacts import artifact_ref, atomic_write_json
@@ -31,7 +35,21 @@ class PreparedExperiment:
 
 
 class PatchRepairsExhausted(RuntimeError):
-    """All bounded semantic patch repairs were rejected by git apply."""
+    """All bounded semantic patch repairs failed candidate validation."""
+
+
+class CandidateGateRejected(RuntimeError):
+    """Candidate code ran in a gate but did not satisfy it."""
+
+
+@dataclass(frozen=True)
+class ValidatedPatchAttempt:
+    decision: AgentDecision
+    patch: str
+    paths: tuple[str, ...]
+    role: str
+    static_log_artifact_id: str
+    fixture_log_artifact_id: str
 
 
 class PatchTransactionCoordinator:
@@ -136,7 +154,7 @@ class PatchTransactionCoordinator:
                         "proposal": proposal.model_dump(mode="json"),
                         **coding_context,
                     }
-                    patch_decision, patch, paths = self._apply_patch_attempts(
+                    validated = self._apply_patch_attempts(
                         run_id=run_id,
                         parent_commit=parent_commit,
                         workspace=workspace,
@@ -144,11 +162,8 @@ class PatchTransactionCoordinator:
                         context=patch_context,
                         artifact_dir=artifact_dir,
                     )
-                    audit_changed_files(workspace.root, paths)
-                    if coding_context.get("fixture_only"):
-                        audit_fixture_bias_only(self.project_root, workspace.root, paths)
                     patch_path = artifact_dir / "patch.diff"
-                    patch_path.write_text(patch, encoding="utf-8")
+                    patch_path.write_text(validated.patch, encoding="utf-8")
                     patch_ref = artifact_ref(patch_path, "patch")
                     self.repository.register_artifact(
                         patch_ref, experiment_id=proposal.experiment_id
@@ -159,41 +174,55 @@ class PatchTransactionCoordinator:
                         state,
                         ExperimentState.PATCHED,
                         "patched",
-                        {"paths": paths, "patch_artifact_id": patch_ref.artifact_id},
+                        {
+                            "paths": validated.paths,
+                            "patch_artifact_id": patch_ref.artifact_id,
+                            "accepted_patch_role": validated.role,
+                        },
                     )
                     self._checkpoint("patched", proposal.experiment_id)
                     continue
                 if state == ExperimentState.PATCHED:
-                    static_ref = self._run_gate(
-                        proposal.experiment_id,
-                        workspace.root,
-                        artifact_dir,
-                        "static",
-                        self.static_command,
+                    accepted = self._accepted_patch_validation(artifact_dir)
+                    static_artifact_id = (
+                        str(accepted["static_log_artifact_id"])
+                        if accepted is not None
+                        else self._run_gate(
+                            proposal.experiment_id,
+                            workspace.root,
+                            artifact_dir,
+                            "static",
+                            self.static_command,
+                        ).artifact_id
                     )
                     self._transition(
                         proposal.experiment_id,
                         state,
                         ExperimentState.STATIC_VALID,
                         "static-valid",
-                        {"log_artifact_id": static_ref.artifact_id},
+                        {"log_artifact_id": static_artifact_id},
                     )
                     self._checkpoint("static_valid", proposal.experiment_id)
                     continue
                 if state == ExperimentState.STATIC_VALID:
-                    fixture_ref = self._run_gate(
-                        proposal.experiment_id,
-                        workspace.root,
-                        artifact_dir,
-                        "fixture",
-                        self.fixture_command,
+                    accepted = self._accepted_patch_validation(artifact_dir)
+                    fixture_artifact_id = (
+                        str(accepted["fixture_log_artifact_id"])
+                        if accepted is not None
+                        else self._run_gate(
+                            proposal.experiment_id,
+                            workspace.root,
+                            artifact_dir,
+                            "fixture",
+                            self.fixture_command,
+                        ).artifact_id
                     )
                     self._transition(
                         proposal.experiment_id,
                         state,
                         ExperimentState.FIXTURE_VALID,
                         "fixture-valid",
-                        {"log_artifact_id": fixture_ref.artifact_id},
+                        {"log_artifact_id": fixture_artifact_id},
                     )
                     self._checkpoint("fixture_valid", proposal.experiment_id)
                     continue
@@ -239,12 +268,13 @@ class PatchTransactionCoordinator:
         proposal: ExperimentProposal,
         context: dict[str, Any],
         artifact_dir: Path,
-    ) -> tuple[AgentDecision, str, tuple[str, ...]]:
+    ) -> ValidatedPatchAttempt:
         previous_rejection: dict[str, Any] | None = None
         attempts = self.max_patch_repairs + 1
         for attempt in range(1, attempts + 1):
             role = self._patch_attempt_role(attempt)
             rejection_path = artifact_dir / f"{role}-rejection.json"
+            accepted_path = artifact_dir / f"{role}-accepted.json"
             repair = None
             attempt_context = dict(context)
             if attempt > 1:
@@ -254,11 +284,12 @@ class PatchTransactionCoordinator:
                 attempt_context["patch_repair"] = {
                     "attempt": attempt,
                     "repair_number": attempt - 1,
-                    "applicability_error": previous_rejection["error"],
+                    "failure_stage": previous_rejection["failure_stage"],
+                    "validation_error": previous_rejection["error"],
                     "rejected_patch": previous_rejection["patch"],
                     "instruction": (
                         "Use allowed_file_snapshots as the authoritative byte-exact base; "
-                        "produce a different diff with correct hunk context and counts."
+                        "produce a different diff that fixes the recorded validation failure."
                     ),
                 }
                 prior_ref = artifact_ref(
@@ -285,8 +316,46 @@ class PatchTransactionCoordinator:
             )
             patch = PatchResponse.model_validate(patch_decision.parsed).patch
             response_ref = artifact_ref(artifact_dir / f"{role}-response.json", "llm_response")
+            if accepted_path.is_file():
+                accepted = self._load_patch_outcome(
+                    accepted_path,
+                    role=role,
+                    attempt=attempt,
+                    patch=patch,
+                )
+                paths = self._apply_or_verify_patch(workspace, patch, proposal)
+                if tuple(accepted["paths"]) != paths:
+                    raise RuntimeError("accepted patch paths drifted from durable validation")
+                accepted_ref = artifact_ref(accepted_path, "patch_acceptance")
+                self.repository.register_artifact(
+                    accepted_ref, experiment_id=proposal.experiment_id
+                )
+                if repair is not None and not repair["completed"]:
+                    self.repository.complete_experiment_repair(
+                        str(repair["repair_id"]),
+                        evidence_artifact_ids=[
+                            response_ref.artifact_id,
+                            accepted_ref.artifact_id,
+                            str(accepted["static_log_artifact_id"]),
+                            str(accepted["fixture_log_artifact_id"]),
+                        ],
+                    )
+                return ValidatedPatchAttempt(
+                    decision=patch_decision,
+                    patch=patch,
+                    paths=paths,
+                    role=role,
+                    static_log_artifact_id=str(accepted["static_log_artifact_id"]),
+                    fixture_log_artifact_id=str(accepted["fixture_log_artifact_id"]),
+                )
             if rejection_path.is_file():
-                previous_rejection = json.loads(rejection_path.read_text(encoding="utf-8"))
+                previous_rejection = self._load_patch_outcome(
+                    rejection_path,
+                    role=role,
+                    attempt=attempt,
+                    patch=patch,
+                )
+                self._restore_rejected_patch(workspace, patch, proposal, parent_commit)
                 if repair is not None and not repair["completed"]:
                     rejection_ref = artifact_ref(rejection_path, "patch_rejection")
                     self.repository.register_artifact(
@@ -297,14 +366,47 @@ class PatchTransactionCoordinator:
                         evidence_artifact_ids=[response_ref.artifact_id, rejection_ref.artifact_id],
                     )
                 continue
+            failure_stage = "application"
             try:
                 paths = self._apply_or_verify_patch(workspace, patch, proposal)
-            except PatchApplicationRejected as error:
-                self._require_pristine_parent(workspace, parent_commit)
+                failure_stage = "static_audit"
+                audit_changed_files(workspace.root, paths)
+                if context.get("fixture_only"):
+                    failure_stage = "fixture_audit"
+                    audit_fixture_bias_only(self.project_root, workspace.root, paths)
+                gate_dir = artifact_dir / "gate-attempts" / role
+                failure_stage = "static_gate"
+                static_ref = self._run_gate(
+                    proposal.experiment_id,
+                    workspace.root,
+                    gate_dir,
+                    "static",
+                    self.static_command,
+                )
+                failure_stage = "fixture_gate"
+                fixture_ref = self._run_gate(
+                    proposal.experiment_id,
+                    workspace.root,
+                    gate_dir,
+                    "fixture",
+                    self.fixture_command,
+                )
+            except (PatchApplicationRejected, StaticAuditRejected, CandidateGateRejected) as error:
+                if isinstance(error, StaticAuditRejected) and not self._repairable_static_failure(
+                    error
+                ):
+                    raise
+                if failure_stage == "application":
+                    self._require_pristine_parent(workspace, parent_commit)
+                else:
+                    self._restore_rejected_patch(workspace, patch, proposal, parent_commit)
                 previous_rejection = {
                     "schema_version": "1.0",
+                    "outcome": "rejected",
+                    "role": role,
                     "attempt": attempt,
                     "repair_number": max(0, attempt - 1),
+                    "failure_stage": failure_stage,
                     "error_type": type(error).__name__,
                     "error": str(error)[-2000:],
                     "patch_sha256": hashlib.sha256(patch.encode("utf-8")).hexdigest(),
@@ -325,16 +427,94 @@ class PatchTransactionCoordinator:
                 self._checkpoint(f"{role}_rejected", proposal.experiment_id)
                 if attempt == attempts:
                     raise PatchRepairsExhausted(
-                        f"patch remained inapplicable after {attempts} attempts: {error}"
+                        f"patch failed {failure_stage} after {attempts} attempts: {error}"
                     ) from error
                 continue
+            accepted = {
+                "schema_version": "1.0",
+                "outcome": "accepted",
+                "role": role,
+                "attempt": attempt,
+                "repair_number": max(0, attempt - 1),
+                "patch_sha256": hashlib.sha256(patch.encode("utf-8")).hexdigest(),
+                "paths": list(paths),
+                "static_log_artifact_id": static_ref.artifact_id,
+                "fixture_log_artifact_id": fixture_ref.artifact_id,
+                "head": parent_commit,
+            }
+            atomic_write_json(accepted_path, accepted)
+            accepted_ref = artifact_ref(accepted_path, "patch_acceptance")
+            self.repository.register_artifact(
+                accepted_ref, experiment_id=proposal.experiment_id
+            )
             if repair is not None and not repair["completed"]:
                 self.repository.complete_experiment_repair(
                     str(repair["repair_id"]),
-                    evidence_artifact_ids=[response_ref.artifact_id],
+                    evidence_artifact_ids=[
+                        response_ref.artifact_id,
+                        accepted_ref.artifact_id,
+                        static_ref.artifact_id,
+                        fixture_ref.artifact_id,
+                    ],
                 )
-            return patch_decision, patch, paths
-        raise PatchRepairsExhausted("patch repair loop ended without an applicable diff")
+            self._checkpoint(f"{role}_accepted", proposal.experiment_id)
+            return ValidatedPatchAttempt(
+                decision=patch_decision,
+                patch=patch,
+                paths=paths,
+                role=role,
+                static_log_artifact_id=static_ref.artifact_id,
+                fixture_log_artifact_id=fixture_ref.artifact_id,
+            )
+        raise PatchRepairsExhausted("patch repair loop ended without a validated diff")
+
+    def _accepted_patch_validation(self, artifact_dir: Path) -> dict[str, Any] | None:
+        for attempt in range(self.max_patch_repairs + 1, 0, -1):
+            role = self._patch_attempt_role(attempt)
+            path = artifact_dir / f"{role}-accepted.json"
+            if path.is_file():
+                value = json.loads(path.read_text(encoding="utf-8"))
+                if value.get("outcome") != "accepted" or value.get("role") != role:
+                    raise RuntimeError("durable accepted patch validation is malformed")
+                return value
+        return None
+
+    @staticmethod
+    def _load_patch_outcome(
+        path: Path,
+        *,
+        role: str,
+        attempt: int,
+        patch: str,
+    ) -> dict[str, Any]:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        expected_sha256 = hashlib.sha256(patch.encode("utf-8")).hexdigest()
+        if (
+            value.get("role") != role
+            or int(value.get("attempt", -1)) != attempt
+            or value.get("patch_sha256") != expected_sha256
+        ):
+            raise RuntimeError("durable patch outcome drifted from its provider response")
+        return value
+
+    def _restore_rejected_patch(
+        self,
+        workspace: GitWorkspace,
+        patch: str,
+        proposal: ExperimentProposal,
+        parent_commit: str,
+    ) -> None:
+        status = self._git(
+            workspace.root, "status", "--porcelain", "--untracked-files=normal"
+        )
+        if status:
+            workspace.revert(patch, self.patch_policy, proposal.files_to_change)
+        self._require_pristine_parent(workspace, parent_commit)
+
+    @staticmethod
+    def _repairable_static_failure(error: StaticAuditRejected) -> bool:
+        message = str(error)
+        return message.startswith("syntax error in ") or message.startswith("fixture patch ")
 
     def _patch_attempt_role(self, attempt: int) -> str:
         if self.max_patch_repairs == 0:
@@ -365,7 +545,7 @@ class PatchTransactionCoordinator:
             failure_status=AttemptStatus.CONTRACT,
             plan={
                 "action": "request_constrained_patch",
-                "reason": "generated diff did not apply to the declared parent",
+                "reason": "generated diff failed bounded candidate validation",
                 "rejection_artifact_id": rejection_artifact_id,
             },
             maximum=self.max_patch_repairs,
@@ -677,32 +857,58 @@ class PatchTransactionCoordinator:
         command: tuple[str, ...],
     ):
         log_path = artifact_dir / f"{name}.log"
-        result = execute_gate(
-            name=name,
-            command=command,
-            workspace=cwd,
-            artifact_dir=artifact_dir,
-            timeout_seconds=self.command_timeout_seconds,
-            sandbox_mode=self.sandbox_mode,
-            trusted_worktree_root=(
-                self.worktree_root if self.sandbox_mode == SandboxMode.PRODUCTION else None
-            ),
-            trusted_output_root=self.trusted_output_root,
-        )
-        output = f"$ {' '.join(command)}\n{result.stdout}\n{result.stderr}"
-        log_path.write_text(output, encoding="utf-8")
+        result_path = artifact_dir / f"{name}-result.json"
+        if not result_path.is_file():
+            result = execute_gate(
+                name=name,
+                command=command,
+                workspace=cwd,
+                artifact_dir=artifact_dir,
+                timeout_seconds=self.command_timeout_seconds,
+                sandbox_mode=self.sandbox_mode,
+                trusted_worktree_root=(
+                    self.worktree_root if self.sandbox_mode == SandboxMode.PRODUCTION else None
+                ),
+                trusted_output_root=self.trusted_output_root,
+            )
+            output = f"$ {' '.join(command)}\n{result.stdout}\n{result.stderr}"
+            log_path.write_text(output, encoding="utf-8")
+            atomic_write_json(
+                result_path,
+                {
+                    "schema_version": "1.0",
+                    "name": name,
+                    "command": list(command),
+                    "return_code": result.return_code,
+                    "timed_out": result.timed_out,
+                    "stderr": result.stderr[-1000:],
+                    "evidence_path": str(result.evidence_path),
+                    "profile_path": (
+                        str(result.profile_path) if result.profile_path is not None else None
+                    ),
+                },
+            )
+        durable = json.loads(result_path.read_text(encoding="utf-8"))
+        if durable.get("name") != name or durable.get("command") != list(command):
+            raise RuntimeError(f"durable {name} gate result drifted")
         ref = artifact_ref(log_path, f"{name}_log")
         self.repository.register_artifact(ref, experiment_id=experiment_id)
-        evidence_ref = artifact_ref(result.evidence_path, f"{name}_sandbox_evidence")
+        evidence_ref = artifact_ref(
+            Path(str(durable["evidence_path"])), f"{name}_sandbox_evidence"
+        )
         self.repository.register_artifact(evidence_ref, experiment_id=experiment_id)
-        if result.profile_path is not None:
-            profile_ref = artifact_ref(result.profile_path, f"{name}_sandbox_profile")
+        if durable.get("profile_path") is not None:
+            profile_ref = artifact_ref(
+                Path(str(durable["profile_path"])), f"{name}_sandbox_profile"
+            )
             self.repository.register_artifact(profile_ref, experiment_id=experiment_id)
-        if result.timed_out:
-            raise RuntimeError(f"{name} gate timed out")
-        if result.return_code:
-            raise RuntimeError(
-                f"{name} gate failed with exit {result.return_code}: {result.stderr[-1000:]}"
+        result_ref = artifact_ref(result_path, f"{name}_result")
+        self.repository.register_artifact(result_ref, experiment_id=experiment_id)
+        if durable["timed_out"]:
+            raise CandidateGateRejected(f"{name} gate timed out")
+        if durable["return_code"]:
+            raise CandidateGateRejected(
+                f"{name} gate failed with exit {durable['return_code']}: {durable['stderr']}"
             )
         return ref
 

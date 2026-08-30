@@ -158,6 +158,13 @@ def execute_gate(
             raise GateExecutionError(str(error)) from error
     else:
         environment = fixture_environment(workspace_path)
+        environment.update(
+            {
+                "PYTHONPYCACHEPREFIX": str(temp_root / "pycache"),
+                "PYTEST_ADDOPTS": "-p no:cacheprovider",
+                "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",
+            }
+        )
         plan_command = tuple(command)
         plan = None
         evidence = {

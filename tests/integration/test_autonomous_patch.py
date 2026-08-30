@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -372,3 +373,130 @@ def test_unapplicable_live_patch_repairs_are_durable_and_bounded(
         worktree = tmp_path / "worktrees" / "repaired-patch"
         assert git(worktree, "status", "--porcelain") == ""
         assert git(worktree, "rev-parse", "HEAD") == parent
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "bad_line", "static_command"),
+    [
+        ("static_audit", "VALUE = (", ("python3", "-m", "compileall", "-q", "src")),
+        (
+            "static_gate",
+            "VALUE = 2",
+            (
+                "python3",
+                "-c",
+                "from pathlib import Path; assert 'VALUE = 3' in "
+                "Path('src/rex/models/experimental/model.py').read_text()",
+            ),
+        ),
+        ("fixture_gate", "VALUE = 2", ("python3", "-m", "compileall", "-q", "src")),
+    ],
+)
+def test_candidate_validation_failures_receive_one_shared_patch_repair(
+    tmp_path: Path,
+    failure_stage: str,
+    bad_line: str,
+    static_command: tuple[str, ...],
+) -> None:
+    project = tmp_path / "project"
+    model = project / "src/rex/models/experimental/model.py"
+    fixture = project / "tests/fixture/test_smoke.py"
+    model.parent.mkdir(parents=True)
+    fixture.parent.mkdir(parents=True)
+    model.write_text("VALUE = 1\n", encoding="utf-8")
+    fixture.write_text("def test_smoke():\n    assert True\n", encoding="utf-8")
+    git(project, "init")
+    git(project, "config", "user.email", "rex@example.invalid")
+    git(project, "config", "user.name", "REX Gate Repair")
+    git(project, "add", "--all")
+    git(project, "commit", "-m", "gate repair root")
+    parent = git(project, "rev-parse", "HEAD")
+
+    database = Database(tmp_path / "transaction.sqlite3")
+    database.initialize()
+    repository = ExperimentRepository(database)
+    repository.create_run(
+        run_id="run",
+        deadline_epoch_ms=deadline_epoch_ms(60),
+        root_commit=parent,
+        environment_sha256=HASH,
+        data_manifest_sha256=HASH,
+        evaluator_sha256=HASH,
+    )
+    proposal = {
+        "experiment_id": "gate-repaired",
+        "parent_id": None,
+        "operator": "HYPERPARAMETER",
+        "hypothesis": "A corrected patch proves bounded validation repair.",
+        "mechanism": "The second patch satisfies every preparation gate.",
+        "primary_change": "fixture value",
+        "files_to_change": ["src/rex/models/experimental/model.py"],
+        "expected_metric_effects": {"fixture": "pass"},
+        "falsifier": "The corrected patch fails preparation.",
+        "leakage_analysis": "No data or target capability is involved.",
+        "estimated_seconds": 5,
+        "cheap_rung": {"fixture": True},
+        "full_rung": {"fixture": True},
+    }
+
+    def patch(line: str) -> dict[str, object]:
+        return {
+            "patch": (
+                "--- a/src/rex/models/experimental/model.py\n"
+                "+++ b/src/rex/models/experimental/model.py\n"
+                "@@ -1 +1 @@\n"
+                "-VALUE = 1\n"
+                f"+{line}\n"
+            ),
+            "rationale": "Exercises one bounded preparation repair.",
+            "tests": ["all preparation gates pass"],
+        }
+
+    provider = FakeProvider([proposal, patch(bad_line), patch("VALUE = 3")])
+    fixture_command = (
+        "python3",
+        "-c",
+        "from pathlib import Path; assert 'VALUE = 3' in "
+        "Path('src/rex/models/experimental/model.py').read_text()",
+    )
+    coordinator = PatchTransactionCoordinator(
+        repository=repository,
+        proposal_service=ProposalService(provider),
+        coding_service=CodingService(provider),
+        project_root=project,
+        worktree_root=tmp_path / "worktrees",
+        patch_policy=PatchPolicy(allowed=("src/rex/models/experimental/**",), denied=()),
+        static_command=static_command,
+        fixture_command=fixture_command,
+        max_patch_repairs=2,
+    )
+
+    prepared = coordinator.prepare(
+        run_id="run",
+        parent_commit=parent,
+        proposal_context={"experiment_id": "gate-repaired", "artifact_ids": []},
+        coding_context={
+            "artifact_ids": [],
+            "allowed_file_snapshots": {
+                "src/rex/models/experimental/model.py": "VALUE = 1\n"
+            },
+        },
+    )
+
+    rejection = json.loads(
+        (
+            tmp_path
+            / "worktrees/_artifacts/gate-repaired/patch-attempt-1-rejection.json"
+        ).read_text(encoding="utf-8")
+    )
+    with database.connect() as connection:
+        repair = connection.execute(
+            "SELECT repair_number,phase,completed_at FROM experiment_repairs"
+        ).fetchone()
+    assert rejection["failure_stage"] == failure_stage
+    assert tuple(repair[:2]) == (1, "preparation")
+    assert repair[2] is not None
+    assert [item["role"] for item in provider.calls] == ["proposal", "patch", "patch"]
+    assert repository.get_experiment("gate-repaired")["state"] == ExperimentState.FIXTURE_VALID
+    assert git(prepared.workspace.root, "status", "--porcelain") == ""
+    assert git(prepared.workspace.root, "show", "HEAD:src/rex/models/experimental/model.py") == "VALUE = 3"

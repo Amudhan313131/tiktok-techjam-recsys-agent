@@ -64,6 +64,32 @@ class GitWorkspace:
             raise PatchApplicationRejected(f"git apply failed: {applied.stderr[-2000:]}")
         return paths
 
+    def revert(self, patch: str, policy: PatchPolicy, declared_files: list[str]) -> tuple[str, ...]:
+        paths = validate_patch(patch, policy, declared_files=declared_files)
+        check = subprocess.run(
+            ["git", "apply", "--reverse", "--check", "-"],
+            cwd=self.root,
+            input=patch,
+            text=True,
+            capture_output=True,
+        )
+        if check.returncode:
+            raise PatchApplicationRejected(
+                f"git apply --reverse --check failed: {check.stderr[-2000:]}"
+            )
+        reverted = subprocess.run(
+            ["git", "apply", "--reverse", "-"],
+            cwd=self.root,
+            input=patch,
+            text=True,
+            capture_output=True,
+        )
+        if reverted.returncode:
+            raise PatchApplicationRejected(
+                f"git apply --reverse failed: {reverted.stderr[-2000:]}"
+            )
+        return paths
+
     def commit(self, message: str) -> str:
         _git(self.root, "add", "--all")
         _git(self.root, "commit", "-m", message)
