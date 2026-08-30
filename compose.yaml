@@ -1,0 +1,106 @@
+name: rex
+
+x-rex-image: &rex-image
+  image: ${REX_WORKER_IMAGE:-rex:local}
+  build:
+    context: .
+    dockerfile: Dockerfile
+    args:
+      REX_SOURCE_COMMIT: ${REX_SOURCE_COMMIT:-unknown}
+      REX_DEPENDENCY_LOCK_SHA256: ${REX_DEPENDENCY_LOCK_SHA256:-unknown}
+      REX_PYPROJECT_SHA256: ${REX_PYPROJECT_SHA256:-unknown}
+      REX_STARTER_MANIFEST_SHA256: ${REX_STARTER_MANIFEST_SHA256:-unknown}
+  pull_policy: never
+
+services:
+  rex:
+    <<: *rex-image
+    labels:
+      rex.managed: "true"
+      rex.role: controller
+    entrypoint: ["/usr/bin/tini", "--", "python", "-m", "rex.execution.docker_controller"]
+    user: "${REX_UID:-10001}:${REX_GID:-10001}"
+    working_dir: /source
+    environment:
+      HOME: /tmp/rex-home
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-}
+      REX_EXECUTION_RUNTIME: docker
+      REX_PRODUCTION_RUNTIME: docker
+      REX_WORKER_IMAGE: ${REX_WORKER_IMAGE:-rex:local}
+      REX_EXPECTED_IMAGE_DIGEST: ${REX_EXPECTED_IMAGE_DIGEST:-}
+      REX_MOUNTED_SOURCE_ROOT: /source
+      REX_SOURCE_ROOT: /source
+      REX_DATA_ROOT: /data
+      REX_RUNS_ROOT: /runs
+      REX_IMAGE_SOURCE_COMMIT: ${REX_SOURCE_COMMIT:-unknown}
+      REX_DEPENDENCY_LOCK_SHA256: ${REX_DEPENDENCY_LOCK_SHA256:-unknown}
+      REX_IMAGE_PLATFORM: ${REX_IMAGE_PLATFORM:-linux/unknown}
+      REX_MAX_API_CALLS: ${REX_MAX_API_CALLS:-}
+      REX_MAX_INPUT_TOKENS: ${REX_MAX_INPUT_TOKENS:-}
+      REX_MAX_OUTPUT_TOKENS: ${REX_MAX_OUTPUT_TOKENS:-}
+      REX_MAX_API_COST_USD: ${REX_MAX_API_COST_USD:-}
+    group_add:
+      - "${REX_DOCKER_GID:-0}"
+    volumes:
+      - type: bind
+        source: ${REX_SOURCE_DIR:-.}
+        target: /source
+        read_only: true
+      - type: bind
+        source: ${REX_DATA_DIR:-./data/KuaiRand-Pure/data}
+        target: /data
+        read_only: true
+      - type: bind
+        source: ${REX_RUNS_DIR:-./runs}
+        target: /runs
+      - type: bind
+        source: ${REX_DOCKER_SOCKET:-/var/run/docker.sock}
+        target: /var/run/docker.sock
+      - ${REX_CODEX_HOME:-rex_codex_empty}:/tmp/rex-home/.codex:ro
+      - ${REX_CLAUDE_HOME:-rex_claude_empty}:/tmp/rex-home/.claude:ro
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,exec,mode=1777
+    security_opt:
+      - no-new-privileges:true
+
+  # This service is a policy fixture and a manual smoke-test target. The trusted
+  # controller creates experiment-specific siblings with these restrictions and
+  # exact request mounts; Compose never starts this service by default.
+  worker:
+    <<: *rex-image
+    profiles: [internal]
+    entrypoint: ["/usr/bin/tini", "--", "python", "-m", "rex.execution.worker"]
+    command: ["--help"]
+    user: "10001:10001"
+    working_dir: /source
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: ${REX_WORKER_PIDS_LIMIT:-128}
+    mem_limit: ${REX_WORKER_MEMORY_LIMIT:-2g}
+    cpus: ${REX_WORKER_CPUS:-1.0}
+    environment:
+      HOME: /tmp
+      PYTHONDONTWRITEBYTECODE: "1"
+      REX_EXECUTION_RUNTIME: docker-worker
+    volumes:
+      - type: bind
+        source: ${REX_SOURCE_DIR:-.}
+        target: /source
+        read_only: true
+      - type: bind
+        source: ${REX_DATA_DIR:-./data/KuaiRand-Pure/data}
+        target: /data
+        read_only: true
+      - type: bind
+        source: ${REX_WORKER_OUTPUT_DIR:-./runs/compose-worker-smoke}
+        target: /output
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,mode=1777,size=256m
+
+volumes:
+  rex_codex_empty:
+  rex_claude_empty:

@@ -1,0 +1,180 @@
+name: Docker production runtime
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  contracts:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.26"
+      - name: Verify reproducible Linux locks
+        run: |
+          scripts/lock_linux.sh >/tmp/rex-lock.log 2>&1
+          git diff --exit-code -- requirements-lock-linux-amd64.txt requirements-lock-linux-arm64.txt
+      - name: Install the locked test environment
+        run: |
+          uv venv --python 3.13
+          uv pip install --require-hashes --only-binary :all: -r requirements-lock-linux-amd64.txt
+          uv pip install --no-deps --no-build-isolation -e .
+      - name: Run Ruff and fake-client Docker lifecycle tests
+        run: |
+          .venv/bin/ruff check src tests scripts
+          .venv/bin/pytest -q \
+            tests/unit/test_docker_controller.py \
+            tests/unit/test_docker_runtime.py
+      - name: Verify Compose security contract
+        run: |
+          mkdir -p data/KuaiRand-Pure/data runs
+          REX_SOURCE_COMMIT="$(git rev-parse HEAD)" \
+            REX_EXPECTED_IMAGE_DIGEST="sha256:$(printf 0%.0s {1..64})" \
+            docker compose --profile internal config --format json > /tmp/compose.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          services = json.loads(Path("/tmp/compose.json").read_text())["services"]
+          controller = services["rex"]
+          worker = services["worker"]
+          assert controller["entrypoint"][-1] == "rex.execution.docker_controller"
+          assert worker["entrypoint"][-1] == "rex.execution.worker"
+          assert worker["network_mode"] == "none"
+          assert worker["read_only"] is True
+          assert worker["cap_drop"] == ["ALL"]
+          assert "no-new-privileges:true" in worker["security_opt"]
+          worker_mounts = {volume["target"] for volume in worker["volumes"]}
+          assert "/var/run/docker.sock" not in worker_mounts
+          writable = [volume for volume in worker["volumes"] if not volume.get("read_only", False)]
+          assert len(writable) == 1 and writable[0]["target"] == "/output"
+          assert not any(key in worker.get("environment", {}) for key in ("OPENAI_API_KEY", "OPENAI_MODEL"))
+          controller_mounts = {volume["target"] for volume in controller["volumes"]}
+          assert "/var/run/docker.sock" in controller_mounts
+          PY
+
+  build:
+    needs: contracts
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            lock: requirements-lock-linux-amd64.txt
+            suffix: amd64
+          - platform: linux/arm64
+            lock: requirements-lock-linux-arm64.txt
+            suffix: arm64
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Build pinned ${{ matrix.platform }} image
+        shell: bash
+        run: |
+          docker buildx build \
+            --platform "${{ matrix.platform }}" \
+            --tag "rex:ci-${{ matrix.suffix }}" \
+            --build-arg "REX_SOURCE_COMMIT=$(git rev-parse HEAD)" \
+            --build-arg "REX_DEPENDENCY_LOCK_SHA256=$(sha256sum "${{ matrix.lock }}" | cut -d' ' -f1)" \
+            --build-arg "REX_PYPROJECT_SHA256=$(sha256sum pyproject.toml | cut -d' ' -f1)" \
+            --build-arg "REX_STARTER_MANIFEST_SHA256=$(sha256sum configs/frozen/starter_manifest.json | cut -d' ' -f1)" \
+            --load \
+            .
+      - name: Smoke-test amd64 image and provenance
+        if: matrix.suffix == 'amd64'
+        shell: bash
+        run: |
+          docker run --rm --entrypoint python rex:ci-amd64 -m rex.cli --help >/dev/null
+          test "$(docker run --rm --entrypoint id rex:ci-amd64 -u)" = "10001"
+          docker run --rm --entrypoint docker rex:ci-amd64 --version
+          docker run --rm --entrypoint codex rex:ci-amd64 --version
+          docker run --rm --entrypoint claude rex:ci-amd64 --version
+          docker image inspect rex:ci-amd64 --format '{{json .Config.Env}}' | \
+            grep -qv 'OPENAI_API_KEY'
+          test "$(docker image inspect rex:ci-amd64 --format '{{index .Config.Labels "org.opencontainers.image.revision"}}')" = "$(git rev-parse HEAD)"
+          test -n "$(docker image inspect rex:ci-amd64 --format '{{index .Config.Labels "org.rex.dependency-lock-sha256"}}')"
+      - name: Run bounded live isolation, timeout, and recovery checks
+        if: matrix.suffix == 'amd64'
+        shell: bash
+        run: |
+          mkdir -p /tmp/rex-ci-data /tmp/rex-ci-runs
+          image_id="$(docker image inspect rex:ci-amd64 --format '{{.Id}}')"
+          socket_gid="$(stat -c '%g' /var/run/docker.sock)"
+          controller="$(docker run --detach --rm \
+            --name rex-ci-live-controller \
+            --user "$(id -u):$(id -g)" \
+            --group-add "$socket_gid" \
+            --security-opt no-new-privileges=true \
+            --mount "type=bind,src=${PWD},dst=/source,readonly" \
+            --mount type=bind,src=/tmp/rex-ci-data,dst=/data,readonly \
+            --mount type=bind,src=/tmp/rex-ci-runs,dst=/runs \
+            --mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock \
+            --entrypoint sleep \
+            "$image_id" 300)"
+          cleanup() {
+            docker container rm --force "$controller" >/dev/null 2>&1 || true
+            docker container ls --all --quiet --filter label=rex.managed=true | \
+              xargs --no-run-if-empty docker container rm --force >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          timeout 180 docker exec \
+            --env REX_DOCKER_INTEGRATION=1 \
+            --env "REX_WORKER_IMAGE=${image_id}" \
+            --env "REX_CONTROLLER_ID=${controller}" \
+            "$controller" \
+            python -m pytest -q \
+              /source/tests/integration/test_docker_runtime_live.py \
+              /source/tests/unit/test_docker_runtime.py::test_runtime_classifies_timeout_and_oom \
+              /source/tests/unit/test_docker_runtime.py::test_recovery_verifies_exact_daemon_labels_and_container_id
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [contracts, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish immutable multi-platform release
+        shell: bash
+        run: |
+          base="ghcr.io/${GITHUB_REPOSITORY,,}"
+          common=(
+            --build-arg "REX_SOURCE_COMMIT=$(git rev-parse HEAD)"
+            --build-arg "REX_PYPROJECT_SHA256=$(sha256sum pyproject.toml | cut -d' ' -f1)"
+            --build-arg "REX_STARTER_MANIFEST_SHA256=$(sha256sum configs/frozen/starter_manifest.json | cut -d' ' -f1)"
+            --provenance=mode=max
+            --sbom=true
+            --push
+          )
+          for arch in amd64 arm64; do
+            docker buildx build \
+              --platform "linux/${arch}" \
+              --tag "${base}:${GITHUB_SHA}-${arch}" \
+              --build-arg "REX_DEPENDENCY_LOCK_SHA256=$(sha256sum "requirements-lock-linux-${arch}.txt" | cut -d' ' -f1)" \
+              "${common[@]}" \
+              .
+          done
+          docker buildx imagetools create \
+            --tag "${base}:${GITHUB_REF_NAME}" \
+            --tag "${base}:${GITHUB_SHA}" \
+            "${base}:${GITHUB_SHA}-amd64" \
+            "${base}:${GITHUB_SHA}-arm64"

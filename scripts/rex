@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+if ! docker compose version >/dev/null 2>&1; then
+  echo "Docker Compose v2 is required." >&2
+  exit 1
+fi
+
+sha256_file() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    shasum -a 256 "$1" | awk '{print $1}'
+  fi
+}
+
+export REX_SOURCE_DIR="${REX_SOURCE_DIR:-$ROOT}"
+export REX_DATA_DIR="${REX_DATA_DIR:-$ROOT/data/KuaiRand-Pure/data}"
+export REX_RUNS_DIR="${REX_RUNS_DIR:-$ROOT/runs}"
+export REX_WORKER_IMAGE="${REX_WORKER_IMAGE:-rex:local}"
+export REX_SOURCE_COMMIT="${REX_SOURCE_COMMIT:-$(git rev-parse HEAD)}"
+export REX_PYPROJECT_SHA256="${REX_PYPROJECT_SHA256:-$(sha256_file pyproject.toml)}"
+export REX_STARTER_MANIFEST_SHA256="${REX_STARTER_MANIFEST_SHA256:-$(sha256_file configs/frozen/starter_manifest.json)}"
+
+docker_arch="$(docker info --format '{{.Architecture}}')"
+case "$docker_arch" in
+  x86_64 | amd64) lock_arch="amd64" ;;
+  aarch64 | arm64) lock_arch="arm64" ;;
+  *) echo "Unsupported Docker architecture: $docker_arch" >&2; exit 1 ;;
+esac
+export REX_DEPENDENCY_LOCK_SHA256="${REX_DEPENDENCY_LOCK_SHA256:-$(sha256_file "requirements-lock-linux-${lock_arch}.txt")}"
+export REX_IMAGE_PLATFORM="${REX_IMAGE_PLATFORM:-linux/${lock_arch}}"
+
+if [ -z "${REX_DOCKER_GID:-}" ] && [ -S "${REX_DOCKER_SOCKET:-/var/run/docker.sock}" ]; then
+  if [ "$(uname -s)" = "Darwin" ]; then
+    # Docker Desktop presents the VM socket as root:root inside Linux
+    # containers even when the macOS-side forwarding socket has another GID.
+    export REX_DOCKER_GID=0
+  else
+    export REX_DOCKER_GID="$(stat -c '%g' "${REX_DOCKER_SOCKET:-/var/run/docker.sock}")"
+  fi
+fi
+export REX_DOCKER_GID="${REX_DOCKER_GID:-0}"
+export REX_UID="${REX_UID:-$(id -u)}"
+export REX_GID="${REX_GID:-$(id -g)}"
+
+mkdir -p "$REX_RUNS_DIR"
+
+if [ "${1:-}" = "build" ] && [ -n "$(git status --porcelain --untracked-files=normal)" ]; then
+  echo "Refusing a production image build from a dirty Git checkout." >&2
+  exit 1
+fi
+
+case "${1:-}" in
+  build | config | down | images | logs | ls | pull | push | stop) ;;
+  *)
+    if [ -z "${REX_EXPECTED_IMAGE_DIGEST:-}" ]; then
+      if ! REX_EXPECTED_IMAGE_DIGEST="$(docker image inspect \
+        --format '{{.Id}}' "$REX_WORKER_IMAGE" 2>/dev/null)"; then
+        echo "Worker image '$REX_WORKER_IMAGE' is not present; run scripts/rex build first." >&2
+        exit 1
+      fi
+      export REX_EXPECTED_IMAGE_DIGEST
+      export REX_WORKER_IMAGE="$REX_EXPECTED_IMAGE_DIGEST"
+    else
+      case "$REX_WORKER_IMAGE" in
+        sha256:* | *@sha256:*) ;;
+        *)
+          local_image_id="$(docker image inspect --format '{{.Id}}' "$REX_WORKER_IMAGE" 2>/dev/null || true)"
+          if [ "$local_image_id" != "$REX_EXPECTED_IMAGE_DIGEST" ]; then
+            echo "REX_WORKER_IMAGE must be an immutable image ID or name@sha256 reference." >&2
+            exit 1
+          fi
+          export REX_WORKER_IMAGE="$local_image_id"
+          ;;
+      esac
+    fi
+    case "$REX_EXPECTED_IMAGE_DIGEST" in
+      sha256:????????????????????????????????????????????????????????????????) ;;
+      *) echo "REX_EXPECTED_IMAGE_DIGEST must be sha256 followed by 64 hex characters." >&2; exit 1 ;;
+    esac
+    if ! printf '%s' "${REX_EXPECTED_IMAGE_DIGEST#sha256:}" | grep -Eq '^[0-9a-f]{64}$'; then
+      echo "REX_EXPECTED_IMAGE_DIGEST must use lowercase hexadecimal." >&2
+      exit 1
+    fi
+    ;;
+esac
+
+case "${1:-}" in
+  build | config | down | images | logs | ls | pull | push | stop) ;;
+  *)
+    image_commit="$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$REX_WORKER_IMAGE")"
+    image_lock="$(docker image inspect --format '{{index .Config.Labels "org.rex.dependency-lock-sha256"}}' "$REX_WORKER_IMAGE")"
+    image_pyproject="$(docker image inspect --format '{{index .Config.Labels "org.rex.pyproject-sha256"}}' "$REX_WORKER_IMAGE")"
+    image_starter="$(docker image inspect --format '{{index .Config.Labels "org.rex.starter-kit-sha256"}}' "$REX_WORKER_IMAGE")"
+    if [ "$image_commit" != "$REX_SOURCE_COMMIT" ] || \
+       [ "$image_lock" != "$REX_DEPENDENCY_LOCK_SHA256" ] || \
+       [ "$image_pyproject" != "$REX_PYPROJECT_SHA256" ] || \
+       [ "$image_starter" != "$REX_STARTER_MANIFEST_SHA256" ]; then
+      echo "Worker image provenance does not match the clean source and locked environment." >&2
+      exit 1
+    fi
+    ;;
+esac
+
+case "${1:-}" in
+  build | config | down | images | logs | ls | pull | push | stop)
+    exec docker compose "$@"
+    ;;
+  "")
+    exec docker compose run --rm rex doctor \
+      --config configs/run/production.yaml --tree --llm fixed
+    ;;
+  *)
+    exec docker compose run --rm rex "$@"
+    ;;
+esac

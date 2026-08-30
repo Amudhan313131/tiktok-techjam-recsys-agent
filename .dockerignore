@@ -1,0 +1,33 @@
+.git
+.gitignore
+.codegraph
+.env
+.env.*
+!.env.example
+.venv
+__pycache__
+*.py[cod]
+*.egg-info
+.pytest_cache
+.ruff_cache
+.mypy_cache
+.coverage
+htmlcov
+
+# Raw data, run evidence, credentials, and local caches never enter the image.
+/data
+/runs
+/.rex-auth
+/.rex-shared-cache
+/logs
+
+# Local editor and operating-system state.
+.DS_Store
+.idea
+.vscode
+
+# Build artifacts and final submissions stay outside the image context.
+/build
+/dist
+/final-submission
+*.log

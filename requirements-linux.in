@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# The project is installed without build isolation inside the production image.
+setuptools==80.10.2
+wheel==0.46.1
