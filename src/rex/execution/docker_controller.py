@@ -190,33 +190,35 @@ def controller_environment(
     container_id = environment.get("HOSTNAME", "")
     environment["REX_CONTROLLER_CONTAINER_ID"] = container_id
     environment["REX_CONTROLLER_ID"] = container_id
+    completed = subprocess.run(
+        ["docker", "container", "inspect", container_id],
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+        env=environment,
+    )
+    try:
+        inspected = json.loads(completed.stdout)
+        container = inspected[0]
+        full_id = str(container["Id"])
+        labels = container["Config"]["Labels"]
+    except (json.JSONDecodeError, IndexError, KeyError, TypeError) as error:
+        raise DockerControllerError(
+            "could not resolve the controller's exact Docker identity"
+        ) from error
+    if (
+        completed.returncode != 0
+        or _CONTAINER_ID.fullmatch(full_id) is None
+        or not isinstance(labels, dict)
+        or labels.get("rex.managed") != "true"
+        or labels.get("rex.role") != "controller"
+        or container.get("Image") != environment.get("REX_EXPECTED_IMAGE_DIGEST")
+    ):
+        raise DockerControllerError("controller Docker identity failed closed")
+    environment["REX_CONTROLLER_CONTAINER_ID"] = full_id
+    environment["REX_CONTROLLER_ID"] = full_id
     if not environment.get("REX_PROCESS_SESSION_HOST"):
-        completed = subprocess.run(
-            ["docker", "container", "inspect", container_id],
-            text=True,
-            capture_output=True,
-            timeout=30,
-            check=False,
-            env=environment,
-        )
-        try:
-            inspected = json.loads(completed.stdout)
-            container = inspected[0]
-            full_id = str(container["Id"])
-            labels = container["Config"]["Labels"]
-        except (json.JSONDecodeError, IndexError, KeyError, TypeError) as error:
-            raise DockerControllerError(
-                "could not resolve the controller's exact Docker identity"
-            ) from error
-        if (
-            completed.returncode != 0
-            or _CONTAINER_ID.fullmatch(full_id) is None
-            or not isinstance(labels, dict)
-            or labels.get("rex.managed") != "true"
-            or labels.get("rex.role") != "controller"
-            or container.get("Image") != environment.get("REX_EXPECTED_IMAGE_DIGEST")
-        ):
-            raise DockerControllerError("controller Docker identity failed closed")
         environment["REX_PROCESS_SESSION_HOST"] = full_id
     return environment
 

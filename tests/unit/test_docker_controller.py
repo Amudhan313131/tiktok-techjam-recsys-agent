@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from rex.execution.docker_controller import DockerControllerError, prepare_controller_source
+from rex.execution.docker_controller import (
+    DockerControllerError,
+    controller_environment,
+    prepare_controller_source,
+)
 
 
 DIGEST = "sha256:" + "a" * 64
@@ -93,3 +98,40 @@ def test_controller_rejects_source_or_image_identity_drift(tmp_path: Path) -> No
             expected_commit=commit,
             expected_image_digest="rex:latest",
         )
+
+
+def test_controller_environment_resolves_exact_id_with_stable_session_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clone = tmp_path / "clone"
+    clone.mkdir()
+    lock = clone / "requirements-lock-linux-arm64.txt"
+    lock.write_text("locked\n", encoding="utf-8")
+    lock_sha256 = hashlib.sha256(lock.read_bytes()).hexdigest()
+    full_id = "c" * 64
+
+    def fake_run(*_args, **_kwargs):
+        payload = [
+            {
+                "Id": full_id,
+                "Image": DIGEST,
+                "Config": {"Labels": {"rex.managed": "true", "rex.role": "controller"}},
+            }
+        ]
+        return subprocess.CompletedProcess([], 0, stdout=json.dumps(payload), stderr="")
+
+    monkeypatch.setattr("rex.execution.docker_controller.subprocess.run", fake_run)
+    environment = controller_environment(
+        clone,
+        {
+            "HOSTNAME": "c" * 12,
+            "REX_IMAGE_PLATFORM": "linux/arm64",
+            "REX_DEPENDENCY_LOCK_SHA256": lock_sha256,
+            "REX_EXPECTED_IMAGE_DIGEST": DIGEST,
+            "REX_PROCESS_SESSION_HOST": "stable-rehearsal-controller",
+        },
+    )
+
+    assert environment["REX_CONTROLLER_CONTAINER_ID"] == full_id
+    assert environment["REX_CONTROLLER_ID"] == full_id
+    assert environment["REX_PROCESS_SESSION_HOST"] == "stable-rehearsal-controller"

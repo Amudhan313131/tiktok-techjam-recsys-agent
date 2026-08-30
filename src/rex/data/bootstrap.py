@@ -190,7 +190,9 @@ def build_split_views(
     label_vault.chmod(0o700)
     forbidden_test_target = label_vault / "test_targets.npz"
     if forbidden_test_target.exists():
-        raise DataContractError(f"forbidden stale test target artifact exists: {forbidden_test_target}")
+        raise DataContractError(
+            f"forbidden stale test target artifact exists: {forbidden_test_target}"
+        )
 
     buffers = {name: _SplitBuffer() for name in benchmark["splits"]}
     for row in read_feature_rows(data_dir):
@@ -297,4 +299,7 @@ def bootstrap_views(data_dir: str | Path, output_dir: str | Path) -> dict[str, A
 
 
 def default_data_dir() -> Path:
+    configured = os.environ.get("REX_DATA_ROOT")
+    if configured:
+        return Path(configured).resolve()
     return repo_root() / "data/KuaiRand-Pure/data"

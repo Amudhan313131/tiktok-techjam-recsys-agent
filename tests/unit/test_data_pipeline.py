@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from rex.contracts import RunRequest
-from rex.data.bootstrap import build_split_views
+from rex.data.bootstrap import build_split_views, default_data_dir
 from rex.data.firewall import (
     CapabilityViolation,
     assert_no_test_target_artifact,
@@ -49,6 +49,15 @@ def test_repo_root_honors_the_verified_controller_clone(
     monkeypatch.setenv("REX_SOURCE_ROOT", str(source_clone))
 
     assert repo_root() == source_clone.resolve()
+
+
+def test_default_data_dir_honors_the_read_only_data_mount(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data_root = tmp_path / "data"
+    monkeypatch.setenv("REX_DATA_ROOT", str(data_root))
+
+    assert default_data_dir() == data_root.resolve()
 
 
 def _write_csv(path: Path, header: list[str], rows: list[list[object]]) -> None:
