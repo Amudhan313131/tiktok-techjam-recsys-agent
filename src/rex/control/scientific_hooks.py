@@ -224,7 +224,7 @@ class ProductionScientificHooks(ProductionHooks):
     ):
         self.config = config
         self.provider = provider
-        self.data_dir = Path(data_dir or default_data_dir()).resolve()
+        self.data_dir = Path(data_dir or config.raw_data_dir or default_data_dir()).resolve()
         self.view_dir = Path(view_dir).resolve() if view_dir is not None else None
         self.settings = settings or ScientificExecutionSettings()
         self.execute = execute

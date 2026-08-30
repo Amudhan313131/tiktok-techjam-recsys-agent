@@ -85,6 +85,7 @@ class ProductionRunConfig:
     cleanup_worktrees: bool
     method_cards: dict[str, MethodCardBinding]
     llm: dict[str, Any]
+    raw_data_dir: Path | None = None
 
     @classmethod
     def load(cls, path: str | Path) -> "ProductionRunConfig":
@@ -133,6 +134,9 @@ class ProductionRunConfig:
             cleanup_worktrees=bool(raw.get("cleanup_worktrees", True)),
             method_cards=bindings,
             llm=dict(raw.get("llm", {})),
+            raw_data_dir=resolve(
+                str(raw.get("raw_data_dir", "data/KuaiRand-Pure/data"))
+            ),
         )
         if config.process_stale_after_seconds <= 0:
             raise ValueError("process_stale_after_seconds must be positive")

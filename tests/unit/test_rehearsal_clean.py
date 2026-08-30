@@ -240,6 +240,34 @@ def test_runtime_template_is_json_and_hard_disables_submission() -> None:
     assert "fixed" not in template["llm"]["auto"]["provider_order"]
 
 
+def test_runtime_configuration_binds_external_raw_data_directory(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[2]
+    data = tmp_path / "external-data"
+    data.mkdir()
+    output = tmp_path / "outside"
+    envelope = R3Envelope(
+        R3Options(
+            source_root=root,
+            source_ref="HEAD",
+            data_dir=data,
+            output_dir=output,
+            llm="codex_cli",
+            run_id="r3-data-binding",
+            wall_clock_seconds=60,
+            finalization_reserve_seconds=10,
+            skip_dependency_install=True,
+        )
+    )
+    envelope.clone = root
+    envelope.runtime.mkdir(parents=True)
+    envelope.runs.mkdir(parents=True)
+
+    config_path, _budget_path = envelope._write_runtime_files()
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+
+    assert config["raw_data_dir"] == str(data.resolve())
+
+
 def test_controlled_failure_kills_only_verified_lease_owner_once(tmp_path: Path) -> None:
     source = tmp_path / "source"
     data = tmp_path / "data"

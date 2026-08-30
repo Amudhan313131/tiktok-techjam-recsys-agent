@@ -711,6 +711,7 @@ class R3Envelope:
                 "budget_config": str(budget_path),
                 "protected_paths": str(self.clone / "configs/security/protected_paths.yaml"),
                 "data_manifest": str(self.runtime / "data/data_manifest.json"),
+                "raw_data_dir": str(self.options.data_dir),
                 "evaluator_path": str(self.clone / "kuairand-starter-kit/evaluate.py"),
                 "environment_lock": str(self.clone / "requirements-lock.txt"),
                 "scientific_execution_enabled": True,

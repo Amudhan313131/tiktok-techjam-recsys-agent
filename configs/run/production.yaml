@@ -10,6 +10,7 @@ runs_dir: runs
 budget_config: configs/budget.yaml
 protected_paths: configs/security/protected_paths.yaml
 data_manifest: runs/data/data_manifest.json
+raw_data_dir: data/KuaiRand-Pure/data
 evaluator_path: kuairand-starter-kit/evaluate.py
 environment_lock: requirements-lock.txt
 process_stale_after_seconds: 900
