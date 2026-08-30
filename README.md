@@ -4,7 +4,9 @@ REX is a guarded autonomous experiment runner for the KuaiRand-Pure
 `long_view` ranking task. It includes the production validation search, a clean
 one-command dress-rehearsal envelope, and a separately authorized final
 submission path. The small generated-fixture path remains available for fast
-tests.
+tests. Docker is the supported production runtime on Windows, macOS, and Linux;
+see [`docs/docker-production.md`](docs/docker-production.md) for its trust
+boundary and cross-platform commands.
 
 The benchmark contract is in [`docs/task_contract.md`](docs/task_contract.md).
 The exact implemented scope and exclusions are in
@@ -85,7 +87,7 @@ The audit bundle is under
 `runs/production-20260830-165853-15087c/`. No confirmation sweep, hidden-test
 prediction, submission construction, or six-hour dress rehearsal was run.
 
-## Setup
+## Development setup
 
 Use a project-local environment. The `tree` extra installs the pinned
 LightGBM 4.7.0 and scikit-learn 1.9.0 runtime.
@@ -116,17 +118,22 @@ Production startup repeats the baseline evidence gate before search begins.
 
 ## Production prerequisites
 
-Production execution currently requires macOS and a working
-`/usr/bin/sandbox-exec`. Other operating systems fail closed because no
-equivalent backend has been implemented. Check the data manifest, sandbox, LLM
-route, and optional tree model before starting:
+Production execution uses Docker on Windows, macOS, and Linux. Native Python is
+not a production-isolation promise, and Docker failures fail closed without an
+unsandboxed fallback. Build the pinned Linux image, configure the read-only
+source and data mounts plus the writable run mount, and run the Docker doctor:
 
 ```bash
-.venv/bin/python -m rex.cli doctor \
-  --config configs/run/production.yaml \
-  --tree \
-  --llm fixed
+scripts/rex build
+scripts/rex doctor --config configs/run/production.yaml --tree --llm fixed
 ```
+
+Use `scripts/rex.ps1` for the same commands in Windows PowerShell. The trusted
+controller alone receives Docker and optional LLM credentials; every generated
+code path runs in a disposable, networkless, non-root worker with read-only
+inputs and bounded resources. Full setup, image provenance, CLI-auth mounts,
+digest pinning, and security guarantees are documented in
+[`docs/docker-production.md`](docs/docker-production.md).
 
 The project root must also be a **clean committed Git checkout**. This is a
 provenance and recovery requirement: every experiment records its parent and
@@ -145,7 +152,7 @@ of the prediction models; it does not propose or diagnose experiments.
 This deterministic mode executes the versioned method-card configs:
 
 ```bash
-.venv/bin/python -m rex.cli run \
+scripts/rex run \
   --config configs/run/production.yaml \
   --llm fixed
 ```
@@ -158,11 +165,12 @@ CLI login; it does not attach to this Codex desktop task.
 
 ```bash
 codex login
-.venv/bin/python -m rex.cli doctor \
+export REX_CODEX_HOME="$HOME/.codex"
+scripts/rex doctor \
   --config configs/run/production.yaml --llm codex_cli
-.venv/bin/python -m rex.cli doctor \
+scripts/rex doctor \
   --config configs/run/production.yaml --llm codex_cli --live
-.venv/bin/python -m rex.cli run \
+scripts/rex run \
   --config configs/run/production.yaml --llm codex_cli
 ```
 
@@ -174,11 +182,12 @@ the response must match the requested JSON Schema.
 
 ```bash
 claude auth login
-.venv/bin/python -m rex.cli doctor \
+export REX_CLAUDE_HOME="$HOME/.claude"
+scripts/rex doctor \
   --config configs/run/production.yaml --llm claude_cli
-.venv/bin/python -m rex.cli doctor \
+scripts/rex doctor \
   --config configs/run/production.yaml --llm claude_cli --live
-.venv/bin/python -m rex.cli run \
+scripts/rex run \
   --config configs/run/production.yaml --llm claude_cli
 ```
 
@@ -192,11 +201,11 @@ and token ceilings survive resumption.
 export OPENAI_API_KEY='your-key'
 export OPENAI_MODEL='your-available-model-id'
 
-.venv/bin/python -m rex.cli doctor \
+scripts/rex doctor \
   --config configs/run/production.yaml --llm openai_api
-.venv/bin/python -m rex.cli doctor \
+scripts/rex doctor \
   --config configs/run/production.yaml --llm openai_api --live
-.venv/bin/python -m rex.cli run \
+scripts/rex run \
   --config configs/run/production.yaml --llm openai_api \
   --authorize-paid-api
 ```
@@ -205,7 +214,7 @@ export OPENAI_MODEL='your-available-model-id'
 fallback is disabled unless explicitly authorized:
 
 ```bash
-.venv/bin/python -m rex.cli run \
+scripts/rex run \
   --config configs/run/production.yaml \
   --llm auto \
   --allow-paid-api-fallback
@@ -217,29 +226,61 @@ Explicit modes do not silently switch providers.
 
 ```bash
 # Resume the exact transaction recorded for an interrupted run.
-.venv/bin/python -m rex.cli run \
+scripts/rex run \
   --config configs/run/production.yaml \
   --llm fixed \
   --resume PRODUCTION_RUN_ID
 
 # Inspect durable state, repairs, sessions, baseline, and search promotions.
-.venv/bin/python -m rex.cli status \
+scripts/rex status \
   --config configs/run/production.yaml \
   --run-id PRODUCTION_RUN_ID
 
 # Export the full evidence index and verify the event chain.
-.venv/bin/python -m rex.cli report \
-  --database runs/PRODUCTION_RUN_ID/state.sqlite3 \
+scripts/rex report \
+  --database /runs/PRODUCTION_RUN_ID/state.sqlite3 \
   --run-id PRODUCTION_RUN_ID \
-  --output-dir runs/PRODUCTION_RUN_ID/report
+  --output-dir /runs/PRODUCTION_RUN_ID/report
 ```
 
 The evidence export includes baseline artifacts and pre-experiment LLM failure
 artifacts even though those records do not yet have an experiment ID.
 
-## Clean one-command R3 rehearsal
+## Clean one-command Docker R3 rehearsal
 
-R3 starts its global clock before setup, clones the exact committed source into
+The Docker supervisor starts trusted controller containers, performs bootstrap
+and the fail-closed Docker doctor, launches the validation-only autopilot,
+force-kills the first controller after it has durably leased a worker, and
+resumes the exact run under its original deadline. It seals the scientific
+iteration log, metrics, recovery evidence, manual-intervention count, resource
+usage, environment identity, and validation champion without predicting or
+scoring hidden test rows:
+
+```bash
+python3 scripts/run_docker_rehearsal.py start \
+  --source-root "$PWD" \
+  --data-dir "$PWD/data/KuaiRand-Pure/data" \
+  --output-dir /absolute/path/to/rex-docker-r3 \
+  --run-id rex-docker-r3 \
+  --image rex:local \
+  --llm fixed
+```
+
+Use `--llm codex_cli --codex-home "$HOME/.codex"`,
+`--llm claude_cli --claude-home "$HOME/.claude"`, or explicitly authorized
+API mode. The source must be clean and committed, and the image label must
+record that exact commit. Status is read-only:
+
+```bash
+python3 scripts/run_docker_rehearsal.py status \
+  --output-dir /absolute/path/to/rex-docker-r3
+```
+
+## Legacy native R3 rollback rehearsal
+
+The previous macOS R3 envelope remains for one transition release as an
+explicit rollback rehearsal; it is not an automatic production fallback. It
+starts its global clock before setup, clones the exact committed source into
 an isolated directory, creates a fresh environment from the fully hashed lock,
 verifies the Starter Kit and raw data, checks the live LLM route, runs the
 validation-only autopilot, and injects exactly one coordinator `SIGKILL` after a
@@ -311,10 +352,11 @@ explicit authorization flag. It accepts only a completed production run and
 its immutable best-valid bundle:
 
 ```bash
-.venv/bin/python -m rex.cli finalize-submission \
+scripts/rex finalize-submission \
   --run-id PRODUCTION_RUN_ID \
   --config configs/run/production.yaml \
-  --data-dir data/KuaiRand-Pure/data \
+  --data-dir /data \
+  --output-dir /runs/PRODUCTION_RUN_ID/final-submission \
   --authorize-test-prediction
 ```
 
@@ -331,11 +373,11 @@ Copying the sealed bundle is a separate one-time handoff bound to its exact seal
 hash:
 
 ```bash
-.venv/bin/python -m rex.cli handoff-submission \
+scripts/rex handoff-submission \
   --run-id PRODUCTION_RUN_ID \
   --job-id SUBMISSION_JOB_ID \
   --seal-sha256 SEALED_MANIFEST_SHA256 \
-  --target-dir /absolute/path/to/final-handoff \
+  --target-dir /runs/final-handoff \
   --authorize-once
 ```
 
