@@ -94,7 +94,9 @@ Three researcher routes are available:
 - `fixed` needs no credentials and consumes no LLM tokens.
 - `codex_cli` or `claude_cli` uses the pinned CLI in the image. Set
   `REX_CODEX_HOME` or `REX_CLAUDE_HOME` to the authenticated host directory.
-  It is mounted read-only into the controller only.
+  It is mounted read-only at a controller-only authentication path. The
+  entrypoint copies only the required files into private tmpfs so the CLI can
+  update ephemeral state without modifying the host credential directory.
 - `openai_api` receives `OPENAI_API_KEY` and `OPENAI_MODEL` in the controller
   only and still requires REX's explicit paid-API authorization flag.
 

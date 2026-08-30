@@ -99,7 +99,8 @@ COPY configs ./configs
 COPY kuairand-starter-kit ./kuairand-starter-kit
 COPY scripts ./scripts
 RUN python -m pip install --no-deps --no-build-isolation . \
-    && python -m rex.cli --help >/dev/null
+    && python -m rex.cli --help >/dev/null \
+    && install --mode=0755 scripts/docker-entrypoint.sh /usr/local/bin/rex-container-entrypoint
 
 RUN groupadd --gid 10001 rex \
     && useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin rex \
@@ -108,5 +109,5 @@ RUN groupadd --gid 10001 rex \
 
 USER 10001:10001
 WORKDIR /source
-ENTRYPOINT ["/usr/bin/tini", "--", "python", "-m", "rex.execution.docker_controller"]
+ENTRYPOINT ["/usr/local/bin/rex-container-entrypoint"]
 CMD ["doctor", "--config", "configs/run/production.yaml", "--tree", "--llm", "fixed"]

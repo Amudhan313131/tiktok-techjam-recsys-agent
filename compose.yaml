@@ -18,7 +18,7 @@ services:
     labels:
       rex.managed: "true"
       rex.role: controller
-    entrypoint: ["/usr/bin/tini", "--", "python", "-m", "rex.execution.docker_controller"]
+    entrypoint: ["/usr/local/bin/rex-container-entrypoint"]
     user: "${REX_UID:-10001}:${REX_GID:-10001}"
     working_dir: /source
     environment:
@@ -57,8 +57,8 @@ services:
       - type: bind
         source: ${REX_DOCKER_SOCKET:-/var/run/docker.sock}
         target: /var/run/docker.sock
-      - ${REX_CODEX_HOME:-rex_codex_empty}:/tmp/rex-home/.codex:ro
-      - ${REX_CLAUDE_HOME:-rex_claude_empty}:/tmp/rex-home/.claude:ro
+      - ${REX_CODEX_HOME:-rex_codex_empty}:/run/rex-auth/codex:ro
+      - ${REX_CLAUDE_HOME:-rex_claude_empty}:/run/rex-auth/claude:ro
     tmpfs:
       - /tmp:rw,nosuid,nodev,exec,mode=1777
     security_opt:
