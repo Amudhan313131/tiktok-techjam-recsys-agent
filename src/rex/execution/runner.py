@@ -450,6 +450,7 @@ def _docker_worker_request(
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONHASHSEED": "0",
             "PYTHONPATH": f"{workspace}/src",
+            "REX_SOURCE_ROOT": str(workspace),
             "TMPDIR": "/tmp",
             "XDG_CACHE_HOME": "/tmp/cache",
         }

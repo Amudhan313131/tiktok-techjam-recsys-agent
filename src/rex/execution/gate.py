@@ -211,6 +211,7 @@ def execute_gate(
             "PYTHONDONTWRITEBYTECODE": "1",
             "PYTHONHASHSEED": "0",
             "PYTHONPATH": f"{workspace_path}/src",
+            "REX_SOURCE_ROOT": str(workspace_path),
             "PYTHONPYCACHEPREFIX": "/output/pycache",
             "PYTEST_ADDOPTS": "-p no:cacheprovider",
             "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1",

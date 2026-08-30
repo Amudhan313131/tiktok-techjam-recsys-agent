@@ -216,6 +216,8 @@ def test_runner_archives_closed_missing_result_and_relaunches(tmp_path: Path) ->
         runtime=runtime,
     )
     assert first.status == AttemptStatus.SUCCESS
+    first_specification = next(iter(runtime.specifications.values()))
+    assert first_specification.environment["REX_SOURCE_ROOT"] == str(workspace)
     (attempt / "worker" / "result.json").unlink()
 
     second = _docker_worker_request(
@@ -290,6 +292,8 @@ def test_gate_cleanup_failure_is_closed_and_recoverable(tmp_path: Path) -> None:
     assert result.successful
     assert runtime.launches == 1
     assert runtime.cleanups == 2
+    gate_specification = next(iter(runtime.specifications.values()))
+    assert gate_specification.environment["REX_SOURCE_ROOT"] == str(workspace)
 
 
 def test_submission_archives_closed_missing_result_and_relaunches(
