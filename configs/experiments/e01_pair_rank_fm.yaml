@@ -1,4 +1,4 @@
-plugin: rex.models.rank_fm:RankFMPlugin
+plugin: rex.models.experimental.pair_rank_fm:ExperimentalPairRankFMPlugin
 k: 16
 lr: 0.001
 l2: 0.000001
