@@ -47,6 +47,29 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _runs_path_on_host(value: object, output_root: Path) -> Path:
+    """Translate a controller-visible /runs artifact into its verified host path."""
+
+    container_path = Path(str(value))
+    try:
+        relative = container_path.relative_to("/runs")
+    except ValueError as error:
+        raise DockerRehearsalError(
+            f"bundle artifact is not rooted in the controller /runs mount: {container_path}"
+        ) from error
+    if not relative.parts:
+        raise DockerRehearsalError("bundle artifact may not name the /runs mount root")
+    root = output_root.resolve(strict=True)
+    try:
+        host_path = (root / relative).resolve(strict=True)
+        host_path.relative_to(root)
+    except (OSError, ValueError) as error:
+        raise DockerRehearsalError(
+            f"bundle artifact escapes or is missing from the host run root: {container_path}"
+        ) from error
+    return host_path
+
+
 def _run(
     arguments: Sequence[str],
     *,
@@ -410,7 +433,7 @@ class Supervisor:
         for name, reference in sorted(best_artifacts.items()):
             if not isinstance(reference, dict):
                 raise DockerRehearsalError(f"best-valid artifact {name} is malformed")
-            path = Path(str(reference.get("path", ""))).resolve(strict=True)
+            path = _runs_path_on_host(reference.get("path", ""), self.output)
             try:
                 path.relative_to(best_root.resolve(strict=True))
             except ValueError as error:
