@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 from pydantic import ValidationError
 
@@ -64,10 +65,17 @@ def create_model_bundle(
     config_sha256: str,
     data_view_sha256: str,
     features: FeatureView,
+    member_paths: Iterable[str | Path] | None = None,
 ) -> Path:
     """Index every plugin-produced file and atomically write its bundle manifest."""
 
     root = Path(bundle_dir).resolve()
+    if not root.is_dir():
+        raise ArtifactError(f"model bundle directory is missing: {root}")
+    if not plugin.strip():
+        raise ArtifactError("model bundle plugin must not be empty")
+    if not commit_sha.strip():
+        raise ArtifactError("model bundle commit must not be empty")
     primary = Path(primary_model).resolve()
     primary_name = _inside(root, primary).as_posix()
     if not primary.is_file():
@@ -75,10 +83,19 @@ def create_model_bundle(
 
     manifest_path = root / BUNDLE_FILENAME
     members: list[ModelBundleMember] = []
-    for candidate in sorted(root.rglob("*")):
+    candidates = (
+        sorted((Path(item).resolve() for item in member_paths), key=str)
+        if member_paths is not None
+        else sorted(root.rglob("*"))
+    )
+    seen: set[str] = set()
+    for candidate in candidates:
         if not candidate.is_file() or candidate == manifest_path or ".tmp" in candidate.suffixes:
             continue
         relative = _inside(root, candidate).as_posix()
+        if relative in seen:
+            continue
+        seen.add(relative)
         members.append(
             ModelBundleMember(
                 name=relative,
@@ -87,6 +104,8 @@ def create_model_bundle(
                 size_bytes=candidate.stat().st_size,
             )
         )
+    if primary_name not in seen:
+        raise ArtifactError("primary model artifact must be an indexed bundle member")
     manifest = ModelBundleManifest(
         plugin=plugin,
         seed=seed,
@@ -108,6 +127,7 @@ def validate_model_bundle(
     expected_plugin: str | None = None,
     expected_config_sha256: str | None = None,
     expected_commit_sha: str | None = None,
+    expected_data_view_sha256: str | None = None,
     expected_features: FeatureView | None = None,
 ) -> LoadedModelBundle:
     """Load a bundle and fail closed on missing, corrupt, or incompatible members."""
@@ -131,6 +151,11 @@ def validate_model_bundle(
         raise ArtifactError("model bundle config hash mismatch")
     if expected_commit_sha is not None and manifest.commit_sha != expected_commit_sha:
         raise ArtifactError("model bundle commit mismatch")
+    if (
+        expected_data_view_sha256 is not None
+        and manifest.data_view_sha256 != expected_data_view_sha256
+    ):
+        raise ArtifactError("model bundle data-view hash mismatch")
     if expected_features is not None and manifest.feature_schema != feature_schema(expected_features):
         raise ArtifactError("model bundle feature schema mismatch")
 
@@ -145,6 +170,9 @@ def validate_model_bundle(
             raise ArtifactError(f"model bundle member is corrupt: {member.name}")
         member_paths.append(path)
     primary_path = (root / manifest.primary_member).resolve()
+    _inside(root, primary_path)
+    if primary_path not in member_paths:
+        raise ArtifactError("model bundle primary member was not validated")
     return LoadedModelBundle(
         manifest_path=manifest_path,
         manifest=manifest,

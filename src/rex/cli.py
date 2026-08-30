@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import functools
+import hashlib
 import importlib.metadata
 import json
 import os
@@ -11,6 +13,7 @@ import subprocess
 import sys
 import time
 import uuid
+from dataclasses import replace
 from pathlib import Path
 
 import yaml
@@ -23,15 +26,42 @@ from rex.control.fixture_supervisor import (
     FixtureScriptProvider,
     run_fixture_autopilot,
 )
+from rex.control.production_supervisor import (
+    ProductionAutopilot,
+    ProductionFixedProvider,
+    ProductionRunConfig,
+    environment_provenance_sha256,
+)
+from rex.control.scientific_hooks import build_scientific_hooks
 from rex.contracts import RunState
 from rex.data.bootstrap import bootstrap_views, default_data_dir
-from rex.data.manifest import load_benchmark_manifest, repo_root, sha256_file, verify_starter_manifest
+from rex.data.manifest import (
+    load_benchmark_manifest,
+    repo_root,
+    sha256_file,
+    verify_starter_manifest,
+)
 from rex.evaluation.baseline import reproduce_fm_bundle
+from rex.evaluation.submission import TEST_ROW_COUNT, build_submission, validate_submission
+from rex.execution.runner import execute_request
+from rex.execution.sandbox import SandboxError, SandboxMode, production_backend
 from rex.models.tree_ranker import tree_ranker_doctor
-from rex.rehearsal import rehearsal_requirements, run_fixture_rehearsal, run_r0
+from rex.rehearsal import (
+    rehearsal_requirements,
+    run_fixture_rehearsal,
+    run_production_rehearsal,
+    run_r0,
+)
 from rex.reporting.report import build_report
 from rex.store.db import Database
 from rex.store.repository import ExperimentRepository
+from rex.submission import (
+    FinalSubmissionCoordinator,
+    SubmissionDependencies,
+    SubmissionJobConfig,
+    SubmissionRepository,
+)
+from rex.submission.repository import discover_completed_source
 
 
 def _json(value: object) -> None:
@@ -46,10 +76,23 @@ def _commit(root: Path) -> str:
 
 
 def _environment_hash(root: Path) -> str:
-    return sha256_file(root / "requirements.txt")
+    provenance = {
+        "python": sys.version,
+        "platform": sys.platform,
+        "files": {
+            name: sha256_file(root / name)
+            for name in ("requirements-lock.txt", "pyproject.toml")
+            if (root / name).is_file()
+        },
+    }
+    return hashlib.sha256(
+        json.dumps(provenance, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
-def _resume_openai_usage(config: FixtureRunConfig, run_id: str | None) -> tuple[int, int]:
+def _resume_openai_usage(
+    config: FixtureRunConfig | ProductionRunConfig, run_id: str | None
+) -> tuple[int, int]:
     """Rehydrate durable successful API usage before resuming a fixture run.
 
     Router attempt counts are read from response artifacts. In automatic mode
@@ -218,15 +261,43 @@ def command_doctor(args: argparse.Namespace) -> int:
     benchmark = load_benchmark_manifest()
     llm = _llm_doctor(args)
     tree = tree_ranker_doctor() if args.tree else None
+    raw = yaml.safe_load(args.config.read_text(encoding="utf-8"))
+    raw = raw if isinstance(raw, dict) else {}
+    production = raw.get("execution_mode") == "production"
+    production_enabled = bool(raw.get("scientific_execution_enabled", False))
+    manifest_ready: bool | None = None
+    sandbox: dict[str, object] | None = None
+    production_ok = True
+    if production:
+        production_config = ProductionRunConfig.load(args.config)
+        manifest_ready = production_config.data_manifest.is_file()
+        try:
+            sandbox = production_backend().doctor().to_dict()
+        except SandboxError as error:
+            sandbox = {
+                "backend": "unavailable",
+                "available": False,
+                "safe_for_production": False,
+                "detail": str(error),
+            }
+        production_ok = bool(
+            production_enabled and manifest_ready and sandbox["safe_for_production"]
+        )
     result = {
-        "ok": bool((llm or {}).get("ok", True) and (tree or {}).get("ok", True)),
+        "ok": bool(
+            (llm or {}).get("ok", True)
+            and (tree or {}).get("ok", True)
+            and production_ok
+        ),
         "python": sys.version,
         "label": benchmark["label"],
         "metrics": benchmark["metrics"],
         "starter_manifest_sha256": starter.manifest_sha256,
         "evaluator_sha256": starter.hashes["evaluate.py"],
         "data_present": default_data_dir().is_dir(),
-        "production_science_enabled": False,
+        "production_science_enabled": production_enabled,
+        "production_data_manifest_ready": manifest_ready,
+        "production_sandbox": sandbox,
         "llm": llm,
         "tree": tree,
     }
@@ -236,10 +307,17 @@ def command_doctor(args: argparse.Namespace) -> int:
 
 def command_run(args: argparse.Namespace) -> int:
     raw = yaml.safe_load(args.config.read_text(encoding="utf-8"))
-    fixture_config = FixtureRunConfig.load(args.config)
+    if not isinstance(raw, dict):
+        raise ValueError("run configuration must be a YAML mapping")
     llm = dict(raw.get("llm", {}))
     if args.llm is not None:
         llm["mode"] = args.llm
+    if llm.get("mode") == "openai_api" and not getattr(args, "authorize_paid_api", False):
+        raise RuntimeError(
+            "direct OpenAI API use requires the explicit --authorize-paid-api flag"
+        )
+    if getattr(args, "authorize_paid_api", False) and llm.get("mode") != "openai_api":
+        raise RuntimeError("--authorize-paid-api requires --llm openai_api")
     if args.allow_paid_api_fallback:
         if llm.get("mode") != "auto":
             raise RuntimeError("--allow-paid-api-fallback requires --llm auto")
@@ -247,6 +325,42 @@ def command_run(args: argparse.Namespace) -> int:
         auto["allow_paid_api_fallback"] = True
         llm["auto"] = auto
     provider_config = load_provider_config(llm)
+    execution_mode = raw.get("execution_mode")
+    if execution_mode == "production":
+        production_config = ProductionRunConfig.load(args.config)
+        production_config = replace(production_config, llm=llm)
+        if provider_config.mode == "auto":
+            provider_config = replace(
+                provider_config,
+                auto=replace(
+                    provider_config.auto,
+                    provider_order=tuple(
+                        item for item in provider_config.auto.provider_order if item != "fixed"
+                    ),
+                ),
+            )
+        prior_openai_calls, prior_openai_tokens = _resume_openai_usage(
+            production_config, args.resume
+        )
+        provider = ProviderRouter.from_config(
+            provider_config,
+            fixed_provider=(ProductionFixedProvider() if provider_config.mode == "fixed" else None),
+            initial_openai_calls=prior_openai_calls,
+            initial_openai_tokens=prior_openai_tokens,
+        )
+        hooks = build_scientific_hooks(production_config, provider)
+        selected_run_id = args.resume or args.run_id
+        result = ProductionAutopilot(production_config, provider, hooks).run(
+            run_id=selected_run_id,
+            create_only=args.run_id is not None,
+            resume_only=args.resume is not None,
+            external_deadline_epoch_ms=args.external_deadline_epoch_ms,
+        )
+        _json(result)
+        return 0
+    if execution_mode != "fixture":
+        raise RuntimeError(f"unsupported execution_mode: {execution_mode!r}")
+    fixture_config = FixtureRunConfig.load(args.config)
     prior_openai_calls, prior_openai_tokens = _resume_openai_usage(
         fixture_config, args.resume
     )
@@ -256,16 +370,28 @@ def command_run(args: argparse.Namespace) -> int:
         initial_openai_calls=prior_openai_calls,
         initial_openai_tokens=prior_openai_tokens,
     )
+    if args.external_deadline_epoch_ms is not None:
+        raise RuntimeError("external deadline is supported only for production R3 runs")
     result = run_fixture_autopilot(
         fixture_config.source_path,
         provider=provider,
-        run_id=args.resume,
+        run_id=args.resume or args.run_id,
     )
     _json(result)
     return 0
 
 
 def command_status(args: argparse.Namespace) -> int:
+    raw = yaml.safe_load(args.config.read_text(encoding="utf-8"))
+    if isinstance(raw, dict) and raw.get("execution_mode") == "production":
+        config = ProductionRunConfig.load(args.config)
+        autopilot = ProductionAutopilot(config, ProductionFixedProvider())
+        _json(
+            autopilot.compact_status(args.run_id)
+            if args.compact
+            else autopilot.status(args.run_id)
+        )
+        return 0
     config = FixtureRunConfig.load(args.config)
     database = Database(config.runs_dir / args.run_id / "state.sqlite3")
     if not database.path.is_file():
@@ -350,12 +476,178 @@ def command_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def _submission_coordinator(
+    args: argparse.Namespace,
+) -> tuple[FinalSubmissionCoordinator, Path]:
+    """Wire production-safe adapters without granting the model test labels."""
+
+    config = ProductionRunConfig.load(args.config)
+    run_dir = (config.runs_dir / args.run_id).resolve()
+    source_database = run_dir / "state.sqlite3"
+    if not source_database.is_file():
+        raise RuntimeError(f"unknown production run: {args.run_id}")
+    try:
+        data_manifest = json.loads(config.data_manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"invalid production data manifest: {error}") from error
+    if not isinstance(data_manifest, dict):
+        raise RuntimeError("production data manifest must be a JSON object")
+    test = data_manifest.get("splits", {}).get("test", {})
+    if not isinstance(test, dict):
+        raise RuntimeError("production data manifest has no test split")
+    if test.get("target_path") is not None or test.get("target_sha256") is not None:
+        raise RuntimeError("test submission refuses a manifest containing test targets")
+    if int(test.get("row_count", -1)) != TEST_ROW_COUNT:
+        raise RuntimeError(f"test split must contain exactly {TEST_ROW_COUNT:,} rows")
+    feature_path = Path(str(test.get("feature_path", ""))).resolve(strict=True)
+    feature_sha256 = str(test.get("feature_sha256", ""))
+    if sha256_file(feature_path) != feature_sha256:
+        raise RuntimeError("canonical test feature view has drifted")
+    source = discover_completed_source(source_database, args.run_id)
+    if source.source_run["data_manifest_sha256"] != sha256_file(config.data_manifest):
+        raise RuntimeError("production run was completed against a different data manifest")
+
+    output_root = _submission_output_root(args, run_dir, source_database)
+    jobs_root = output_root / "jobs"
+    repository = SubmissionRepository(output_root / "state.sqlite3")
+    repository.initialize()
+
+    def predict(request, attempt_dir):
+        return execute_request(
+            request,
+            attempt_dir,
+            trusted_worktree_root=jobs_root,
+            sandbox_mode=SandboxMode.PRODUCTION,
+            trusted_output_root=jobs_root,
+        )
+
+    def build_csv(prediction_path, csv_path, expected_features, expected_rows):
+        return build_submission(
+            prediction_path,
+            csv_path,
+            expected_features=expected_features,
+            expected_rows=expected_rows,
+        )
+
+    checker = functools.partial(
+        validate_submission,
+        data_dir=Path(args.data_dir).resolve(strict=True),
+        split="test",
+        sandbox_mode=SandboxMode.PRODUCTION,
+    )
+    coordinator = FinalSubmissionCoordinator(
+        repository,
+        SubmissionJobConfig(
+            repository_root=config.project_root,
+            jobs_root=jobs_root,
+            test_feature_path=feature_path,
+            test_data_view_sha256=feature_sha256,
+            environment_sha256=environment_provenance_sha256(config),
+            expected_test_rows=TEST_ROW_COUNT,
+        ),
+        SubmissionDependencies(
+            predictor=predict,
+            csv_builder=build_csv,
+            checker=checker,
+        ),
+    )
+    return coordinator, source_database
+
+
+def _submission_output_root(
+    args: argparse.Namespace, run_dir: Path, source_database: Path
+) -> Path:
+    output_root = (
+        Path(args.output_dir).resolve()
+        if args.output_dir is not None
+        else (run_dir / "submission").resolve()
+    )
+    if output_root == run_dir or output_root in run_dir.parents:
+        raise RuntimeError("submission output may not replace the production run or its parent")
+    for protected in (source_database, run_dir / "best-valid", run_dir / "report"):
+        protected = protected.resolve()
+        if output_root == protected or protected in output_root.parents:
+            raise RuntimeError(f"submission output overlaps immutable run evidence: {protected}")
+    return output_root
+
+
+def _handoff_coordinator(args: argparse.Namespace) -> FinalSubmissionCoordinator:
+    """Open only sealed submission state; handoff needs no test-data capability."""
+
+    config = ProductionRunConfig.load(args.config)
+    run_dir = (config.runs_dir / args.run_id).resolve()
+    source_database = run_dir / "state.sqlite3"
+    output_root = _submission_output_root(args, run_dir, source_database)
+    state_path = output_root / "state.sqlite3"
+    if not state_path.is_file():
+        raise RuntimeError(f"submission state does not exist: {state_path}")
+    repository = SubmissionRepository(state_path)
+    repository.initialize()
+
+    def unavailable(*_args, **_kwargs):
+        raise RuntimeError("handoff command has no prediction, data, or checker capability")
+
+    coordinator = FinalSubmissionCoordinator(
+        repository,
+        SubmissionJobConfig(
+            repository_root=config.project_root,
+            jobs_root=output_root / "jobs",
+            test_feature_path=output_root / "no-test-feature-capability",
+            test_data_view_sha256="0" * 64,
+            environment_sha256="0" * 64,
+            expected_test_rows=TEST_ROW_COUNT,
+        ),
+        SubmissionDependencies(
+            predictor=unavailable,
+            csv_builder=unavailable,
+            checker=unavailable,
+        ),
+    )
+    return coordinator
+
+
+def command_finalize_submission(args: argparse.Namespace) -> int:
+    if not args.authorize_test_prediction:
+        raise RuntimeError(
+            "final test prediction requires the explicit --authorize-test-prediction flag"
+        )
+    coordinator, source_database = _submission_coordinator(args)
+    job = coordinator.create(source_database, args.run_id)
+    result = coordinator.run_until_ready(str(job["job_id"]))
+    _json(result)
+    return 0
+
+
+def command_handoff_submission(args: argparse.Namespace) -> int:
+    if not args.authorize_once:
+        raise RuntimeError("submission handoff requires the explicit --authorize-once flag")
+    if len(args.seal_sha256) != 64 or any(
+        character not in "0123456789abcdef" for character in args.seal_sha256
+    ):
+        raise ValueError("--seal-sha256 must be a lowercase SHA-256 digest")
+    coordinator = _handoff_coordinator(args)
+    job = coordinator.repository.get_job(args.job_id)
+    if job["source_run_id"] != args.run_id:
+        raise RuntimeError("submission job belongs to a different production run")
+    result = coordinator.handoff(
+        args.job_id,
+        args.target_dir,
+        authorized_seal_sha256=args.seal_sha256,
+    )
+    _json(result)
+    return 0
+
+
 def command_rehearse(args: argparse.Namespace) -> int:
     requirements = rehearsal_requirements(args.level)
     if args.level.upper() == "R0":
         result = run_r0(args.output_dir)
         _json({"requirements": requirements, **result})
         return 0 if result["event_chain_valid"] else 1
+    if args.level.upper() in {"R1", "R2"}:
+        result = run_production_rehearsal(args.level, args.output_dir)
+        _json({"requirements": requirements, **result})
+        return 0 if result["all_cases_passed"] else 1
     result = run_fixture_rehearsal(args.config, args.output_dir)
     _json({"requirements": requirements, **result})
     checks = (
@@ -381,9 +673,16 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--tree", action="store_true", help="run the synthetic LightGBM doctor")
     doctor.add_argument("--config", type=Path, default=root / "configs/run/fixture.yaml")
     doctor.set_defaults(handler=command_doctor)
-    run = sub.add_parser("run", help="run or resume the fixture-only autonomous loop")
+    run = sub.add_parser("run", help="run or resume the configured autonomous control plane")
     run.add_argument("--config", type=Path, default=root / "configs/run/fixture.yaml")
-    run.add_argument("--resume", metavar="RUN_ID")
+    run_identity = run.add_mutually_exclusive_group()
+    run_identity.add_argument("--run-id", metavar="RUN_ID", help="create one named run")
+    run_identity.add_argument("--resume", metavar="RUN_ID", help="resume one existing run")
+    run.add_argument(
+        "--external-deadline-epoch-ms",
+        type=int,
+        help="R3 envelope deadline; may only shorten the configured wall ceiling",
+    )
     run.add_argument(
         "--llm", choices=["codex_cli", "claude_cli", "openai_api", "auto", "fixed"]
     )
@@ -392,10 +691,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="allow auto mode to fall back from local CLIs to the paid OpenAI API",
     )
+    run.add_argument(
+        "--authorize-paid-api",
+        action="store_true",
+        help="explicitly authorize direct paid OpenAI API use for this run invocation",
+    )
     run.set_defaults(handler=command_run)
-    status = sub.add_parser("status", help="show durable fixture-run state")
+    status = sub.add_parser("status", help="show durable run state")
     status.add_argument("--run-id", required=True)
     status.add_argument("--config", type=Path, default=root / "configs/run/fixture.yaml")
+    status.add_argument(
+        "--compact", action="store_true", help="emit a small hourly-monitoring snapshot"
+    )
     status.set_defaults(handler=command_status)
     bootstrap = sub.add_parser("bootstrap", help="build sanitized data views and target vault")
     bootstrap.add_argument("--data-dir", type=Path, default=default_data_dir())
@@ -417,9 +724,49 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("--run-id", required=True)
     report.add_argument("--output-dir", type=Path, required=True)
     report.set_defaults(handler=command_report)
-    rehearse = sub.add_parser("rehearse", help="run a short generated-fixture rehearsal")
+    finalize = sub.add_parser(
+        "finalize-submission",
+        help="create and check one test submission from a completed production winner",
+    )
+    finalize.add_argument("--run-id", required=True)
+    finalize.add_argument("--config", type=Path, default=root / "configs/run/production.yaml")
+    finalize.add_argument("--data-dir", type=Path, default=default_data_dir())
+    finalize.add_argument(
+        "--output-dir",
+        type=Path,
+        help="submission state/output root; defaults to runs/<run-id>/submission",
+    )
+    finalize.add_argument(
+        "--authorize-test-prediction",
+        action="store_true",
+        help="explicitly authorize the single resumable prediction over the test feature view",
+    )
+    finalize.set_defaults(handler=command_finalize_submission)
+    handoff = sub.add_parser(
+        "handoff-submission",
+        help="copy one sealed submission bundle to its explicitly authorized handoff path",
+    )
+    handoff.add_argument("--run-id", required=True)
+    handoff.add_argument("--job-id", required=True)
+    handoff.add_argument("--seal-sha256", required=True)
+    handoff.add_argument("--target-dir", type=Path, required=True)
+    handoff.add_argument("--config", type=Path, default=root / "configs/run/production.yaml")
+    handoff.add_argument(
+        "--output-dir",
+        type=Path,
+        help="submission state/output root; defaults to runs/<run-id>/submission",
+    )
+    handoff.add_argument(
+        "--authorize-once",
+        action="store_true",
+        help="authorize one filesystem handoff of this exact seal",
+    )
+    handoff.set_defaults(handler=command_handoff_submission)
+    rehearse = sub.add_parser("rehearse", help="run a bounded offline control-plane rehearsal")
     rehearse.add_argument(
-        "--level", choices=["R0", "FIXTURE", "r0", "fixture"], default="FIXTURE"
+        "--level",
+        choices=["R0", "R1", "R2", "FIXTURE", "r0", "r1", "r2", "fixture"],
+        default="FIXTURE",
     )
     rehearse.add_argument("--output-dir", type=Path, default=root / "runs/rehearsal-fixture")
     rehearse.add_argument("--config", type=Path, default=root / "configs/run/fixture.yaml")

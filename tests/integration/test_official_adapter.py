@@ -23,7 +23,12 @@ def test_perfect_predictions_score_one_through_frozen_evaluator(feature_target_p
 def test_submission_builder_preserves_duplicate_rows(feature_target_paths, tmp_path) -> None:
     features, _ = feature_target_paths
     prediction = write_prediction_artifact(tmp_path / "pred.npz", features, np.arange(8))
-    csv_path = build_submission(prediction, tmp_path / "submission.csv")
+    csv_path = build_submission(
+        prediction,
+        tmp_path / "submission.csv",
+        expected_features=features,
+        expected_rows=8,
+    )
     with csv_path.open(newline="", encoding="utf-8") as handle:
         rows = list(csv.reader(handle))
     assert rows[0] == ["row_id", "user_id", "video_id", "score"]

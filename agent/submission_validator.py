@@ -18,4 +18,6 @@ def validate(csv_path: str, *, data_dir: str, split: str) -> dict[str, object]:
         "output": result.stdout + result.stderr,
         "command": list(result.command),
         "returncode": result.returncode,
+        "sandbox": result.sandbox_evidence,
+        "test_scored": False,
     }
