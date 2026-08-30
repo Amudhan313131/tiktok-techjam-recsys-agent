@@ -312,6 +312,124 @@ def test_controlled_failure_kills_only_verified_lease_owner_once(tmp_path: Path)
         os.kill(process.pid, 0)
 
 
+def test_pre_injection_recovery_accepts_fixture_valid_progress_and_rejects_loops(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    data = tmp_path / "data"
+    source.mkdir()
+    data.mkdir()
+    envelope = R3Envelope(
+        R3Options(
+            source,
+            "HEAD",
+            data,
+            tmp_path / "output",
+            "codex_cli",
+            run_id="r3-prelease",
+            wall_clock_seconds=60,
+            finalization_reserve_seconds=10,
+        )
+    )
+    envelope.source_commit = "a" * 40
+    main_database = envelope.runs / envelope.run_id / "state.sqlite3"
+    Database(main_database).initialize()
+    with sqlite3.connect(main_database) as connection:
+        connection.execute(
+            "INSERT INTO runs(run_id,state,created_at,updated_at,deadline_epoch_ms,root_commit,"
+            "environment_sha256,data_manifest_sha256,evaluator_sha256,hypothesis_count,"
+            "official_evaluation_count,non_improvement_streak) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                envelope.run_id,
+                "SEARCHING",
+                "now",
+                "now",
+                int(envelope.deadline_epoch * 1000),
+                envelope.source_commit,
+                "b" * 64,
+                "c" * 64,
+                "d" * 64,
+                0,
+                0,
+                0,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO process_sessions(session_id,run_id,pid,host,started_at,last_heartbeat,"
+            "ended_at,exit_reason) VALUES(?,?,?,?,?,?,?,?)",
+            ("prelease", envelope.run_id, 4321, "host", "1", "2", "3", "production_interrupted"),
+        )
+
+    transaction_database = (
+        envelope.runs / envelope.run_id / "transactions" / "E01" / "state.sqlite3"
+    )
+    Database(transaction_database).initialize()
+    with sqlite3.connect(transaction_database) as connection:
+        connection.execute(
+            "INSERT INTO runs(run_id,state,created_at,updated_at,deadline_epoch_ms,root_commit,"
+            "environment_sha256,data_manifest_sha256,evaluator_sha256,hypothesis_count,"
+            "official_evaluation_count,non_improvement_streak) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                envelope.run_id,
+                "SEARCHING",
+                "now",
+                "now",
+                int(envelope.deadline_epoch * 1000),
+                envelope.source_commit,
+                "b" * 64,
+                "c" * 64,
+                "d" * 64,
+                1,
+                0,
+                0,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO experiments(experiment_id,run_id,iteration_number,operator,hypothesis,"
+            "proposal_json,state,workspace_path,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (
+                "exp-1",
+                envelope.run_id,
+                1,
+                "LOSS",
+                "durable preparation",
+                "{}",
+                "FIXTURE_VALID",
+                "/isolated/worktree",
+                "now",
+                "now",
+            ),
+        )
+
+    class ExitedProcess:
+        pid = 4321
+        returncode = 1
+
+    first = envelope._pre_injection_recovery(
+        ExitedProcess(), restart_number=1, previous_progress_token=None  # type: ignore[arg-type]
+    )
+    with pytest.raises(R3EnvelopeError, match="no durable progress"):
+        envelope._pre_injection_recovery(
+            ExitedProcess(),  # type: ignore[arg-type]
+            restart_number=2,
+            previous_progress_token=str(first["progress_token"]),
+        )
+
+    with sqlite3.connect(transaction_database) as connection:
+        connection.execute(
+            "UPDATE experiments SET commit_sha=? WHERE experiment_id=?",
+            ("e" * 40, "exp-1"),
+        )
+    second = envelope._pre_injection_recovery(
+        ExitedProcess(),  # type: ignore[arg-type]
+        restart_number=2,
+        previous_progress_token=str(first["progress_token"]),
+    )
+    assert second["decision"] == "resume-same-run"
+    assert second["progress_token"] != first["progress_token"]
+
+
 def _artifact(path: Path, kind: str) -> dict[str, object]:
     import hashlib
 

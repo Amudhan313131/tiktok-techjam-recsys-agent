@@ -54,6 +54,7 @@ class R3Options:
     finalization_reserve_seconds: int = 20 * 60
     snapshot_interval_seconds: int = DEFAULT_SNAPSHOT_SECONDS
     lease_wait_seconds: int = 3 * 60 * 60
+    pre_injection_restart_limit: int = 2
     authorize_paid_api: bool = False
     skip_dependency_install: bool = False
 
@@ -77,6 +78,8 @@ class R3Options:
             raise R3EnvelopeError("snapshot interval must be positive")
         if self.lease_wait_seconds <= 0:
             raise R3EnvelopeError("worker-lease wait must be positive")
+        if not 0 <= self.pre_injection_restart_limit <= 2:
+            raise R3EnvelopeError("pre-injection restart limit must be between zero and two")
         if self.run_id is not None and not _SAFE_RUN_ID.fullmatch(self.run_id):
             raise R3EnvelopeError("R3 run ID must be one safe path component")
         if not source.is_dir():
@@ -97,6 +100,7 @@ class R3Options:
             finalization_reserve_seconds=self.finalization_reserve_seconds,
             snapshot_interval_seconds=self.snapshot_interval_seconds,
             lease_wait_seconds=self.lease_wait_seconds,
+            pre_injection_restart_limit=self.pre_injection_restart_limit,
             authorize_paid_api=self.authorize_paid_api,
             skip_dependency_install=self.skip_dependency_install,
         )
@@ -846,22 +850,164 @@ class R3Envelope:
                 self.next_snapshot += self.options.snapshot_interval_seconds
         return snapshot
 
-    def _wait_for_injection_point(self, process: subprocess.Popen[bytes]) -> tuple[Path, dict[str, Any]]:
+    def _wait_for_injection_point(
+        self, process: subprocess.Popen[bytes]
+    ) -> tuple[Path, dict[str, Any]] | None:
         wait_deadline = min(
             self.deadline_monotonic - self.options.finalization_reserve_seconds,
             self.monotonic() + self.options.lease_wait_seconds,
         )
         while self.monotonic() < wait_deadline:
             self._snapshot("scheduled-hourly")
-            if process.poll() is not None:
-                raise R3EnvelopeError(
-                    "production run ended before an active durable worker lease was available"
-                )
             observed = self._find_active_lease(process.pid)
             if observed is not None:
                 return observed
+            if process.poll() is not None:
+                return None
             self.sleep(min(1.0, max(0.01, wait_deadline - self.monotonic())))
         raise R3EnvelopeError("no active durable worker lease appeared before the injection cutoff")
+
+    def _pre_injection_recovery(
+        self,
+        process: subprocess.Popen[bytes],
+        *,
+        restart_number: int,
+        previous_progress_token: str | None,
+    ) -> dict[str, Any]:
+        database = self.runs / self.run_id / "state.sqlite3"
+        if not database.is_file():
+            raise R3EnvelopeError("pre-injection coordinator exit left no durable run database")
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        try:
+            run = connection.execute("SELECT * FROM runs WHERE run_id=?", (self.run_id,)).fetchone()
+            session = connection.execute(
+                "SELECT pid,ended_at,exit_reason,last_heartbeat FROM process_sessions "
+                "WHERE run_id=? AND pid=? ORDER BY started_at DESC LIMIT 1",
+                (self.run_id, process.pid),
+            ).fetchone()
+            main_counts = {
+                "experiments": int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM experiments WHERE run_id=?", (self.run_id,)
+                    ).fetchone()[0]
+                ),
+                "transitions": int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM transitions transition JOIN experiments experiment "
+                        "ON experiment.experiment_id=transition.experiment_id WHERE experiment.run_id=?",
+                        (self.run_id,),
+                    ).fetchone()[0]
+                ),
+            }
+        finally:
+            connection.close()
+        if run is None or str(run["state"]) != "SEARCHING":
+            raise R3EnvelopeError("pre-injection coordinator exit is not a resumable search run")
+        if str(run["root_commit"]) != self.source_commit:
+            raise R3EnvelopeError("pre-injection recovery detected source-commit drift")
+        if int(run["deadline_epoch_ms"]) != int(self.deadline_epoch * 1000):
+            raise R3EnvelopeError("pre-injection recovery detected deadline drift")
+        if session is None:
+            raise R3EnvelopeError("pre-injection exit has no durable process session")
+
+        transactions: list[dict[str, Any]] = []
+        active_states: list[str] = []
+        allowed = {
+            "PROPOSED",
+            "WORKTREE_READY",
+            "PATCHED",
+            "STATIC_VALID",
+            "FIXTURE_VALID",
+        }
+        run_dir = self.runs / self.run_id
+        for path in sorted(run_dir.glob("transactions/*/state.sqlite3")):
+            transaction = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            transaction.row_factory = sqlite3.Row
+            try:
+                rows = transaction.execute(
+                    "SELECT experiment_id,state,terminal_reason,commit_sha,config_sha256,"
+                    "workspace_path FROM experiments ORDER BY iteration_number"
+                ).fetchall()
+                transitions = int(
+                    transaction.execute("SELECT COUNT(*) FROM transitions").fetchone()[0]
+                )
+                transition_high_water = int(
+                    transaction.execute(
+                        "SELECT COALESCE(MAX(transition_id),0) FROM transitions"
+                    ).fetchone()[0]
+                )
+                repairs = int(
+                    transaction.execute("SELECT COUNT(*) FROM experiment_repairs").fetchone()[0]
+                )
+                completed_repairs = int(
+                    transaction.execute(
+                        "SELECT COUNT(*) FROM experiment_repairs WHERE completed_at IS NOT NULL"
+                    ).fetchone()[0]
+                )
+                llm_calls = int(transaction.execute("SELECT COUNT(*) FROM llm_calls").fetchone()[0])
+                artifacts = int(transaction.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0])
+                event_high_water = int(
+                    transaction.execute(
+                        "SELECT COALESCE(MAX(sequence),0) FROM event_outbox"
+                    ).fetchone()[0]
+                )
+            finally:
+                transaction.close()
+            item = {
+                "path": str(path.relative_to(run_dir)),
+                "experiments": [
+                    {
+                        "experiment_id": str(row["experiment_id"]),
+                        "state": str(row["state"]),
+                        "terminal_reason": str(row["terminal_reason"] or "")[-500:],
+                        "commit_sha": str(row["commit_sha"] or ""),
+                        "config_sha256": str(row["config_sha256"] or ""),
+                        "workspace_path": str(row["workspace_path"] or ""),
+                    }
+                    for row in rows
+                ],
+                "transitions": transitions,
+                "transition_high_water": transition_high_water,
+                "repairs": repairs,
+                "completed_repairs": completed_repairs,
+                "llm_calls": llm_calls,
+                "artifacts": artifacts,
+                "event_high_water": event_high_water,
+            }
+            transactions.append(item)
+            active_states.extend(
+                str(row["state"])
+                for row in rows
+                if str(row["state"])
+                not in {"PROMOTED", "REJECTED", "ABANDONED", "FAILED_FINAL"}
+            )
+        if any(state not in allowed for state in active_states):
+            raise R3EnvelopeError(
+                "pre-injection coordinator exit is not a typed preparation interruption"
+            )
+        progress = {
+            "run_state": str(run["state"]),
+            "hypothesis_count": int(run["hypothesis_count"]),
+            "main_counts": main_counts,
+            "transactions": transactions,
+        }
+        progress_token = hashlib.sha256(
+            json.dumps(progress, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        if previous_progress_token == progress_token:
+            raise R3EnvelopeError("pre-injection recovery made no durable progress")
+        return {
+            "schema_version": "1.0",
+            "restart_number": restart_number,
+            "exited_pid": process.pid,
+            "return_code": int(process.returncode or 0),
+            "process_session": dict(session),
+            "progress": progress,
+            "progress_token": progress_token,
+            "decision": "resume-same-run",
+            "recorded_at": _utc_now(),
+        }
 
     def _inject(self, process: subprocess.Popen[bytes], lease_path: Path, lease: dict[str, Any]) -> None:
         if self.fault["count"] != 0:
@@ -889,6 +1035,9 @@ class R3Envelope:
             "pre_fault_status": _read_run_status(database, self.run_id),
             "pre_fault_database_audit": _database_audit(database, self.run_id),
             "recorded_at": _utc_now(),
+            "pre_injection_recoveries": list(
+                self.fault.get("pre_injection_recoveries", [])
+            ),
         }
         injection_path = self.runtime / "fault_injection.json"
         _atomic_json(injection_path, intent)
@@ -1230,6 +1379,7 @@ class R3Envelope:
                 "resume_command": list(resume_command),
                 "run_id": self.run_id,
                 "external_deadline_epoch_ms": int(self.deadline_epoch * 1000),
+                "pre_injection_restart_limit": self.options.pre_injection_restart_limit,
                 "stdin": "DEVNULL",
                 "validation_only": True,
             },
@@ -1237,8 +1387,42 @@ class R3Envelope:
         first = self._launch(initial_command, environment, "run-initial")
         self._state("running")
         self._snapshot("initial", force=True)
-        lease_path, lease = self._wait_for_injection_point(first)
-        self._inject(first, lease_path, lease)
+        coordinator = first
+        recoveries: list[dict[str, Any]] = []
+        previous_progress_token: str | None = None
+        while True:
+            observed = self._wait_for_injection_point(coordinator)
+            if observed is not None:
+                lease_path, lease = observed
+                break
+            if len(recoveries) >= self.options.pre_injection_restart_limit:
+                raise R3EnvelopeError(
+                    "production run ended before an active durable worker lease was available"
+                )
+            recovery = self._pre_injection_recovery(
+                coordinator,
+                restart_number=len(recoveries) + 1,
+                previous_progress_token=previous_progress_token,
+            )
+            previous_progress_token = str(recovery["progress_token"])
+            recoveries.append(recovery)
+            _atomic_json(
+                self.runtime / "pre_injection_recoveries.json",
+                {"schema_version": "1.0", "recoveries": recoveries},
+            )
+            self.fault = {
+                **self.fault,
+                "state": "recovering-preparation",
+                "pre_injection_recoveries": recoveries,
+            }
+            self._state("recovering-preparation")
+            coordinator = self._launch(
+                resume_command,
+                environment,
+                f"run-prelease-resume-{len(recoveries):02d}",
+            )
+            self._state("running")
+        self._inject(coordinator, lease_path, lease)
         resumed = self._launch(resume_command, environment, "run-resumed")
         self.fault = {**self.fault, "state": "resume-started", "resume_pid": resumed.pid}
         self._state("running-resumed")
@@ -1271,6 +1455,9 @@ class R3Envelope:
             self.status_dir / "latest.json",
             run_root / "state.sqlite3",
         ]
+        prelease_evidence = self.runtime / "pre_injection_recoveries.json"
+        if prelease_evidence.is_file():
+            evidence_files.append(prelease_evidence)
         evidence_files.extend(path for path in self.logs.rglob("*") if path.is_file())
         evidence_files.extend(path for path in self.status_dir.rglob("*") if path.is_file())
         evidence_files.extend(

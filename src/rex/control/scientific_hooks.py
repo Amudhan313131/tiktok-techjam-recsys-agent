@@ -21,13 +21,21 @@ from typing import Any, Callable
 import numpy as np
 import yaml
 
-from rex.agents.coordinator import PatchTransactionCoordinator
+from rex.agents.coordinator import PatchRepairsExhausted, PatchTransactionCoordinator
 from rex.agents.patch_guard import PatchPolicy, changed_paths
 from rex.agents.provider import ProviderError, StructuredProvider, redact_secrets
 from rex.agents.services import CodingService, ProposalService
 from rex.agents.static_audit import audit_changed_files
 from rex.agents.workspace import GitWorkspace
-from rex.contracts import ArtifactRef, AttemptStatus, ExperimentProposal, Metrics, RunRequest, RunResult
+from rex.contracts import (
+    ArtifactRef,
+    AttemptStatus,
+    ExperimentProposal,
+    ExperimentState,
+    Metrics,
+    RunRequest,
+    RunResult,
+)
 from rex.control.budget import BudgetConfig
 from rex.control.production_supervisor import (
     BaselineGateResult,
@@ -37,6 +45,7 @@ from rex.control.production_supervisor import (
     ProductionContext,
     ProductionFixedProvider,
     ProductionHooks,
+    ProductionPreparationRejected,
     ProductionRungFailure,
     ProductionRungResult,
     ProductionRunConfig,
@@ -73,7 +82,7 @@ from rex.features.recipes import (
 )
 from rex.models.ensemble import blend_scores
 from rex.store.db import Database
-from rex.store.repository import ExperimentRepository
+from rex.store.repository import ExperimentRepository, RepositoryError
 
 
 ExecuteRequest = Callable[..., RunResult]
@@ -863,6 +872,18 @@ class ProductionScientificHooks(ProductionHooks):
             data_manifest_sha256=sha256_file(self.config.data_manifest),
             evaluator_sha256=sha256_file(self.config.evaluator_path),
         )
+        exhausted = self._exhausted_preparation(repository, context.run_id)
+        if exhausted is not None:
+            reason = str(exhausted.get("terminal_reason") or "patch repairs exhausted")
+            self._abandon_exhausted_preparation(
+                context=context,
+                card_id=card.card_id,
+                parent_commit=parent_commit,
+                transaction_repository=repository,
+                transaction_root=transaction_root,
+                reason=reason,
+            )
+            raise ProductionPreparationRejected(reason)
         enriched_context: dict[str, Any] = {
             **proposal_context,
             "experiment_id": f"{context.run_id}-{card.card_id.lower()}",
@@ -884,6 +905,7 @@ class ProductionScientificHooks(ProductionHooks):
             trusted_output_root=context.run_dir,
             command_timeout_seconds=min(180, self.budget.default_attempt_timeout_seconds),
             checkpoint=self.preparation_checkpoint,
+            max_patch_repairs=self.budget.max_repairs_per_experiment,
         )
         try:
             prepared = coordinator.prepare(
@@ -945,11 +967,119 @@ class ProductionScientificHooks(ProductionHooks):
                 (*refs, artifact_ref(durable_config, "effective_experiment_config")),
                 durable_config,
             )
+        except PatchRepairsExhausted as error:
+            self._record_preparation_failure(
+                context, card.card_id, error, enriched_context, attempt
+            )
+            self._abandon_exhausted_preparation(
+                context=context,
+                card_id=card.card_id,
+                parent_commit=parent_commit,
+                transaction_repository=repository,
+                transaction_root=transaction_root,
+                reason=str(error),
+            )
+            raise ProductionPreparationRejected(str(error)) from error
         except Exception as error:
             self._record_preparation_failure(
                 context, card.card_id, error, enriched_context, attempt
             )
             raise
+
+    def _abandon_exhausted_preparation(
+        self,
+        *,
+        context: ProductionContext,
+        card_id: str,
+        parent_commit: str,
+        transaction_repository: ExperimentRepository,
+        transaction_root: Path,
+        reason: str,
+    ) -> None:
+        with transaction_repository.database.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM experiments WHERE run_id=? ORDER BY iteration_number",
+                (context.run_id,),
+            ).fetchall()
+        if len(rows) != 1:
+            raise RuntimeError("exhausted preparation has no unique durable proposal")
+        transaction = dict(rows[0])
+        experiment_id = str(transaction["experiment_id"])
+        state = ExperimentState(str(transaction["state"]))
+        if state == ExperimentState.FAILED_REPAIRABLE:
+            transaction_repository.transition_experiment(
+                experiment_id,
+                ExperimentState.FAILED_REPAIRABLE,
+                ExperimentState.FAILED_FINAL,
+                payload={"phase": "preparation", "reason": reason[-1000:]},
+                idempotency_key=f"{experiment_id}:preparation-repairs-exhausted",
+            )
+        elif state != ExperimentState.FAILED_FINAL:
+            raise RuntimeError(f"unexpected exhausted preparation state: {state}")
+
+        proposal = ExperimentProposal.model_validate_json(transaction["proposal_json"])
+        main = self._main_repository(context)
+        try:
+            main_experiment = main.get_experiment(experiment_id)
+        except RepositoryError:
+            main.create_experiment(
+                context.run_id,
+                proposal,
+                parent_commit,
+                max_hypotheses=self.budget.max_hypotheses,
+                workspace_path=transaction.get("workspace_path"),
+                branch_name=transaction.get("branch_name"),
+                method_card_id=card_id,
+                experiment_kind="production_search",
+            )
+            main_experiment = main.get_experiment(experiment_id)
+        evidence_paths = _all_files(
+            transaction_root.parent.parent / "worktrees" / "_artifacts" / experiment_id
+        )
+        for path in evidence_paths:
+            main.register_artifact(
+                artifact_ref(path, "preparation_evidence"), experiment_id=experiment_id
+            )
+        self._mirror_preparation_llm_calls(context, transaction_repository, experiment_id)
+        main_state = ExperimentState(str(main_experiment["state"]))
+        if main_state == ExperimentState.PROPOSED:
+            main.transition_experiment(
+                experiment_id,
+                ExperimentState.PROPOSED,
+                ExperimentState.ABANDONED,
+                payload={
+                    "phase": "preparation",
+                    "reason": reason[-1000:],
+                    "incumbent_preserved": True,
+                    "repairs_exhausted": self.budget.max_repairs_per_experiment,
+                },
+                idempotency_key=f"{experiment_id}:preparation-abandoned",
+            )
+        elif main_state != ExperimentState.ABANDONED:
+            raise RuntimeError(
+                f"exhausted preparation has unexpected main state: {main_state}"
+            )
+
+    @staticmethod
+    def _exhausted_preparation(
+        repository: ExperimentRepository, run_id: str
+    ) -> dict[str, Any] | None:
+        with repository.database.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM experiments WHERE run_id=? ORDER BY iteration_number",
+                (run_id,),
+            ).fetchall()
+        if len(rows) != 1:
+            return None
+        row = dict(rows[0])
+        state = ExperimentState(str(row["state"]))
+        exhausted_repairable = (
+            state == ExperimentState.FAILED_REPAIRABLE
+            and "PatchRepairsExhausted" in str(row.get("terminal_reason") or "")
+        )
+        if state != ExperimentState.FAILED_FINAL and not exhausted_repairable:
+            return None
+        return row
 
     def _mirror_preparation_llm_calls(
         self,
@@ -982,7 +1112,7 @@ class ProductionScientificHooks(ProductionHooks):
                 if ref is not None:
                     main.register_artifact(ref)
             main.record_llm_call(
-                call_id=f"{experiment_id}:preparation:{row['role']}",
+                call_id=f"{experiment_id}:preparation:{row['call_id']}",
                 run_id=context.run_id,
                 experiment_id=None,
                 role=str(row["role"]),
@@ -1036,6 +1166,25 @@ class ProductionScientificHooks(ProductionHooks):
             raise RuntimeError("durable live proposal identity mismatch")
         repository = self._main_repository(context)
         experiment = repository.get_experiment(experiment_id)
+        card_id = str(experiment.get("method_card_id") or "")
+        transaction_root = context.run_dir / "transactions" / card_id
+        transaction_database = Database(transaction_root / "state.sqlite3")
+        if transaction_database.path.is_file():
+            transaction_repository = ExperimentRepository(transaction_database)
+            exhausted = self._exhausted_preparation(transaction_repository, context.run_id)
+            if exhausted is not None:
+                reason = str(
+                    exhausted.get("terminal_reason") or "patch repairs exhausted"
+                )
+                self._abandon_exhausted_preparation(
+                    context=context,
+                    card_id=card_id,
+                    parent_commit=str(experiment.get("parent_commit") or context.root_commit),
+                    transaction_repository=transaction_repository,
+                    transaction_root=transaction_root,
+                    reason=reason,
+                )
+                raise ProductionPreparationRejected(reason)
         if proposal.model_dump(mode="json") != json.loads(experiment["proposal_json"]):
             raise RuntimeError("durable live proposal contents drifted")
         commit_sha = str(experiment.get("commit_sha") or "")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 import subprocess
@@ -13,8 +14,8 @@ from rex.agents.patch_guard import PatchPolicy, validate_patch
 from rex.agents.provider import ProviderResponse
 from rex.agents.services import AgentDecision, CodingService, PatchResponse, ProposalService
 from rex.agents.static_audit import audit_changed_files, audit_fixture_bias_only
-from rex.agents.workspace import GitWorkspace
-from rex.contracts import ExperimentProposal, ExperimentState
+from rex.agents.workspace import GitWorkspace, PatchApplicationRejected
+from rex.contracts import AttemptStatus, ExperimentProposal, ExperimentState
 from rex.execution.artifacts import artifact_ref, atomic_write_json
 from rex.execution.gate import execute_gate
 from rex.execution.sandbox import SandboxMode
@@ -27,6 +28,10 @@ class PreparedExperiment:
     workspace: GitWorkspace
     commit_sha: str
     log_artifact_ids: tuple[str, ...]
+
+
+class PatchRepairsExhausted(RuntimeError):
+    """All bounded semantic patch repairs were rejected by git apply."""
 
 
 class PatchTransactionCoordinator:
@@ -57,6 +62,7 @@ class PatchTransactionCoordinator:
         sandbox_mode: SandboxMode | str = SandboxMode.FIXTURE,
         trusted_output_root: str | Path | None = None,
         checkpoint: Callable[[str, str], None] | None = None,
+        max_patch_repairs: int = 0,
     ):
         self.repository = repository
         self.proposal_service = proposal_service
@@ -72,6 +78,9 @@ class PatchTransactionCoordinator:
             None if trusted_output_root is None else Path(trusted_output_root).resolve()
         )
         self.checkpoint = checkpoint
+        if not 0 <= max_patch_repairs <= 2:
+            raise ValueError("patch repair limit must be between zero and two")
+        self.max_patch_repairs = max_patch_repairs
         if self.sandbox_mode == SandboxMode.PRODUCTION and self.trusted_output_root is None:
             raise ValueError("production patch gates require a trusted output root")
 
@@ -127,21 +136,14 @@ class PatchTransactionCoordinator:
                         "proposal": proposal.model_dump(mode="json"),
                         **coding_context,
                     }
-                    patch_decision, generated = self._durable_patch(
-                        proposal, patch_context, artifact_dir
-                    )
-                    if generated:
-                        self._checkpoint("patch_decision", proposal.experiment_id)
-                    self._record_llm_decision(
+                    patch_decision, patch, paths = self._apply_patch_attempts(
                         run_id=run_id,
-                        experiment_id=proposal.experiment_id,
-                        role="patch",
+                        parent_commit=parent_commit,
+                        workspace=workspace,
+                        proposal=proposal,
                         context=patch_context,
-                        decision=patch_decision,
                         artifact_dir=artifact_dir,
                     )
-                    patch = PatchResponse.model_validate(patch_decision.parsed).patch
-                    paths = self._apply_or_verify_patch(workspace, patch, proposal)
                     audit_changed_files(workspace.root, paths)
                     if coding_context.get("fixture_only"):
                         audit_fixture_bias_only(self.project_root, workspace.root, paths)
@@ -227,6 +229,155 @@ class PatchTransactionCoordinator:
                     {"reason": f"{type(error).__name__}: {str(error)[-1000:]}"},
                 )
             raise
+
+    def _apply_patch_attempts(
+        self,
+        *,
+        run_id: str,
+        parent_commit: str,
+        workspace: GitWorkspace,
+        proposal: ExperimentProposal,
+        context: dict[str, Any],
+        artifact_dir: Path,
+    ) -> tuple[AgentDecision, str, tuple[str, ...]]:
+        previous_rejection: dict[str, Any] | None = None
+        attempts = self.max_patch_repairs + 1
+        for attempt in range(1, attempts + 1):
+            role = self._patch_attempt_role(attempt)
+            rejection_path = artifact_dir / f"{role}-rejection.json"
+            repair = None
+            attempt_context = dict(context)
+            if attempt > 1:
+                if previous_rejection is None:
+                    raise RuntimeError("patch repair lacks durable rejection evidence")
+                self._require_pristine_parent(workspace, parent_commit)
+                attempt_context["patch_repair"] = {
+                    "attempt": attempt,
+                    "repair_number": attempt - 1,
+                    "applicability_error": previous_rejection["error"],
+                    "rejected_patch": previous_rejection["patch"],
+                    "instruction": (
+                        "Use allowed_file_snapshots as the authoritative byte-exact base; "
+                        "produce a different diff with correct hunk context and counts."
+                    ),
+                }
+                prior_ref = artifact_ref(
+                    artifact_dir / f"{self._patch_attempt_role(attempt - 1)}-rejection.json",
+                    "patch_rejection",
+                )
+                repair = self._patch_repair_reservation(
+                    proposal.experiment_id,
+                    attempt - 1,
+                    prior_ref.artifact_id,
+                )
+            patch_decision, generated = self._durable_patch(
+                proposal, attempt_context, artifact_dir, role=role
+            )
+            if generated:
+                self._checkpoint(f"{role}_decision", proposal.experiment_id)
+            self._record_llm_decision(
+                run_id=run_id,
+                experiment_id=proposal.experiment_id,
+                role=role,
+                context=attempt_context,
+                decision=patch_decision,
+                artifact_dir=artifact_dir,
+            )
+            patch = PatchResponse.model_validate(patch_decision.parsed).patch
+            response_ref = artifact_ref(artifact_dir / f"{role}-response.json", "llm_response")
+            if rejection_path.is_file():
+                previous_rejection = json.loads(rejection_path.read_text(encoding="utf-8"))
+                if repair is not None and not repair["completed"]:
+                    rejection_ref = artifact_ref(rejection_path, "patch_rejection")
+                    self.repository.register_artifact(
+                        rejection_ref, experiment_id=proposal.experiment_id
+                    )
+                    self.repository.complete_experiment_repair(
+                        str(repair["repair_id"]),
+                        evidence_artifact_ids=[response_ref.artifact_id, rejection_ref.artifact_id],
+                    )
+                continue
+            try:
+                paths = self._apply_or_verify_patch(workspace, patch, proposal)
+            except PatchApplicationRejected as error:
+                self._require_pristine_parent(workspace, parent_commit)
+                previous_rejection = {
+                    "schema_version": "1.0",
+                    "attempt": attempt,
+                    "repair_number": max(0, attempt - 1),
+                    "error_type": type(error).__name__,
+                    "error": str(error)[-2000:],
+                    "patch_sha256": hashlib.sha256(patch.encode("utf-8")).hexdigest(),
+                    "patch": patch[-40_000:],
+                    "head": parent_commit,
+                    "worktree_clean": True,
+                }
+                atomic_write_json(rejection_path, previous_rejection)
+                rejection_ref = artifact_ref(rejection_path, "patch_rejection")
+                self.repository.register_artifact(
+                    rejection_ref, experiment_id=proposal.experiment_id
+                )
+                if repair is not None and not repair["completed"]:
+                    self.repository.complete_experiment_repair(
+                        str(repair["repair_id"]),
+                        evidence_artifact_ids=[response_ref.artifact_id, rejection_ref.artifact_id],
+                    )
+                self._checkpoint(f"{role}_rejected", proposal.experiment_id)
+                if attempt == attempts:
+                    raise PatchRepairsExhausted(
+                        f"patch remained inapplicable after {attempts} attempts: {error}"
+                    ) from error
+                continue
+            if repair is not None and not repair["completed"]:
+                self.repository.complete_experiment_repair(
+                    str(repair["repair_id"]),
+                    evidence_artifact_ids=[response_ref.artifact_id],
+                )
+            return patch_decision, patch, paths
+        raise PatchRepairsExhausted("patch repair loop ended without an applicable diff")
+
+    def _patch_attempt_role(self, attempt: int) -> str:
+        if self.max_patch_repairs == 0:
+            return "patch"
+        return f"patch-attempt-{attempt}"
+
+    def _patch_repair_reservation(
+        self,
+        experiment_id: str,
+        repair_number: int,
+        rejection_artifact_id: str,
+    ) -> dict[str, Any]:
+        with self.repository.database.connect() as connection:
+            row = connection.execute(
+                "SELECT repair_id,repair_number,completed_at FROM experiment_repairs "
+                "WHERE experiment_id=? AND repair_number=?",
+                (experiment_id, repair_number),
+            ).fetchone()
+        if row is not None:
+            return {
+                "repair_id": str(row["repair_id"]),
+                "repair_number": int(row["repair_number"]),
+                "completed": row["completed_at"] is not None,
+            }
+        reserved = self.repository.reserve_experiment_repair(
+            experiment_id=experiment_id,
+            phase="preparation",
+            failure_status=AttemptStatus.CONTRACT,
+            plan={
+                "action": "request_constrained_patch",
+                "reason": "generated diff did not apply to the declared parent",
+                "rejection_artifact_id": rejection_artifact_id,
+            },
+            maximum=self.max_patch_repairs,
+        )
+        return {**reserved, "completed": False}
+
+    def _require_pristine_parent(self, workspace: GitWorkspace, parent_commit: str) -> None:
+        status = self._git(workspace.root, "status", "--porcelain", "--untracked-files=normal")
+        if status:
+            raise RuntimeError("rejected patch changed the isolated worktree")
+        if self._git(workspace.root, "rev-parse", "HEAD") != parent_commit:
+            raise RuntimeError("patch repair worktree drifted from its declared parent")
 
     def _apply_or_verify_patch(
         self,
@@ -327,11 +478,13 @@ class PatchTransactionCoordinator:
         proposal: ExperimentProposal,
         context: dict[str, Any],
         artifact_dir: Path,
+        *,
+        role: str = "patch",
     ) -> tuple[AgentDecision, bool]:
-        if (artifact_dir / "patch-response.json").is_file():
-            return self._load_llm_decision("patch", artifact_dir), False
+        if (artifact_dir / f"{role}-response.json").is_file():
+            return self._load_llm_decision(role, artifact_dir), False
         decision = self.coding_service.create_patch(proposal, context)
-        self._persist_llm_decision_files("patch", context, decision, artifact_dir)
+        self._persist_llm_decision_files(role, context, decision, artifact_dir)
         return decision, True
 
     @staticmethod

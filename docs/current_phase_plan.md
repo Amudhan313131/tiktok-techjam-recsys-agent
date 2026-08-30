@@ -285,14 +285,17 @@ It then:
    target;
 6. runs the LightGBM, sandbox, and explicitly selected live-provider doctors;
 7. starts one production run with a durable external deadline;
-8. waits for a worker lease owned by that coordinator, records the exact
+8. preserves and retries an inapplicable agent diff at most twice, and permits
+   at most two same-run coordinator relaunches before training only when the
+   durable preparation progress token changes;
+9. waits for a worker lease owned by that coordinator, records the exact
    attempt/checkpoint, and injects one `SIGKILL`;
-9. resumes the same run ID and external deadline;
-10. proves the attempt exists exactly once, counters did not regress or
+10. resumes the same run ID and external deadline;
+11. proves the attempt exists exactly once, counters did not regress or
     duplicate, and the pre-fault champion remains in durable evidence;
-11. audits the database, artifacts, requests, and command transcripts for any
+12. audits the database, artifacts, requests, and command transcripts for any
     test prediction or scoring work;
-12. recursively revalidates every winning checkpoint member, report artifact,
+13. recursively revalidates every winning checkpoint member, report artifact,
     log, recovery file, and status snapshot before sealing the R3 manifest.
 
 The envelope stops through convergence, the 50-hypothesis/evaluation caps, or

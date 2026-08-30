@@ -10,6 +10,10 @@ from pathlib import Path
 from rex.agents.patch_guard import PatchPolicy, validate_patch
 
 
+class PatchApplicationRejected(RuntimeError):
+    """A policy-valid diff could not be applied to its declared parent tree."""
+
+
 def _safe_name(value: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "-", value).strip("-.")
     if not cleaned:
@@ -50,12 +54,14 @@ class GitWorkspace:
             capture_output=True,
         )
         if check.returncode:
-            raise RuntimeError(f"git apply --check failed: {check.stderr[-2000:]}")
+            raise PatchApplicationRejected(
+                f"git apply --check failed: {check.stderr[-2000:]}"
+            )
         applied = subprocess.run(
             ["git", "apply", "-"], cwd=self.root, input=patch, text=True, capture_output=True
         )
         if applied.returncode:
-            raise RuntimeError(f"git apply failed: {applied.stderr[-2000:]}")
+            raise PatchApplicationRejected(f"git apply failed: {applied.stderr[-2000:]}")
         return paths
 
     def commit(self, message: str) -> str:

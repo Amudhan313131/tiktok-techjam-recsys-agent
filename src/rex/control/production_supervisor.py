@@ -219,6 +219,10 @@ class ProductionRungFailure(RuntimeError):
         self.status = status
 
 
+class ProductionPreparationRejected(RuntimeError):
+    """A bounded candidate preparation failed safely and the search may continue."""
+
+
 class ProductionHooks(Protocol):
     """Model/data adapter boundary; implementations must be idempotent by request identity."""
 
@@ -497,7 +501,10 @@ class ProductionAutopilot:
                         "eligible_method_queue_exhausted",
                     )
                     break
-                prepared = self._prepare_candidate(repository, context, card)
+                try:
+                    prepared = self._prepare_candidate(repository, context, card)
+                except ProductionPreparationRejected:
+                    continue
                 self._run_candidate(repository, context, prepared.proposal.experiment_id)
             return self._finalize(repository, context)
         except BaseException:
@@ -1249,7 +1256,10 @@ class ProductionAutopilot:
                 ExperimentState.PATCHED,
                 ExperimentState.STATIC_VALID,
             }:
-                self._resume_preparation(repository, context, str(row["experiment_id"]))
+                try:
+                    self._resume_preparation(repository, context, str(row["experiment_id"]))
+                except ProductionPreparationRejected:
+                    continue
             self._run_candidate(repository, context, str(row["experiment_id"]))
 
     def _resume_preparation(

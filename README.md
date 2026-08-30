@@ -247,6 +247,12 @@ durable worker lease exists. It then resumes the same run and proves the attempt
 was recorded once, the prior champion survived, and no test prediction or test
 metric was created.
 
+Agent-authored diffs are checked against byte-exact allowlisted snapshots. An
+inapplicable diff is preserved as evidence and may receive at most two new,
+attempt-scoped coding repairs; protected-path failures are never retried. If the
+coordinator itself exits before training, the envelope may relaunch the same run
+at most twice, only when the database proves preparation made durable progress.
+
 The output directory must be outside the repository and must not already
 contain another run:
 

@@ -46,6 +46,7 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("--finalization-reserve-seconds", type=int, default=1200)
     start.add_argument("--snapshot-interval-seconds", type=int, default=3600)
     start.add_argument("--lease-wait-seconds", type=int, default=10800)
+    start.add_argument("--pre-injection-restart-limit", type=int, default=2)
     status = commands.add_parser("status", help="write and print one read-only compact snapshot")
     status.add_argument("--output-dir", type=Path, required=True)
     return parser
@@ -69,6 +70,7 @@ def main(argv: list[str] | None = None) -> int:
                     finalization_reserve_seconds=args.finalization_reserve_seconds,
                     snapshot_interval_seconds=args.snapshot_interval_seconds,
                     lease_wait_seconds=args.lease_wait_seconds,
+                    pre_injection_restart_limit=args.pre_injection_restart_limit,
                     authorize_paid_api=args.authorize_paid_api,
                 )
             ).run()
@@ -81,4 +83,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

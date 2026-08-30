@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from rex.agents.coordinator import PatchTransactionCoordinator
+from rex.agents.coordinator import PatchRepairsExhausted, PatchTransactionCoordinator
 from rex.agents.patch_guard import PatchPolicy
 from rex.agents.provider import FakeProvider
 from rex.agents.services import CodingService, ProposalService
@@ -216,3 +216,159 @@ def test_patch_transaction_resumes_without_duplicate_provider_calls_or_iteration
     assert git(prepared.workspace.root, "rev-parse", "HEAD") == prepared.commit_sha
     assert git(prepared.workspace.root, "status", "--porcelain") == ""
     assert git(prepared.workspace.root, "show", "HEAD:src/rex/models/experimental/model.py") == "VALUE = 2"
+
+
+@pytest.mark.parametrize("repair_succeeds", [True, False])
+def test_unapplicable_live_patch_repairs_are_durable_and_bounded(
+    tmp_path: Path, repair_succeeds: bool
+) -> None:
+    project = tmp_path / "project"
+    model = project / "src/rex/models/experimental/model.py"
+    fixture = project / "tests/fixture/test_smoke.py"
+    model.parent.mkdir(parents=True)
+    fixture.parent.mkdir(parents=True)
+    model.write_text("VALUE = 1\n", encoding="utf-8")
+    fixture.write_text("def test_smoke():\n    assert True\n", encoding="utf-8")
+    git(project, "init")
+    git(project, "config", "user.email", "rex@example.invalid")
+    git(project, "config", "user.name", "REX Repair")
+    git(project, "add", "--all")
+    git(project, "commit", "-m", "repair root")
+    parent = git(project, "rev-parse", "HEAD")
+
+    database = Database(tmp_path / "transaction.sqlite3")
+    database.initialize()
+    repository = ExperimentRepository(database)
+    repository.create_run(
+        run_id="run",
+        deadline_epoch_ms=deadline_epoch_ms(60),
+        root_commit=parent,
+        environment_sha256=HASH,
+        data_manifest_sha256=HASH,
+        evaluator_sha256=HASH,
+    )
+    proposal = {
+        "experiment_id": "repaired-patch",
+        "parent_id": None,
+        "operator": "HYPERPARAMETER",
+        "hypothesis": "A corrected diff proves bounded coding repair.",
+        "mechanism": "The second patch uses the authoritative source snapshot.",
+        "primary_change": "fixture value",
+        "files_to_change": ["src/rex/models/experimental/model.py"],
+        "expected_metric_effects": {"fixture": "pass"},
+        "falsifier": "The corrected patch remains inapplicable.",
+        "leakage_analysis": "No data or target capability is involved.",
+        "estimated_seconds": 5,
+        "cheap_rung": {"fixture": True},
+        "full_rung": {"fixture": True},
+    }
+    bad_patch = {
+        "patch": (
+            "--- a/src/rex/models/experimental/model.py\n"
+            "+++ b/src/rex/models/experimental/model.py\n"
+            "@@ -1 +1 @@\n"
+            "-VALUE = 9\n"
+            "+VALUE = 2\n"
+        ),
+        "rationale": "This intentionally mismatches the parent source.",
+        "tests": ["fixture value equals two"],
+    }
+    good_patch = {
+        "patch": (
+            "--- a/src/rex/models/experimental/model.py\n"
+            "+++ b/src/rex/models/experimental/model.py\n"
+            "@@ -1 +1 @@\n"
+            "-VALUE = 1\n"
+            "+VALUE = 2\n"
+        ),
+        "rationale": "Uses the exact authoritative parent line.",
+        "tests": ["fixture value equals two"],
+    }
+    provider = FakeProvider(
+        [proposal, bad_patch, good_patch]
+        if repair_succeeds
+        else [proposal, bad_patch, bad_patch, bad_patch]
+    )
+    coordinator = PatchTransactionCoordinator(
+        repository=repository,
+        proposal_service=ProposalService(provider),
+        coding_service=CodingService(provider),
+        project_root=project,
+        worktree_root=tmp_path / "worktrees",
+        patch_policy=PatchPolicy(allowed=("src/rex/models/experimental/**",), denied=()),
+        fixture_command=(
+            "python3",
+            "-c",
+            "from pathlib import Path; assert 'VALUE = 2' in "
+            "Path('src/rex/models/experimental/model.py').read_text()",
+        ),
+        max_patch_repairs=2,
+    )
+
+    def prepare():
+        return coordinator.prepare(
+            run_id="run",
+            parent_commit=parent,
+            proposal_context={"experiment_id": "repaired-patch", "artifact_ids": []},
+            coding_context={
+                "artifact_ids": [],
+                "allowed_file_snapshots": {
+                    "src/rex/models/experimental/model.py": "VALUE = 1\n"
+                },
+            },
+        )
+
+    if repair_succeeds:
+        prepared = prepare()
+    else:
+        with pytest.raises(PatchRepairsExhausted):
+            prepare()
+
+    with database.connect() as connection:
+        roles = [
+            row[0]
+            for row in connection.execute("SELECT role FROM llm_calls ORDER BY rowid")
+        ]
+        repair = connection.execute(
+            "SELECT repair_number,phase,completed_at FROM experiment_repairs"
+        ).fetchone()
+    if repair_succeeds:
+        assert [item["role"] for item in provider.calls] == ["proposal", "patch", "patch"]
+        assert roles == ["proposal", "patch-attempt-1", "patch-attempt-2"]
+        assert tuple(repair[:2]) == (1, "preparation")
+        assert repair[2] is not None
+        assert (
+            repository.get_experiment("repaired-patch")["state"]
+            == ExperimentState.FIXTURE_VALID
+        )
+        assert git(prepared.workspace.root, "status", "--porcelain") == ""
+        assert (
+            git(prepared.workspace.root, "show", "HEAD:src/rex/models/experimental/model.py")
+            == "VALUE = 2"
+        )
+    else:
+        assert [item["role"] for item in provider.calls] == [
+            "proposal",
+            "patch",
+            "patch",
+            "patch",
+        ]
+        assert roles == [
+            "proposal",
+            "patch-attempt-1",
+            "patch-attempt-2",
+            "patch-attempt-3",
+        ]
+        with database.connect() as connection:
+            repairs = connection.execute(
+                "SELECT repair_number,completed_at FROM experiment_repairs ORDER BY repair_number"
+            ).fetchall()
+        assert [row[0] for row in repairs] == [1, 2]
+        assert all(row[1] is not None for row in repairs)
+        assert (
+            repository.get_experiment("repaired-patch")["state"]
+            == ExperimentState.FAILED_REPAIRABLE
+        )
+        worktree = tmp_path / "worktrees" / "repaired-patch"
+        assert git(worktree, "status", "--porcelain") == ""
+        assert git(worktree, "rev-parse", "HEAD") == parent
