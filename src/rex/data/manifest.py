@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import csv
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,9 @@ class ManifestError(RuntimeError):
 
 
 def repo_root() -> Path:
+    configured = os.environ.get("REX_SOURCE_ROOT")
+    if configured:
+        return Path(configured).resolve()
     return Path(__file__).resolve().parents[3]
 
 

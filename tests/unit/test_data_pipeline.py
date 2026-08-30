@@ -14,7 +14,7 @@ from rex.data.firewall import (
     assert_no_test_target_artifact,
     validate_worker_request,
 )
-from rex.data.manifest import ManifestError, sha256_file, verify_raw_dataset
+from rex.data.manifest import ManifestError, repo_root, sha256_file, verify_raw_dataset
 from rex.data.shadow_views import materialize_cheap_view, materialize_shadow_folds
 from rex.data.views import load_feature_view
 from rex.evaluation.diagnostics import standard_segments
@@ -39,6 +39,16 @@ LOG_HEADER = [
     "duration_ms",
     "tab",
 ]
+
+
+def test_repo_root_honors_the_verified_controller_clone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_clone = tmp_path / "controller-clone"
+    source_clone.mkdir()
+    monkeypatch.setenv("REX_SOURCE_ROOT", str(source_clone))
+
+    assert repo_root() == source_clone.resolve()
 
 
 def _write_csv(path: Path, header: list[str], rows: list[list[object]]) -> None:
@@ -160,8 +170,22 @@ def test_firewall_rejects_test_fit_request(feature_target_paths, tmp_path: Path)
 
 def _temporal_source(tmp_path: Path) -> tuple[Path, Path]:
     dates = np.asarray(
-        [20220408, 20220409, 20220410, 20220411, 20220412, 20220413, 20220414,
-         20220415, 20220416, 20220417, 20220418, 20220419, 20220420, 20220421]
+        [
+            20220408,
+            20220409,
+            20220410,
+            20220411,
+            20220412,
+            20220413,
+            20220414,
+            20220415,
+            20220416,
+            20220417,
+            20220418,
+            20220419,
+            20220420,
+            20220421,
+        ]
     )
     users = np.asarray(["u1", "u2"] * 7)
     feature = tmp_path / "train.npz"
@@ -209,7 +233,9 @@ def test_shadow_and_cheap_views_are_cached_and_keep_complete_users(tmp_path: Pat
         RECENCY_HISTORY,
     ],
 )
-def test_feature_recipe_cache_is_deterministic(recipe, feature_target_paths, tmp_path: Path) -> None:
+def test_feature_recipe_cache_is_deterministic(
+    recipe, feature_target_paths, tmp_path: Path
+) -> None:
     features, targets = feature_target_paths
     first = materialize_feature_recipe(recipe, features, targets, features, tmp_path / "cache")
     second = materialize_feature_recipe(recipe, features, targets, features, tmp_path / "cache")
