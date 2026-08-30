@@ -254,7 +254,8 @@ class CodexCLIProvider:
             schema_path = temp / "schema.json"
             response_path = temp / "response.json"
             working_directory = self.working_directory or temp
-            schema_path.write_text(_canonical_json(schema), encoding="utf-8")
+            cli_schema, uses_json_envelope = _codex_cli_schema(schema)
+            schema_path.write_text(_canonical_json(cli_schema), encoding="utf-8")
             args = [
                 self.executable,
                 "--ask-for-approval",
@@ -276,10 +277,21 @@ class CodexCLIProvider:
             if self.model:
                 args.extend(["--model", self.model])
             args.append("-")
-            input_text = (
-                f"{system.strip()}\n\n"
-                f"Return only the required structured {role} object.\n\n{prompt}"
-            )
+            if uses_json_envelope:
+                input_text = (
+                    f"{system.strip()}\n\n"
+                    "The CLI response envelope has one field named payload_json. "
+                    f"Set payload_json to a compact serialized JSON object for the {role} "
+                    "decision. The decoded object must satisfy this original JSON Schema:\n"
+                    f"{_canonical_json(schema)}\n\n"
+                    "Do not use Markdown fences or explanatory text inside payload_json.\n\n"
+                    f"{prompt}"
+                )
+            else:
+                input_text = (
+                    f"{system.strip()}\n\n"
+                    f"Return only the required structured {role} object.\n\n{prompt}"
+                )
             try:
                 result = self._command_runner(args, input_text, self.timeout_seconds)
             except (subprocess.TimeoutExpired, TimeoutError) as error:
@@ -293,11 +305,12 @@ class CodexCLIProvider:
 
             safe_stderr = redact_secrets(result.stderr)
             if result.returncode != 0:
-                message = _bounded_error(safe_stderr or "Codex CLI exited unsuccessfully")
+                failure = _codex_failure_message(result.stdout, result.stderr)
+                message = _bounded_error(redact_secrets(failure))
                 raise ProviderExecutionError(
                     message,
                     code="cli_exit",
-                    retryable=_codex_failure_is_retryable(result.stderr),
+                    retryable=_codex_failure_is_retryable(failure),
                 )
             if not response_path.is_file():
                 raise ProviderExecutionError(
@@ -305,7 +318,12 @@ class CodexCLIProvider:
                     code="incomplete_response",
                     retryable=True,
                 )
-            raw = response_path.read_text(encoding="utf-8")
+            cli_raw = response_path.read_text(encoding="utf-8")
+            if uses_json_envelope:
+                envelope = _parse_and_validate(cli_raw, cli_schema)
+                raw = str(envelope["payload_json"])
+            else:
+                raw = cli_raw
             value = _parse_and_validate(raw, schema)
             input_tokens, output_tokens, request_id = _codex_metadata(result.stdout)
             return ProviderResponse(
@@ -812,6 +830,50 @@ def _canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"))
 
 
+_CODEX_JSON_ENVELOPE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"payload_json": {"type": "string"}},
+    "required": ["payload_json"],
+    "additionalProperties": False,
+}
+
+
+def _codex_cli_schema(schema: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Use native strict output when possible, otherwise carry validated JSON in a string.
+
+    Codex strict output schemas require every object property to be required and
+    `additionalProperties` to be false. Pydantic contracts intentionally use
+    defaults and typed dictionaries, which cannot be represented by that strict
+    subset without changing their meaning. The envelope remains structured at
+    the CLI boundary; its decoded JSON is then validated against the unchanged
+    application schema before it can reach the coordinator.
+    """
+
+    if _codex_schema_is_native_strict(schema):
+        return schema, False
+    return _CODEX_JSON_ENVELOPE_SCHEMA, True
+
+
+def _codex_schema_is_native_strict(value: Any) -> bool:
+    if isinstance(value, list):
+        return all(_codex_schema_is_native_strict(item) for item in value)
+    if not isinstance(value, dict):
+        return True
+    if "default" in value:
+        return False
+    is_object = value.get("type") == "object" or "properties" in value
+    if is_object:
+        properties = value.get("properties")
+        if not isinstance(properties, dict):
+            return False
+        if value.get("additionalProperties") is not False:
+            return False
+        required = value.get("required")
+        if not isinstance(required, list) or set(required) != set(properties):
+            return False
+    return all(_codex_schema_is_native_strict(item) for item in value.values())
+
+
 def _schema_name(role: str) -> str:
     normalized = re.sub(r"[^A-Za-z0-9_-]", "_", role).strip("_") or "decision"
     return f"rex_{normalized}"[:64]
@@ -842,6 +904,28 @@ def _codex_metadata(stdout: str) -> tuple[int, int, str | None]:
             input_tokens = max(input_tokens, int(usage.get("input_tokens", 0) or 0))
             output_tokens = max(output_tokens, int(usage.get("output_tokens", 0) or 0))
     return input_tokens, output_tokens, request_id
+
+
+def _codex_failure_message(stdout: str, stderr: str) -> str:
+    """Prefer the structured terminal Codex error over unrelated MCP warnings."""
+
+    messages: list[str] = []
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        direct = event.get("message")
+        if event.get("type") == "error" and isinstance(direct, str):
+            messages.append(direct)
+        error = event.get("error")
+        if isinstance(error, dict) and isinstance(error.get("message"), str):
+            messages.append(str(error["message"]))
+    if messages:
+        return messages[-1]
+    return stderr or "Codex CLI exited unsuccessfully"
 
 
 def _claude_envelope(stdout: str) -> dict[str, Any]:

@@ -213,6 +213,65 @@ def test_codex_cli_rejects_invalid_json_and_schema(tmp_path: Path) -> None:
         )
 
 
+def test_codex_cli_envelopes_non_strict_pydantic_schema(tmp_path: Path) -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "decision": {"type": "string"},
+            "notes": {"type": "array", "items": {"type": "string"}, "default": []},
+            "effects": {"type": "object", "additionalProperties": {"type": "string"}},
+        },
+        "required": ["decision", "effects"],
+        "additionalProperties": False,
+    }
+    observed: dict[str, Any] = {}
+
+    def runner(args: list[str], input_text: str, _: float) -> CommandResult:
+        cli_schema = json.loads(
+            Path(args[args.index("--output-schema") + 1]).read_text(encoding="utf-8")
+        )
+        observed.update(schema=cli_schema, input_text=input_text)
+        payload = {"decision": "ship", "effects": {"primary": "increase"}}
+        Path(args[args.index("--output-last-message") + 1]).write_text(
+            json.dumps({"payload_json": json.dumps(payload)}), encoding="utf-8"
+        )
+        return CommandResult(0, "", "", 0.01)
+
+    response = CodexCLIProvider(
+        working_directory=tmp_path,
+        command_runner=runner,
+    ).generate(role="proposal", system="system", prompt="prompt", schema=schema)
+
+    assert observed["schema"] == {
+        "type": "object",
+        "properties": {"payload_json": {"type": "string"}},
+        "required": ["payload_json"],
+        "additionalProperties": False,
+    }
+    assert "original JSON Schema" in observed["input_text"]
+    assert response.value == {"decision": "ship", "effects": {"primary": "increase"}}
+
+
+def test_codex_cli_envelope_rejects_invalid_inner_payload(tmp_path: Path) -> None:
+    schema = {
+        "type": "object",
+        "properties": {"decision": {"type": "string", "default": "hold"}},
+        "additionalProperties": False,
+    }
+
+    def runner(args: list[str], _: str, __: float) -> CommandResult:
+        Path(args[args.index("--output-last-message") + 1]).write_text(
+            '{"payload_json":"not-json"}', encoding="utf-8"
+        )
+        return CommandResult(0, "", "", 0.01)
+
+    with pytest.raises(ProviderSchemaError, match="invalid JSON"):
+        CodexCLIProvider(
+            working_directory=tmp_path,
+            command_runner=runner,
+        ).generate(role="proposal", system="system", prompt="prompt", schema=schema)
+
+
 def test_codex_cli_defaults_to_an_empty_ephemeral_context() -> None:
     observed_directory: Path | None = None
 
@@ -241,6 +300,36 @@ def test_codex_cli_normalizes_timeout() -> None:
     with pytest.raises(ProviderTimeoutError) as raised:
         generate(CodexCLIProvider(command_runner=runner))
     assert raised.value.retryable
+
+
+def test_codex_cli_surfaces_structured_error_instead_of_mcp_warnings() -> None:
+    def runner(_: list[str], __: str, ___: float) -> CommandResult:
+        stdout = "\n".join(
+            [
+                json.dumps({"type": "thread.started", "thread_id": "thread-error"}),
+                json.dumps(
+                    {
+                        "type": "turn.failed",
+                        "error": {
+                            "message": "invalid_json_schema: every property must be required"
+                        },
+                    }
+                ),
+            ]
+        )
+        return CommandResult(
+            1,
+            stdout,
+            "connection refused while starting an unrelated MCP server",
+            0.01,
+        )
+
+    with pytest.raises(ProviderExecutionError) as raised:
+        generate(CodexCLIProvider(command_runner=runner))
+
+    assert "invalid_json_schema" in str(raised.value)
+    assert "connection refused" not in str(raised.value)
+    assert raised.value.retryable is False
 
 
 def test_claude_cli_uses_tool_free_ephemeral_structured_mode(tmp_path: Path) -> None:
