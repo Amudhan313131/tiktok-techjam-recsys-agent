@@ -28,7 +28,7 @@ def test_hash_lock_requires_exact_pins_and_sha256(tmp_path: Path) -> None:
         validate_hash_lock(lock)
 
     lock.write_text(
-        "numpy==2.3.5 \\\n" "    --hash=sha256:" + "a" * 64 + "\n",
+        "numpy==2.3.5 \\\n    --hash=sha256:" + "a" * 64 + "\n",
         encoding="utf-8",
     )
     evidence = validate_hash_lock(lock)
@@ -41,16 +41,14 @@ def test_install_requires_binary_wheels_and_records_installer_provenance(tmp_pat
     data = tmp_path / "data"
     source.mkdir()
     data.mkdir()
-    envelope = R3Envelope(
-        R3Options(source, "HEAD", data, tmp_path / "output", "codex_cli")
-    )
+    envelope = R3Envelope(R3Options(source, "HEAD", data, tmp_path / "output", "codex_cli"))
     envelope.clone = source
     envelope.logs.mkdir(parents=True)
     envelope.venv.joinpath("bin").mkdir(parents=True)
     python = envelope.venv / "bin/python"
     python.write_bytes(b"python")
     (source / "requirements-lock.txt").write_text(
-        "numpy==2.3.5 \\\n" "    --hash=sha256:" + "a" * 64 + "\n",
+        "numpy==2.3.5 \\\n    --hash=sha256:" + "a" * 64 + "\n",
         encoding="utf-8",
     )
     commands: dict[str, list[str]] = {}
@@ -59,9 +57,7 @@ def test_install_requires_binary_wheels_and_records_installer_provenance(tmp_pat
         del kwargs
         commands[name] = list(command)
         if name == "installer-provenance":
-            (envelope.logs / "installer-provenance.stdout.log").write_text(
-                "{}\n", encoding="utf-8"
-            )
+            (envelope.logs / "installer-provenance.stdout.log").write_text("{}\n", encoding="utf-8")
         if name == "installed-inventory":
             (envelope.logs / "installed-inventory.stdout.log").write_text(
                 "numpy==2.3.5\n", encoding="utf-8"
@@ -89,6 +85,24 @@ def test_r3_options_reject_fixed_paid_without_authorization_and_nested_output(
         R3Options(source, "HEAD", data, tmp_path / "out", "openai_api").normalized()
     with pytest.raises(R3EnvelopeError, match="outside the source"):
         R3Options(source, "HEAD", data, source / "runs/r3", "codex_cli").normalized()
+    with pytest.raises(R3EnvelopeError, match="baseline cache"):
+        R3Options(
+            source,
+            "HEAD",
+            data,
+            tmp_path / "out",
+            "codex_cli",
+            baseline_cache_dir=source / "cache",
+        ).normalized()
+    with pytest.raises(R3EnvelopeError, match="control cache"):
+        R3Options(
+            source,
+            "HEAD",
+            data,
+            tmp_path / "out",
+            "codex_cli",
+            control_cache_dir=tmp_path / "out/cache",
+        ).normalized()
     for unsafe in ("../escape", "nested/run", "/tmp/escape", "", "space id"):
         with pytest.raises(R3EnvelopeError, match="safe path component"):
             R3Options(
@@ -266,6 +280,12 @@ def test_runtime_configuration_binds_external_raw_data_directory(tmp_path: Path)
     config = json.loads(config_path.read_text(encoding="utf-8"))
 
     assert config["raw_data_dir"] == str(data.resolve())
+    assert config["baseline_cache_dir"] == str(
+        (root.parent / ".rex-shared-cache/baseline").resolve()
+    )
+    assert config["control_cache_dir"] == str(
+        (root.parent / ".rex-shared-cache/controls").resolve()
+    )
 
 
 def test_controlled_failure_kills_only_verified_lease_owner_once(tmp_path: Path) -> None:
@@ -459,7 +479,9 @@ def test_pre_injection_recovery_accepts_fixture_valid_progress_and_rejects_loops
         returncode = 1
 
     first = envelope._pre_injection_recovery(
-        ExitedProcess(), restart_number=1, previous_progress_token=None  # type: ignore[arg-type]
+        ExitedProcess(),
+        restart_number=1,
+        previous_progress_token=None,  # type: ignore[arg-type]
     )
     with pytest.raises(R3EnvelopeError, match="no durable progress"):
         envelope._pre_injection_recovery(

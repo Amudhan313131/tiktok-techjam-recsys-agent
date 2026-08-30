@@ -31,6 +31,16 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("--source-ref", default="HEAD")
     start.add_argument("--data-dir", type=Path, required=True)
     start.add_argument("--output-dir", type=Path, required=True)
+    start.add_argument(
+        "--baseline-cache-dir",
+        type=Path,
+        help="shared verified baseline cache outside the source and run output",
+    )
+    start.add_argument(
+        "--control-cache-dir",
+        type=Path,
+        help="shared immutable control cache outside the source and run output",
+    )
     start.add_argument("--run-id")
     start.add_argument(
         "--llm",
@@ -72,6 +82,8 @@ def main(argv: list[str] | None = None) -> int:
                     lease_wait_seconds=args.lease_wait_seconds,
                     pre_injection_restart_limit=args.pre_injection_restart_limit,
                     authorize_paid_api=args.authorize_paid_api,
+                    baseline_cache_dir=args.baseline_cache_dir,
+                    control_cache_dir=args.control_cache_dir,
                 )
             ).run()
         print(json.dumps(result, indent=2, sort_keys=True))

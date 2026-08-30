@@ -57,11 +57,16 @@ class R3Options:
     pre_injection_restart_limit: int = 2
     authorize_paid_api: bool = False
     skip_dependency_install: bool = False
+    baseline_cache_dir: Path | None = None
+    control_cache_dir: Path | None = None
 
     def normalized(self) -> "R3Options":
         source = self.source_root.resolve()
         data = self.data_dir.resolve()
         output = self.output_dir.resolve()
+        shared_cache = source.parent / ".rex-shared-cache"
+        baseline_cache = (self.baseline_cache_dir or shared_cache / "baseline").resolve()
+        control_cache = (self.control_cache_dir or shared_cache / "controls").resolve()
         if self.llm not in {"codex_cli", "claude_cli", "openai_api", "auto"}:
             raise R3EnvelopeError(
                 "R3 requires codex_cli, claude_cli, openai_api, or auto; fixed is not live research"
@@ -88,6 +93,19 @@ class R3Options:
             raise R3EnvelopeError(f"KuaiRand-Pure data directory is missing: {data}")
         if _is_relative_to(output, source) or _is_relative_to(source, output):
             raise R3EnvelopeError("R3 output must be outside the source repository")
+        for label, cache in (
+            ("baseline", baseline_cache),
+            ("control", control_cache),
+        ):
+            if (
+                _is_relative_to(cache, source)
+                or _is_relative_to(source, cache)
+                or _is_relative_to(cache, output)
+                or _is_relative_to(output, cache)
+            ):
+                raise R3EnvelopeError(
+                    f"R3 {label} cache must be outside the source and output directories"
+                )
         return R3Options(
             source_root=source,
             source_ref=self.source_ref,
@@ -103,6 +121,8 @@ class R3Options:
             pre_injection_restart_limit=self.pre_injection_restart_limit,
             authorize_paid_api=self.authorize_paid_api,
             skip_dependency_install=self.skip_dependency_install,
+            baseline_cache_dir=baseline_cache,
+            control_cache_dir=control_cache,
         )
 
 
@@ -273,8 +293,10 @@ def _database_audit(database: Path, run_id: str) -> dict[str, Any]:
     connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=1)
     connection.row_factory = sqlite3.Row
     try:
+
         def scalar(sql: str, params: tuple[Any, ...] = (run_id,)) -> int:
             return int(connection.execute(sql, params).fetchone()[0])
+
         providers = [
             dict(row)
             for row in connection.execute(
@@ -479,6 +501,8 @@ class R3Envelope:
             "clone_root": str(self.clone),
             "runs_dir": str(self.runs),
             "llm": self.options.llm,
+            "baseline_cache_dir": str(self.options.baseline_cache_dir),
+            "control_cache_dir": str(self.options.control_cache_dir),
             "paid_api_authorized": self.options.authorize_paid_api,
             "validation_only": True,
             "test_prediction_enabled": False,
@@ -502,9 +526,10 @@ class R3Envelope:
         stdout_path = self.logs / f"{name}.stdout.log"
         stderr_path = self.logs / f"{name}.stderr.log"
         try:
-            with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open(
-                "w", encoding="utf-8"
-            ) as stderr:
+            with (
+                stdout_path.open("w", encoding="utf-8") as stdout,
+                stderr_path.open("w", encoding="utf-8") as stderr,
+            ):
                 result = subprocess.run(
                     list(command),
                     cwd=cwd,
@@ -566,7 +591,9 @@ class R3Envelope:
             ],
             cwd=self.output,
         )
-        self._checked("checkout", ["git", "checkout", "--detach", self.source_commit], cwd=self.clone)
+        self._checked(
+            "checkout", ["git", "checkout", "--detach", self.source_commit], cwd=self.clone
+        )
         snapshot = git_snapshot(self.clone)
         if snapshot["commit"] != self.source_commit or snapshot["status"]:
             raise R3EnvelopeError("fresh clone does not match the selected clean commit")
@@ -719,6 +746,8 @@ class R3Envelope:
                 "evaluator_path": str(self.clone / "kuairand-starter-kit/evaluate.py"),
                 "environment_lock": str(self.clone / "requirements-lock.txt"),
                 "scientific_execution_enabled": True,
+                "baseline_cache_dir": str(self.options.baseline_cache_dir),
+                "control_cache_dir": str(self.options.control_cache_dir),
                 "confirmation_enabled": False,
                 "test_prediction_enabled": False,
                 "final_submission_enabled": False,
@@ -776,6 +805,12 @@ class R3Envelope:
             "doctor_stdout_sha256": _sha256(self.logs / "doctor.stdout.log"),
             "runtime_config_sha256": _sha256(config_path),
             "runtime_budget_sha256": _sha256(budget_path),
+            "cache": {
+                "baseline_root": str(self.options.baseline_cache_dir),
+                "control_root": str(self.options.control_cache_dir),
+                "outside_source_and_output": True,
+                "validation_only": True,
+            },
         }
         return config_path, evidence
 
@@ -800,7 +835,9 @@ class R3Envelope:
             command.append("--authorize-paid-api")
         return command
 
-    def _launch(self, command: Sequence[str], environment: dict[str, str], name: str) -> subprocess.Popen[bytes]:
+    def _launch(
+        self, command: Sequence[str], environment: dict[str, str], name: str
+    ) -> subprocess.Popen[bytes]:
         self._require_time(name)
         stdout = (self.logs / f"{name}.stdout.log").open("ab")
         stderr = (self.logs / f"{name}.stderr.log").open("ab")
@@ -827,7 +864,10 @@ class R3Envelope:
                 lease = _read_json(path)
             except (OSError, UnicodeError, json.JSONDecodeError, R3EnvelopeError):
                 continue
-            if lease.get("state") == "active" and int(lease.get("owner_pid", -1)) == coordinator_pid:
+            if (
+                lease.get("state") == "active"
+                and int(lease.get("owner_pid", -1)) == coordinator_pid
+            ):
                 return path, lease
         return None
 
@@ -838,7 +878,10 @@ class R3Envelope:
             return None
         if self.clone_snapshot is not None and git_snapshot(self.clone) != self.clone_snapshot:
             raise R3EnvelopeError("clean rehearsal source changed between hourly audits")
-        if self.source_snapshot is not None and git_snapshot(self.options.source_root) != self.source_snapshot:
+        if (
+            self.source_snapshot is not None
+            and git_snapshot(self.options.source_root) != self.source_snapshot
+        ):
             raise R3EnvelopeError("operator source changed between hourly audits")
         snapshot = compact_status_snapshot(self.output, reason=reason)
         label = "hourly" if scheduled else "checkpoint"
@@ -1008,8 +1051,7 @@ class R3Envelope:
             active_states.extend(
                 str(row["state"])
                 for row in rows
-                if str(row["state"])
-                not in {"PROMOTED", "REJECTED", "ABANDONED", "FAILED_FINAL"}
+                if str(row["state"]) not in {"PROMOTED", "REJECTED", "ABANDONED", "FAILED_FINAL"}
             )
         if any(state not in allowed for state in active_states):
             raise R3EnvelopeError(
@@ -1038,7 +1080,9 @@ class R3Envelope:
             "recorded_at": _utc_now(),
         }
 
-    def _inject(self, process: subprocess.Popen[bytes], lease_path: Path, lease: dict[str, Any]) -> None:
+    def _inject(
+        self, process: subprocess.Popen[bytes], lease_path: Path, lease: dict[str, Any]
+    ) -> None:
         if self.fault["count"] != 0:
             raise R3EnvelopeError("controlled failure may be injected exactly once")
         if process.poll() is not None:
@@ -1064,9 +1108,7 @@ class R3Envelope:
             "pre_fault_status": _read_run_status(database, self.run_id),
             "pre_fault_database_audit": _database_audit(database, self.run_id),
             "recorded_at": _utc_now(),
-            "pre_injection_recoveries": list(
-                self.fault.get("pre_injection_recoveries", [])
-            ),
+            "pre_injection_recoveries": list(self.fault.get("pre_injection_recoveries", [])),
         }
         injection_path = self.runtime / "fault_injection.json"
         _atomic_json(injection_path, intent)
@@ -1200,9 +1242,9 @@ class R3Envelope:
                 else 0
             )
             pre_champion = (
-                self.fault.get("pre_fault_status", {}).get("run", {}).get(
-                    "search_champion_experiment_id"
-                )
+                self.fault.get("pre_fault_status", {})
+                .get("run", {})
+                .get("search_champion_experiment_id")
             )
             champion_evidence = 0
             if pre_champion == "baseline":
@@ -1229,7 +1271,13 @@ class R3Envelope:
             raise R3EnvelopeError("pre-fault champion is absent from durable promotion evidence")
         before = dict(self.fault.get("pre_fault_database_audit", {}))
         after = _database_audit(database, self.run_id)
-        for field in ("experiments", "attempts", "transitions", "promotions", "convergence_transactions"):
+        for field in (
+            "experiments",
+            "attempts",
+            "transitions",
+            "promotions",
+            "convergence_transactions",
+        ):
             if int(after.get(field, 0)) < int(before.get(field, 0)):
                 raise R3EnvelopeError(f"durable {field} count moved backwards during recovery")
         if after.get("duplicate_iterations"):
@@ -1266,12 +1314,37 @@ class R3Envelope:
                 for row in connection.execute("SELECT kind,path FROM artifacts"):
                     kind = str(row["kind"]).lower()
                     path = str(row["path"]).lower()
-                    if "submission" in kind or "test_prediction" in kind or "test-prediction" in path:
+                    if (
+                        "submission" in kind
+                        or "test_prediction" in kind
+                        or "test-prediction" in path
+                    ):
                         suspicious_artifacts.append(dict(row))
             finally:
                 connection.close()
             database_audit = _database_audit(database, self.run_id)
         forbidden_commands: list[str] = []
+        cache_evidence = sorted(
+            {
+                *run_dir.glob("baseline/cache.json"),
+                *run_dir.glob("evidence/**/control-cache/*.json"),
+            }
+        )
+        unsafe_cache_evidence: list[str] = []
+        for path in cache_evidence:
+            try:
+                payload = _read_json(path)
+            except (OSError, ValueError, json.JSONDecodeError):
+                unsafe_cache_evidence.append(str(path))
+                continue
+            encoded = json.dumps(payload, sort_keys=True).lower()
+            if (
+                payload.get("test_scored") is not False
+                or '"split": "test"' in encoded
+                or "test_predictions" in encoded
+                or "submission.csv" in encoded
+            ):
+                unsafe_cache_evidence.append(str(path))
         for path in self.logs.glob("*.log"):
             try:
                 text = path.read_text(encoding="utf-8", errors="replace")
@@ -1283,6 +1356,7 @@ class R3Envelope:
             forbidden
             or suspicious_artifacts
             or forbidden_commands
+            or unsafe_cache_evidence
             or int(database_audit.get("test_metrics", 0))
             or int(database_audit.get("predict_attempts", 0))
         ):
@@ -1296,6 +1370,8 @@ class R3Envelope:
             "test_metric_rows": database_audit.get("test_metrics", 0),
             "predict_attempt_rows": database_audit.get("predict_attempts", 0),
             "forbidden_command_logs": forbidden_commands,
+            "cache_evidence_files": [str(path) for path in cache_evidence],
+            "unsafe_cache_evidence": unsafe_cache_evidence,
             "database_audit": database_audit,
         }
 
@@ -1304,7 +1380,10 @@ class R3Envelope:
         if not manifest.is_file():
             raise R3EnvelopeError("completed R3 run did not preserve a best-valid manifest")
         payload = _read_json(manifest)
-        if payload.get("kind") != "best_valid" or payload.get("test_prediction_created") is not False:
+        if (
+            payload.get("kind") != "best_valid"
+            or payload.get("test_prediction_created") is not False
+        ):
             raise R3EnvelopeError("best-valid manifest has an invalid identity or test policy")
         artifacts = payload.get("artifacts")
         if not isinstance(artifacts, dict) or not artifacts:
@@ -1328,10 +1407,9 @@ class R3Envelope:
             verified[relative_name] = {"sha256": digest, "size_bytes": path.stat().st_size}
         model_manifest = root / "model/model_bundle.json"
         model = _read_json(model_manifest)
-        if (
-            model.get("commit_sha") != payload.get("commit_sha")
-            or model.get("config_sha256") != payload.get("config_sha256")
-        ):
+        if model.get("commit_sha") != payload.get("commit_sha") or model.get(
+            "config_sha256"
+        ) != payload.get("config_sha256"):
             raise R3EnvelopeError("best-valid model provenance disagrees with its manifest")
         members = model.get("members")
         if not isinstance(members, list) or not members:
@@ -1510,9 +1588,20 @@ class R3Envelope:
             evidence_files.extend(report_files)
         winner_root = Path(winner["path"]).parent
         evidence_files.extend(path for path in winner_root.rglob("*") if path.is_file())
+        evidence_files.extend(
+            path
+            for path in (
+                run_root / "baseline/cache.json",
+                *run_root.glob("evidence/**/control-cache/*.json"),
+            )
+            if path.is_file()
+        )
         evidence_files = sorted(set(evidence_files))
         evidence = {
-            str(path.relative_to(self.output)): {"sha256": _sha256(path), "size_bytes": path.stat().st_size}
+            str(path.relative_to(self.output)): {
+                "sha256": _sha256(path),
+                "size_bytes": path.stat().st_size,
+            }
             for path in evidence_files
         }
         database_audit = validation["database_audit"]
@@ -1522,7 +1611,9 @@ class R3Envelope:
             raise R3EnvelopeError("R3 did not record an authorized live researcher provider")
         elapsed = self.monotonic() - self.started_monotonic
         if elapsed > self.options.wall_clock_seconds:
-            raise R3EnvelopeError("R3 exceeded its global wall-clock ceiling while hashing evidence")
+            raise R3EnvelopeError(
+                "R3 exceeded its global wall-clock ceiling while hashing evidence"
+            )
         best_valid_ref = _artifact_payload(Path(winner["path"]), "best_valid_manifest")
         report_refs = [_artifact_payload(path, "r3_report_artifact") for path in report_files]
         environment_inventory = self.logs / "installed-inventory.stdout.log"
@@ -1582,7 +1673,9 @@ class R3Envelope:
         self._state("complete", manifest=str(manifest_path), manifest_sha256=_sha256(manifest_path))
         if self.monotonic() - self.started_monotonic > self.options.wall_clock_seconds:
             manifest_path.unlink(missing_ok=True)
-            raise R3EnvelopeError("R3 exceeded its global wall-clock ceiling during final state seal")
+            raise R3EnvelopeError(
+                "R3 exceeded its global wall-clock ceiling during final state seal"
+            )
         return manifest
 
     def run(self) -> dict[str, Any]:
