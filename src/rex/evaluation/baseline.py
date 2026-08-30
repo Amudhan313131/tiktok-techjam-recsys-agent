@@ -442,11 +442,27 @@ def run_baseline_verification(
     *,
     seeds: tuple[int, ...] = (0, 1, 2, 3, 4),
 ) -> BaselineEvidence:
-    """Run and persist the complete valid-only baseline acceptance gate."""
+    """Bootstrap views, then run the complete valid-only baseline gate."""
+
+    bootstrap_views(data_dir, view_dir)
+    return run_baseline_verification_from_views(view_dir, evidence_dir, seeds=seeds)
+
+
+def run_baseline_verification_from_views(
+    view_dir: str | Path,
+    evidence_dir: str | Path,
+    *,
+    seeds: tuple[int, ...] = (0, 1, 2, 3, 4),
+) -> BaselineEvidence:
+    """Run the baseline gate from already verified, sanitized views.
+
+    Production rehearsals bootstrap and hash these views during preflight.  This
+    entry point avoids rebuilding the same arrays before baseline training while
+    retaining :func:`run_baseline_verification` for standalone callers.
+    """
 
     root = Path(evidence_dir)
     root.mkdir(parents=True, exist_ok=True)
-    bootstrap_views(data_dir, view_dir)
     random_metrics = reproduce_random(view_dir, evidence_dir=root / "random")
     popularity_metrics = reproduce_item_popularity(
         view_dir, evidence_dir=root / "item-popularity"
