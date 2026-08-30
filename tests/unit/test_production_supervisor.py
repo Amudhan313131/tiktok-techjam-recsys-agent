@@ -20,6 +20,11 @@ def test_shipped_production_config_is_runnable_and_excludes_unsupported_cards() 
     assert config.method_cards["E03"].feature_recipe == "history_length"
     assert config.method_cards["E07"].feature_recipe == "author_duration_affinity"
     assert config.method_cards["E08"].feature_recipe == "recency_history"
+    assert config.scientific_execution == {
+        "max_parallel_workers": 2,
+        "max_parallel_folds": 3,
+        "parallel_candidate_control": True,
+    }
 
 
 def test_proposal_context_contains_versioned_method_card_and_only_evidence_ids() -> None:

@@ -2,6 +2,11 @@
   "schema_version": "1.0",
   "execution_mode": "production",
   "scientific_execution_enabled": true,
+  "scientific_execution": {
+    "max_parallel_workers": 2,
+    "max_parallel_folds": 3,
+    "parallel_candidate_control": true
+  },
   "confirmation_enabled": false,
   "test_prediction_enabled": false,
   "final_submission_enabled": false,

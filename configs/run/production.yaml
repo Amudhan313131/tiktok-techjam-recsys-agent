@@ -4,6 +4,10 @@ execution_mode: production
 # Running this configuration executes validation-only search. Confirmation,
 # test prediction, and final submission remain explicitly disabled in code.
 scientific_execution_enabled: true
+scientific_execution:
+  max_parallel_workers: 2
+  max_parallel_folds: 3
+  parallel_candidate_control: true
 
 project_root: .
 runs_dir: runs

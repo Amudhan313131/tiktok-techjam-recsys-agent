@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from rex.agents.search_policy import SearchPolicy
 from rex.agents.recovery import RepairAction, TypedRepairPlan
@@ -12,6 +16,7 @@ from rex.control.production_supervisor import (
     MethodCardBinding,
     ProductionContext,
     ProductionFixedProvider,
+    ProductionRungFailure,
     ProductionRunConfig,
     RepairRequest,
     RungRequest,
@@ -192,6 +197,63 @@ class _FakeWorker:
         )
 
 
+class _ConcurrentFakeWorker(_FakeWorker):
+    def __init__(self, delay_seconds: float = 0.03):
+        self.delay_seconds = delay_seconds
+        self.lock = threading.Lock()
+        self.active = 0
+        self.peak = 0
+        self.completed: list[str] = []
+
+    def __call__(self, request, attempt_dir, **kwargs):
+        with self.lock:
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+        try:
+            delay = self.delay_seconds
+            if "full-A" in request.attempt_id:
+                delay *= 2
+            time.sleep(delay)
+            return super().__call__(request, attempt_dir, **kwargs)
+        finally:
+            with self.lock:
+                self.completed.append(request.attempt_id)
+                self.active -= 1
+
+
+class _FailingConcurrentWorker(_ConcurrentFakeWorker):
+    def __call__(self, request, attempt_dir, **kwargs):
+        if "full-A-candidate" not in request.attempt_id or request.effective_operation != "fit":
+            if "full-B" in request.attempt_id:
+                time.sleep(0.08)
+            return super().__call__(request, attempt_dir, **kwargs)
+        with self.lock:
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+        try:
+            time.sleep(0.005)
+            return RunResult(
+                run_id=request.run_id,
+                experiment_id=request.experiment_id,
+                attempt_id=request.attempt_id,
+                status=AttemptStatus.CRASH,
+                exit_code=1,
+                error_type="ControlledFailure",
+                error_summary="controlled parallel failure",
+                command_sha256=HASH,
+                commit_sha=request.commit_sha,
+                config_sha256=request.config_sha256,
+                data_view_sha256=request.data_view_sha256,
+                environment_sha256=request.environment_sha256,
+                artifacts=[],
+                wall_seconds=0.005,
+            )
+        finally:
+            with self.lock:
+                self.completed.append(request.attempt_id)
+                self.active -= 1
+
+
 def _request(tmp_path: Path):
     config, binding, _, _ = _config(tmp_path)
     context = ProductionContext(
@@ -334,6 +396,68 @@ def test_scientific_rung_cache_replays_without_new_worker_calls(tmp_path: Path):
     assert second.observations == first.observations
     with repository.database.connect() as connection:
         assert connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 4
+
+
+def test_candidate_and_reference_execute_concurrently_within_bound(tmp_path: Path):
+    hooks, context, experiment, card, binding, _repository = _request(tmp_path)
+    worker = _ConcurrentFakeWorker()
+    hooks.execute = worker
+    hooks.settings = replace(
+        hooks.settings,
+        max_parallel_workers=2,
+        max_parallel_folds=3,
+        parallel_candidate_control=True,
+    )
+
+    result = hooks.run_rung(RungRequest(context, experiment, card, binding, "cheap"))
+
+    assert len(result.observations) == 1
+    assert worker.peak == 2
+
+
+def test_full_rung_parallelism_is_bounded_and_results_are_canonical(tmp_path: Path):
+    hooks, context, experiment, card, binding, repository = _request(tmp_path)
+    worker = _ConcurrentFakeWorker()
+    hooks.execute = worker
+    hooks.settings = replace(
+        hooks.settings,
+        max_parallel_workers=4,
+        max_parallel_folds=3,
+        parallel_candidate_control=True,
+    )
+
+    result = hooks.run_rung(RungRequest(context, experiment, card, binding, "full"))
+
+    assert [item.candidate.fold for item in result.observations] == ["A", "B", "C"]
+    assert worker.peak == 4
+    assert worker.completed[0].split(":full-", 1)[1][0] == "B"
+    with repository.database.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 12
+
+
+def test_parallel_failure_drains_started_work_and_cancels_queued_folds(tmp_path: Path):
+    hooks, context, experiment, card, binding, repository = _request(tmp_path)
+    worker = _FailingConcurrentWorker()
+    hooks.execute = worker
+    hooks.settings = replace(
+        hooks.settings,
+        max_parallel_workers=4,
+        max_parallel_folds=3,
+        parallel_candidate_control=True,
+    )
+
+    with pytest.raises(ProductionRungFailure, match="candidate fit failed on A"):
+        hooks.run_rung(RungRequest(context, experiment, card, binding, "full"))
+
+    assert worker.active == 0
+    assert not any(":full-C-" in attempt_id for attempt_id in worker.completed)
+    assert not (
+        context.run_dir / "scientific-cache" / experiment["experiment_id"] / "full.json"
+    ).exists()
+    with repository.database.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM attempts WHERE status='reserved'"
+        ).fetchone()[0] == 0
 
 
 def test_e10_derives_weights_only_from_complete_full_shadow_artifacts(tmp_path: Path):

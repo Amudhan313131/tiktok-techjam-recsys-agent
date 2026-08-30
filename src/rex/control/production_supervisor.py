@@ -86,6 +86,7 @@ class ProductionRunConfig:
     method_cards: dict[str, MethodCardBinding]
     llm: dict[str, Any]
     raw_data_dir: Path | None = None
+    scientific_execution: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: str | Path) -> "ProductionRunConfig":
@@ -116,6 +117,9 @@ class ProductionRunConfig:
                 config_path=resolve(str(value["config"])),
                 feature_recipe=str(value["feature_recipe"]),
             )
+        scientific_execution = raw.get("scientific_execution", {})
+        if not isinstance(scientific_execution, dict):
+            raise ValueError("scientific_execution must be a mapping")
         config = cls(
             source_path=candidate,
             project_root=resolve(str(raw.get("project_root", "."))),
@@ -137,6 +141,7 @@ class ProductionRunConfig:
             raw_data_dir=resolve(
                 str(raw.get("raw_data_dir", "data/KuaiRand-Pure/data"))
             ),
+            scientific_execution=dict(scientific_execution),
         )
         if config.process_stale_after_seconds <= 0:
             raise ValueError("process_stale_after_seconds must be positive")

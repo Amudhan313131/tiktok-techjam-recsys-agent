@@ -14,6 +14,8 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Callable
@@ -96,12 +98,19 @@ class ScientificExecutionSettings:
     model_seed: int = 0
     max_memory_mb: int = 8192
     bootstrap_samples: int = 500
+    max_parallel_workers: int = 2
+    max_parallel_folds: int = 3
+    parallel_candidate_control: bool = True
 
     def __post_init__(self) -> None:
         if not 0 < self.cheap_user_fraction <= 1:
             raise ValueError("cheap_user_fraction must be in (0, 1]")
         if self.max_memory_mb <= 0 or self.bootstrap_samples <= 0:
             raise ValueError("resource and bootstrap bounds must be positive")
+        if self.max_parallel_workers <= 0:
+            raise ValueError("max_parallel_workers must be positive")
+        if not 1 <= self.max_parallel_folds <= 3:
+            raise ValueError("max_parallel_folds must be between 1 and 3")
 
 
 @dataclass(frozen=True)
@@ -241,6 +250,8 @@ class ProductionScientificHooks(ProductionHooks):
         self.python_executable = python_executable
         self.preparation_checkpoint = preparation_checkpoint
         self.budget = BudgetConfig.from_yaml(config.budget_config)
+        self._repository_guard = threading.Lock()
+        self._repositories: dict[Path, ExperimentRepository] = {}
 
     # ---- baseline and immutable data contract ---------------------------------
 
@@ -375,9 +386,15 @@ class ProductionScientificHooks(ProductionHooks):
     # ---- candidate preparation -------------------------------------------------
 
     def _main_repository(self, context: ProductionContext) -> ExperimentRepository:
-        database = Database(context.run_dir / "state.sqlite3")
-        database.initialize()
-        return ExperimentRepository(database)
+        path = (context.run_dir / "state.sqlite3").resolve()
+        with self._repository_guard:
+            repository = self._repositories.get(path)
+            if repository is None:
+                database = Database(path)
+                database.initialize()
+                repository = ExperimentRepository(database)
+                self._repositories[path] = repository
+            return repository
 
     def _candidate_result(
         self,
@@ -1547,11 +1564,11 @@ class ProductionScientificHooks(ProductionHooks):
         views: _PreparedViews,
         targets: Path,
         split: str,
+        repair_number: int,
     ) -> _ModelExecution:
         experiment_id = str(experiment["experiment_id"])
         workspace = Path(str(experiment["workspace_path"])).resolve()
         commit_sha = str(experiment["commit_sha"])
-        repair_number = self._repair_number(context, experiment_id)
         prefix = f"{rung}-{fold}-{side}-repair-{repair_number}"
         attempt_root = context.run_dir / "attempts" / experiment_id / prefix
         config_hash = sha256_file(config_path)
@@ -1587,7 +1604,11 @@ class ProductionScientificHooks(ProductionHooks):
             roots=CapabilityRoots(features=views.feature_root, targets=targets.parent),
         )
         fit_result = self._run_and_record(
-            context, fit_request, attempt_root / "fit", f"{rung}:{fold}:{side}:fit"
+            context,
+            fit_request,
+            attempt_root / "fit",
+            f"{rung}:{fold}:{side}:fit",
+            repair_number=repair_number,
         )
         if fit_result.status != AttemptStatus.SUCCESS:
             raise ProductionRungFailure(
@@ -1635,6 +1656,7 @@ class ProductionScientificHooks(ProductionHooks):
             predict_request,
             attempt_root / "predict",
             f"{rung}:{fold}:{side}:predict",
+            repair_number=repair_number,
         )
         if predict_result.status != AttemptStatus.SUCCESS:
             raise ProductionRungFailure(
@@ -1681,13 +1703,15 @@ class ProductionScientificHooks(ProductionHooks):
         request: RunRequest,
         attempt_dir: Path,
         rung: str,
+        *,
+        repair_number: int,
     ) -> RunResult:
         repository = self._main_repository(context)
         repository.reserve_attempt(
             attempt_id=request.attempt_id,
             experiment_id=request.experiment_id,
             rung=rung,
-            repair_number=self._repair_number(context, request.experiment_id),
+            repair_number=repair_number,
             commit_sha=request.commit_sha,
         )
         result = self.execute(
@@ -1732,7 +1756,7 @@ class ProductionScientificHooks(ProductionHooks):
         repository.record_attempt(
             result,
             rung=rung,
-            repair_number=self._repair_number(context, request.experiment_id),
+            repair_number=repair_number,
         )
         return result
 
@@ -1760,6 +1784,8 @@ class ProductionScientificHooks(ProductionHooks):
         context: ProductionContext,
         request: RungRequest,
         partition: _Partition,
+        *,
+        repair_number: int,
     ) -> tuple[ComparisonObservation, tuple[ArtifactRef, ...], dict[str, Any]]:
         card_id = request.method_card.card_id
         candidate_config = self._effective_config(request)
@@ -1768,19 +1794,26 @@ class ProductionScientificHooks(ProductionHooks):
         )
         split = "valid" if request.rung == "official_valid" else "shadow"
         evaluation_fold = None if split == "valid" else partition.name
-        candidate = self._execute_one(
-            context=context,
-            experiment=request.experiment,
-            rung=request.rung,
-            fold=partition.name,
-            side="candidate",
-            config_path=candidate_config,
-            plugin=self._plugin(candidate_config, card_id=card_id),
-            views=candidate_views,
-            targets=partition.train_targets,
-            split=split,
+        def execute_candidate() -> _ModelExecution:
+            return self._execute_one(
+                context=context,
+                experiment=request.experiment,
+                rung=request.rung,
+                fold=partition.name,
+                side="candidate",
+                config_path=candidate_config,
+                plugin=self._plugin(candidate_config, card_id=card_id),
+                views=candidate_views,
+                targets=partition.train_targets,
+                split=split,
+                repair_number=repair_number,
+            )
+
+        uses_incumbent = (
+            request.rung == "official_valid" and self._search_champion(context) is not None
         )
-        if request.rung == "official_valid" and self._search_champion(context) is not None:
+        if uses_incumbent:
+            candidate = execute_candidate()
             candidate_metrics = self._metrics(
                 candidate_views.apply_features,
                 partition.valid_targets,
@@ -1795,6 +1828,7 @@ class ProductionScientificHooks(ProductionHooks):
             )
             reference_artifacts = (incumbent_ref,)
         elif card_id == "E10":
+            candidate = execute_candidate()
             if candidate.component_scores is None:
                 raise ProductionRungFailure(
                     AttemptStatus.INVALID_ARTIFACT, "E10 did not emit component predictions"
@@ -1839,18 +1873,49 @@ class ProductionScientificHooks(ProductionHooks):
             reference_views = self._views(
                 context, partition, card_id, request.binding.feature_recipe, reference=True
             )
-            reference = self._execute_one(
-                context=context,
-                experiment=request.experiment,
-                rung=request.rung,
-                fold=partition.name,
-                side="reference",
-                config_path=reference_config,
-                plugin=self._plugin(reference_config, card_id=card_id),
-                views=reference_views,
-                targets=partition.train_targets,
-                split=split,
-            )
+
+            def execute_reference() -> _ModelExecution:
+                return self._execute_one(
+                    context=context,
+                    experiment=request.experiment,
+                    rung=request.rung,
+                    fold=partition.name,
+                    side="reference",
+                    config_path=reference_config,
+                    plugin=self._plugin(reference_config, card_id=card_id),
+                    views=reference_views,
+                    targets=partition.train_targets,
+                    split=split,
+                    repair_number=repair_number,
+                )
+
+            if (
+                self.settings.parallel_candidate_control
+                and self.settings.max_parallel_workers >= 2
+            ):
+                side_results: dict[int, _ModelExecution] = {}
+                side_errors: dict[int, Exception] = {}
+                with ThreadPoolExecutor(max_workers=2, thread_name_prefix="rex-side") as executor:
+                    futures: dict[Future[_ModelExecution], int] = {
+                        executor.submit(execute_candidate): 0,
+                        executor.submit(execute_reference): 1,
+                    }
+                    for future in as_completed(futures):
+                        index = futures[future]
+                        try:
+                            side_results[index] = future.result()
+                        except Exception as error:
+                            side_errors[index] = error
+                            for pending in futures:
+                                if pending is not future:
+                                    pending.cancel()
+                if side_errors:
+                    raise side_errors[min(side_errors)]
+                candidate = side_results[0]
+                reference = side_results[1]
+            else:
+                candidate = execute_candidate()
+                reference = execute_reference()
             candidate_metrics = self._metrics(
                 candidate_views.apply_features,
                 partition.valid_targets,
@@ -2047,21 +2112,100 @@ class ProductionScientificHooks(ProductionHooks):
             result_values["diagnostics"] = payload.get("diagnostics", {})
         return ProductionRungResult(**result_values)
 
+    def _parallel_side_width(self, request: RungRequest) -> int:
+        if (
+            not self.settings.parallel_candidate_control
+            or self.settings.max_parallel_workers < 2
+            or request.method_card.card_id == "E10"
+        ):
+            return 1
+        if request.rung == "official_valid" and self._search_champion(request.context):
+            return 1
+        return 2
+
     def run_rung(self, request: RungRequest) -> ProductionRungResult:
         cached = self._cached_rung(request)
         if cached is not None:
             return cached
-        observations: list[ComparisonObservation] = []
-        refs: list[ArtifactRef] = []
-        diagnostics_by_fold: dict[str, dict[str, Any]] = {}
+        partitions = self._partition_for_rung(request.context, request.rung)
+        repair_number = self._repair_number(
+            request.context, str(request.experiment["experiment_id"])
+        )
+        side_width = self._parallel_side_width(request)
+        fold_workers = max(
+            1,
+            min(
+                len(partitions),
+                self.settings.max_parallel_folds,
+                self.settings.max_parallel_workers // side_width,
+            ),
+        )
+        results: dict[
+            int, tuple[ComparisonObservation, tuple[ArtifactRef, ...], dict[str, Any]]
+        ] = {}
         try:
-            for partition in self._partition_for_rung(request.context, request.rung):
-                observation, evidence, report = self._evaluate_pair(
-                    request.context, request, partition
-                )
-                observations.append(observation)
-                refs.extend(evidence)
-                diagnostics_by_fold[partition.name] = report
+            if fold_workers == 1:
+                for index, partition in enumerate(partitions):
+                    results[index] = self._evaluate_pair(
+                        request.context,
+                        request,
+                        partition,
+                        repair_number=repair_number,
+                    )
+            else:
+                fold_errors: dict[int, Exception] = {}
+                with ThreadPoolExecutor(
+                    max_workers=fold_workers, thread_name_prefix="rex-fold"
+                ) as executor:
+                    next_index = 0
+                    futures: dict[
+                        Future[
+                            tuple[
+                                ComparisonObservation,
+                                tuple[ArtifactRef, ...],
+                                dict[str, Any],
+                            ]
+                        ],
+                        int,
+                    ] = {}
+
+                    def submit(index: int) -> None:
+                        futures[
+                            executor.submit(
+                                self._evaluate_pair,
+                                request.context,
+                                request,
+                                partitions[index],
+                                repair_number=repair_number,
+                            )
+                        ] = index
+
+                    while next_index < min(fold_workers, len(partitions)):
+                        submit(next_index)
+                        next_index += 1
+                    stop_scheduling = False
+                    while futures:
+                        completed, _pending = wait(
+                            tuple(futures), return_when=FIRST_COMPLETED
+                        )
+                        for future in sorted(completed, key=lambda item: futures[item]):
+                            index = futures.pop(future)
+                            if future.cancelled():
+                                continue
+                            try:
+                                results[index] = future.result()
+                            except Exception as error:
+                                fold_errors[index] = error
+                                stop_scheduling = True
+                        if stop_scheduling:
+                            for pending in futures:
+                                pending.cancel()
+                            continue
+                        while next_index < len(partitions) and len(futures) < fold_workers:
+                            submit(next_index)
+                            next_index += 1
+                if fold_errors:
+                    raise fold_errors[min(fold_errors)]
         except ProductionRungFailure:
             raise
         except (ArtifactError, EvaluationError, ValueError) as error:
@@ -2071,6 +2215,13 @@ class ProductionScientificHooks(ProductionHooks):
             raise ProductionRungFailure(AttemptStatus.TIMEOUT, str(error)) from error
         except MemoryError as error:
             raise ProductionRungFailure(AttemptStatus.OOM, str(error)) from error
+        ordered = [results[index] for index in range(len(partitions))]
+        observations = [item[0] for item in ordered]
+        refs = [ref for item in ordered for ref in item[1]]
+        diagnostics_by_fold = {
+            partition.name: ordered[index][2]
+            for index, partition in enumerate(partitions)
+        }
         diagnostics = self._summarize_diagnostics(diagnostics_by_fold)
         cache_path = (
             request.context.run_dir
@@ -2090,6 +2241,14 @@ class ProductionScientificHooks(ProductionHooks):
                 ],
                 "artifacts": [item.model_dump(mode="json") for item in refs],
                 "diagnostics": diagnostics,
+                "execution_plan": {
+                    "max_parallel_workers": self.settings.max_parallel_workers,
+                    "max_parallel_folds": self.settings.max_parallel_folds,
+                    "parallel_candidate_control": self.settings.parallel_candidate_control,
+                    "resolved_fold_workers": fold_workers,
+                    "side_width": side_width,
+                    "repair_number": repair_number,
+                },
             },
         )
         refs.append(artifact_ref(cache_path, "scientific_rung_cache"))
@@ -2842,4 +3001,6 @@ def build_scientific_hooks(
 ) -> ProductionScientificHooks:
     """Small CLI-friendly factory kept free of provider configuration logic."""
 
+    if "settings" not in kwargs:
+        kwargs["settings"] = ScientificExecutionSettings(**config.scientific_execution)
     return ProductionScientificHooks(config, provider, **kwargs)
