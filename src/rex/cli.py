@@ -44,7 +44,8 @@ from rex.data.manifest import (
 from rex.evaluation.baseline import reproduce_fm_bundle
 from rex.evaluation.submission import TEST_ROW_COUNT, build_submission, validate_submission
 from rex.execution.runner import execute_request
-from rex.execution.sandbox import SandboxError, SandboxMode, production_backend
+from rex.execution.runtime import ExecutionRuntimeError, production_runtime
+from rex.execution.sandbox import SandboxMode
 from rex.models.tree_ranker import tree_ranker_doctor
 from rex.rehearsal import (
     rehearsal_requirements,
@@ -69,9 +70,7 @@ def _json(value: object) -> None:
 
 
 def _commit(root: Path) -> str:
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True
-    )
+    result = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True)
     return result.stdout.strip() if result.returncode == 0 else "uncommitted"
 
 
@@ -259,7 +258,6 @@ def _llm_doctor(args: argparse.Namespace) -> dict[str, object] | None:
 def command_doctor(args: argparse.Namespace) -> int:
     starter = verify_starter_manifest()
     benchmark = load_benchmark_manifest()
-    llm = _llm_doctor(args)
     tree = tree_ranker_doctor() if args.tree else None
     raw = yaml.safe_load(args.config.read_text(encoding="utf-8"))
     raw = raw if isinstance(raw, dict) else {}
@@ -272,8 +270,34 @@ def command_doctor(args: argparse.Namespace) -> int:
         production_config = ProductionRunConfig.load(args.config)
         manifest_ready = production_config.data_manifest.is_file()
         try:
-            sandbox = production_backend().doctor().to_dict()
-        except SandboxError as error:
+            runtime_result = production_runtime().doctor()
+            source_commit = _commit(production_config.project_root)
+            image_commit = str(runtime_result.environment_identity.get("source_git_commit", ""))
+            source_revision_matches = (
+                source_commit != "uncommitted" and source_commit == image_commit
+            )
+            sandbox = {
+                "backend": runtime_result.runtime_kind.value,
+                "available": runtime_result.available,
+                "safe_for_production": runtime_result.safe_for_production,
+                "detail": runtime_result.detail,
+                "checks": [
+                    {"name": item.name, "passed": item.passed, "detail": item.detail}
+                    for item in runtime_result.checks
+                ]
+                + [
+                    {
+                        "name": "source_revision_matches_image",
+                        "passed": source_revision_matches,
+                        "detail": f"source={source_commit}, image={image_commit or 'missing'}",
+                    }
+                ],
+                "environment_identity": dict(runtime_result.environment_identity),
+            }
+            sandbox["safe_for_production"] = bool(
+                runtime_result.safe_for_production and source_revision_matches
+            )
+        except ExecutionRuntimeError as error:
             sandbox = {
                 "backend": "unavailable",
                 "available": False,
@@ -283,12 +307,18 @@ def command_doctor(args: argparse.Namespace) -> int:
         production_ok = bool(
             production_enabled and manifest_ready and sandbox["safe_for_production"]
         )
+    llm = (
+        _llm_doctor(args)
+        if production_ok
+        else {
+            "ok": False,
+            "live_response": {
+                "skipped": "production Docker doctor must pass before an LLM request"
+            },
+        }
+    )
     result = {
-        "ok": bool(
-            (llm or {}).get("ok", True)
-            and (tree or {}).get("ok", True)
-            and production_ok
-        ),
+        "ok": bool((llm or {}).get("ok", True) and (tree or {}).get("ok", True) and production_ok),
         "python": sys.version,
         "label": benchmark["label"],
         "metrics": benchmark["metrics"],
@@ -313,9 +343,7 @@ def command_run(args: argparse.Namespace) -> int:
     if args.llm is not None:
         llm["mode"] = args.llm
     if llm.get("mode") == "openai_api" and not getattr(args, "authorize_paid_api", False):
-        raise RuntimeError(
-            "direct OpenAI API use requires the explicit --authorize-paid-api flag"
-        )
+        raise RuntimeError("direct OpenAI API use requires the explicit --authorize-paid-api flag")
     if getattr(args, "authorize_paid_api", False) and llm.get("mode") != "openai_api":
         raise RuntimeError("--authorize-paid-api requires --llm openai_api")
     if args.allow_paid_api_fallback:
@@ -328,7 +356,27 @@ def command_run(args: argparse.Namespace) -> int:
     execution_mode = raw.get("execution_mode")
     if execution_mode == "production":
         production_config = ProductionRunConfig.load(args.config)
-        production_config = replace(production_config, llm=llm)
+        try:
+            runtime_result = production_runtime().doctor()
+        except ExecutionRuntimeError as error:
+            raise RuntimeError(f"production Docker runtime is unavailable: {error}") from error
+        if not runtime_result.safe_for_production:
+            failed = "; ".join(
+                f"{item.name}: {item.detail}" for item in runtime_result.checks if not item.passed
+            )
+            raise RuntimeError(f"production Docker doctor failed closed: {failed}")
+        source_commit = _commit(production_config.project_root)
+        image_commit = str(runtime_result.environment_identity.get("source_git_commit", ""))
+        if source_commit == "uncommitted" or image_commit != source_commit:
+            raise RuntimeError(
+                "production source revision does not match the verified worker image: "
+                f"source={source_commit}, image={image_commit or 'missing'}"
+            )
+        production_config = replace(
+            production_config,
+            llm=llm,
+            runtime_environment_identity=dict(runtime_result.environment_identity),
+        )
         if provider_config.mode == "auto":
             provider_config = replace(
                 provider_config,
@@ -361,9 +409,7 @@ def command_run(args: argparse.Namespace) -> int:
     if execution_mode != "fixture":
         raise RuntimeError(f"unsupported execution_mode: {execution_mode!r}")
     fixture_config = FixtureRunConfig.load(args.config)
-    prior_openai_calls, prior_openai_tokens = _resume_openai_usage(
-        fixture_config, args.resume
-    )
+    prior_openai_calls, prior_openai_tokens = _resume_openai_usage(fixture_config, args.resume)
     provider = ProviderRouter.from_config(
         provider_config,
         fixed_provider=FixtureScriptProvider(),
@@ -387,9 +433,7 @@ def command_status(args: argparse.Namespace) -> int:
         config = ProductionRunConfig.load(args.config)
         autopilot = ProductionAutopilot(config, ProductionFixedProvider())
         _json(
-            autopilot.compact_status(args.run_id)
-            if args.compact
-            else autopilot.status(args.run_id)
+            autopilot.compact_status(args.run_id) if args.compact else autopilot.status(args.run_id)
         )
         return 0
     config = FixtureRunConfig.load(args.config)
@@ -506,6 +550,39 @@ def _submission_coordinator(
     source = discover_completed_source(source_database, args.run_id)
     if source.source_run["data_manifest_sha256"] != sha256_file(config.data_manifest):
         raise RuntimeError("production run was completed against a different data manifest")
+    try:
+        runtime = production_runtime()
+        runtime_result = runtime.doctor()
+    except ExecutionRuntimeError as error:
+        raise RuntimeError(f"final-prediction Docker runtime is unavailable: {error}") from error
+    if not runtime_result.safe_for_production:
+        failed = "; ".join(
+            f"{item.name}: {item.detail}" for item in runtime_result.checks if not item.passed
+        )
+        raise RuntimeError(f"final-prediction Docker doctor failed closed: {failed}")
+    current_identity = dict(runtime_result.environment_identity)
+    identity_path = source.source_report_path / "environment_identity.json"
+    try:
+        winning_identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"winning run has no valid Docker environment identity: {error}"
+        ) from error
+    if not isinstance(winning_identity, dict):
+        raise RuntimeError("winning run Docker environment identity must be an object")
+    identity_drift = {
+        key: {"winning": winning_identity.get(key), "current": value}
+        for key, value in sorted(current_identity.items())
+        if winning_identity.get(key) != value
+    }
+    if identity_drift:
+        raise RuntimeError(
+            "final prediction must use the winning Docker image and platform: "
+            + json.dumps(identity_drift, sort_keys=True)
+        )
+    config = replace(config, runtime_environment_identity=current_identity)
+    if environment_provenance_sha256(config) != source.source_run["environment_sha256"]:
+        raise RuntimeError("final-prediction environment differs from the completed winning run")
 
     output_root = _submission_output_root(args, run_dir, source_database)
     jobs_root = output_root / "jobs"
@@ -519,6 +596,7 @@ def _submission_coordinator(
             trusted_worktree_root=jobs_root,
             sandbox_mode=SandboxMode.PRODUCTION,
             trusted_output_root=jobs_root,
+            execution_runtime=runtime,
         )
 
     def build_csv(prediction_path, csv_path, expected_features, expected_rows):
@@ -534,6 +612,7 @@ def _submission_coordinator(
         data_dir=Path(args.data_dir).resolve(strict=True),
         split="test",
         sandbox_mode=SandboxMode.PRODUCTION,
+        execution_runtime=runtime,
     )
     coordinator = FinalSubmissionCoordinator(
         repository,
@@ -554,9 +633,7 @@ def _submission_coordinator(
     return coordinator, source_database
 
 
-def _submission_output_root(
-    args: argparse.Namespace, run_dir: Path, source_database: Path
-) -> Path:
+def _submission_output_root(args: argparse.Namespace, run_dir: Path, source_database: Path) -> Path:
     output_root = (
         Path(args.output_dir).resolve()
         if args.output_dir is not None
@@ -666,9 +743,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="rex")
     sub = parser.add_subparsers(dest="command", required=True)
     doctor = sub.add_parser("doctor", help="verify frozen contracts and local prerequisites")
-    doctor.add_argument(
-        "--llm", choices=["codex_cli", "claude_cli", "openai_api", "auto", "fixed"]
-    )
+    doctor.add_argument("--llm", choices=["codex_cli", "claude_cli", "openai_api", "auto", "fixed"])
     doctor.add_argument("--live", action="store_true", help="perform an explicit live LLM call")
     doctor.add_argument("--tree", action="store_true", help="run the synthetic LightGBM doctor")
     doctor.add_argument("--config", type=Path, default=root / "configs/run/fixture.yaml")
@@ -683,9 +758,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="R3 envelope deadline; may only shorten the configured wall ceiling",
     )
-    run.add_argument(
-        "--llm", choices=["codex_cli", "claude_cli", "openai_api", "auto", "fixed"]
-    )
+    run.add_argument("--llm", choices=["codex_cli", "claude_cli", "openai_api", "auto", "fixed"])
     run.add_argument(
         "--allow-paid-api-fallback",
         action="store_true",

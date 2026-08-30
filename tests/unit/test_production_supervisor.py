@@ -21,13 +21,39 @@ def test_shipped_production_config_is_runnable_and_excludes_unsupported_cards() 
     assert config.method_cards["E07"].feature_recipe == "author_duration_affinity"
     assert config.method_cards["E08"].feature_recipe == "recency_history"
     assert config.scientific_execution == {
-        "max_parallel_workers": 6,
+        "max_parallel_workers": 4,
         "max_parallel_folds": 3,
         "parallel_candidate_control": True,
-        "max_memory_mb": 2048,
+        "max_memory_mb": 1536,
     }
     assert config.baseline_cache_dir is None
     assert config.control_cache_dir is None
+
+
+def test_production_loader_honors_docker_capability_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runs = tmp_path / "runs"
+    data = tmp_path / "data"
+    baseline_cache = runs / "cache" / "baseline"
+    control_cache = runs / "cache" / "controls"
+    linux_lock = repo_root() / "requirements-lock-linux-arm64.txt"
+    monkeypatch.setenv("REX_SOURCE_ROOT", str(repo_root()))
+    monkeypatch.setenv("REX_RUNS_ROOT", str(runs))
+    monkeypatch.setenv("REX_DATA_ROOT", str(data))
+    monkeypatch.setenv("REX_BASELINE_CACHE_DIR", str(baseline_cache))
+    monkeypatch.setenv("REX_CONTROL_CACHE_DIR", str(control_cache))
+    monkeypatch.setenv("REX_ENVIRONMENT_LOCK", str(linux_lock))
+
+    config = ProductionRunConfig.load(repo_root() / "configs/run/production.yaml")
+
+    assert config.project_root == repo_root()
+    assert config.runs_dir == runs
+    assert config.raw_data_dir == data
+    assert config.data_manifest == runs / "data" / "data_manifest.json"
+    assert config.baseline_cache_dir == baseline_cache
+    assert config.control_cache_dir == control_cache
+    assert config.environment_lock == linux_lock
 
 
 def test_proposal_context_contains_versioned_method_card_and_only_evidence_ids() -> None:

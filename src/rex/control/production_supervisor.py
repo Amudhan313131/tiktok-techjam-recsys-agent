@@ -89,6 +89,7 @@ class ProductionRunConfig:
     scientific_execution: dict[str, Any] = field(default_factory=dict)
     baseline_cache_dir: Path | None = None
     control_cache_dir: Path | None = None
+    runtime_environment_identity: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: str | Path) -> "ProductionRunConfig":
@@ -98,7 +99,10 @@ class ProductionRunConfig:
             raise ValueError("production run configuration must be a YAML mapping")
         if raw.get("execution_mode") != "production":
             raise RuntimeError("production configuration requires execution_mode: production")
-        root = repo_root()
+        # Docker is the production filesystem contract.  The controller sees a
+        # read-only source tree plus separate data and run capabilities; native
+        # development keeps the historic repository-relative defaults.
+        root = Path(os.environ.get("REX_SOURCE_ROOT", repo_root())).resolve()
 
         def resolve(value: str) -> Path:
             item = Path(value)
@@ -126,31 +130,69 @@ class ProductionRunConfig:
         scientific_execution = raw.get("scientific_execution", {})
         if not isinstance(scientific_execution, dict):
             raise ValueError("scientific_execution must be a mapping")
+        runs_override = os.environ.get("REX_RUNS_ROOT")
+        runs_dir = (
+            Path(runs_override).resolve()
+            if runs_override
+            else resolve(str(raw.get("runs_dir", "runs")))
+        )
+        data_manifest_override = os.environ.get("REX_DATA_MANIFEST")
+        data_manifest = (
+            Path(data_manifest_override).resolve()
+            if data_manifest_override
+            else (
+                runs_dir / "data" / "data_manifest.json"
+                if runs_override
+                else resolve(str(raw.get("data_manifest", "runs/data/manifest.json")))
+            )
+        )
+        raw_data_override = os.environ.get("REX_DATA_ROOT")
+        environment_lock_override = os.environ.get("REX_ENVIRONMENT_LOCK")
+        baseline_cache_override = os.environ.get("REX_BASELINE_CACHE_DIR")
+        control_cache_override = os.environ.get("REX_CONTROL_CACHE_DIR")
         config = cls(
             source_path=candidate,
             project_root=resolve(str(raw.get("project_root", "."))),
-            runs_dir=resolve(str(raw.get("runs_dir", "runs"))),
+            runs_dir=runs_dir,
             budget_config=resolve(str(raw.get("budget_config", "configs/budget.yaml"))),
             protected_paths=resolve(
                 str(raw.get("protected_paths", "configs/security/protected_paths.yaml"))
             ),
-            data_manifest=resolve(str(raw.get("data_manifest", "runs/data/manifest.json"))),
+            data_manifest=data_manifest,
             evaluator_path=resolve(
                 str(raw.get("evaluator_path", "kuairand-starter-kit/evaluate.py"))
             ),
-            environment_lock=resolve(str(raw.get("environment_lock", "requirements-lock.txt"))),
+            environment_lock=(
+                Path(environment_lock_override).resolve()
+                if environment_lock_override
+                else resolve(str(raw.get("environment_lock", "requirements-lock.txt")))
+            ),
             scientific_execution_enabled=bool(raw.get("scientific_execution_enabled", False)),
             process_stale_after_seconds=int(raw.get("process_stale_after_seconds", 900)),
             cleanup_worktrees=bool(raw.get("cleanup_worktrees", True)),
             method_cards=bindings,
             llm=dict(raw.get("llm", {})),
-            raw_data_dir=resolve(str(raw.get("raw_data_dir", "data/KuaiRand-Pure/data"))),
+            raw_data_dir=(
+                Path(raw_data_override).resolve()
+                if raw_data_override
+                else resolve(str(raw.get("raw_data_dir", "data/KuaiRand-Pure/data")))
+            ),
             scientific_execution=dict(scientific_execution),
             baseline_cache_dir=(
-                resolve(str(raw["baseline_cache_dir"])) if raw.get("baseline_cache_dir") else None
+                Path(baseline_cache_override).resolve()
+                if baseline_cache_override
+                else (
+                    resolve(str(raw["baseline_cache_dir"]))
+                    if raw.get("baseline_cache_dir")
+                    else None
+                )
             ),
             control_cache_dir=(
-                resolve(str(raw["control_cache_dir"])) if raw.get("control_cache_dir") else None
+                Path(control_cache_override).resolve()
+                if control_cache_override
+                else (
+                    resolve(str(raw["control_cache_dir"])) if raw.get("control_cache_dir") else None
+                )
             ),
         )
         if config.process_stale_after_seconds <= 0:
@@ -338,6 +380,7 @@ def environment_provenance_sha256(config: ProductionRunConfig) -> str:
         "python": sys.version,
         "platform": platform.platform(),
         "files": {},
+        "production_runtime": dict(sorted(config.runtime_environment_identity.items())),
     }
     for path in paths:
         if path.is_file():
@@ -437,9 +480,18 @@ class ProductionAutopilot:
             external_deadline_epoch_ms
         ):
             raise RuntimeError("production run deadline differs from the R3 envelope")
-        if RunState(run["state"]) == RunState.COMPLETE:
-            return self.status(identifier)
-
+        runtime_identity_ref: ArtifactRef | None = None
+        if self.config.runtime_environment_identity:
+            identity_path = run_dir / "evidence" / "environment_identity.json"
+            atomic_write_json(
+                identity_path,
+                {
+                    "schema_version": "rex.production-environment.v1",
+                    **dict(sorted(self.config.runtime_environment_identity.items())),
+                },
+            )
+            runtime_identity_ref = artifact_ref(identity_path, "runtime_environment_identity")
+            repository.register_artifact(runtime_identity_ref)
         context = ProductionContext(
             run_id=identifier,
             run_dir=run_dir,
@@ -447,12 +499,17 @@ class ProductionAutopilot:
             root_commit=root_commit,
             deadline_epoch_ms=int(run["deadline_epoch_ms"]),
         )
+        if RunState(run["state"]) == RunState.COMPLETE:
+            return self._finalize(repository, context)
         session_id = f"production-session-{uuid.uuid4().hex}"
         session_started = time.monotonic()
+        session_host = os.environ.get("REX_PROCESS_SESSION_HOST") or None
         repository.open_process_session(
             session_id=session_id,
             run_id=identifier,
+            host=session_host,
             stale_after_seconds=self.config.process_stale_after_seconds if run_id else None,
+            proven_dead_session_ids=self._proven_dead_docker_sessions(repository, identifier),
         )
         heartbeat_stop = threading.Event()
         heartbeat = threading.Thread(
@@ -462,6 +519,20 @@ class ProductionAutopilot:
         )
         heartbeat.start()
         closed = False
+
+        def close_session(exit_reason: str) -> None:
+            nonlocal closed
+            if closed:
+                return
+            heartbeat_stop.set()
+            heartbeat.join(timeout=10)
+            repository.close_process_session(
+                session_id,
+                exit_reason=exit_reason,
+                monotonic_seconds=time.monotonic() - session_started,
+            )
+            closed = True
+
         try:
             state = RunState(repository.get_run(identifier)["state"])
             if state == RunState.INITIALIZING:
@@ -484,7 +555,14 @@ class ProductionAutopilot:
                 repository.establish_baseline(
                     run_id=identifier,
                     metrics=baseline.metrics,
-                    evidence_artifact_ids=[item.artifact_id for item in baseline.artifacts],
+                    evidence_artifact_ids=[
+                        *[item.artifact_id for item in baseline.artifacts],
+                        *(
+                            [runtime_identity_ref.artifact_id]
+                            if runtime_identity_ref is not None
+                            else []
+                        ),
+                    ],
                 )
                 repository.transition_run(
                     identifier, RunState.BASELINE_VERIFYING, RunState.SEARCHING
@@ -495,6 +573,7 @@ class ProductionAutopilot:
                     repository.transition_run(
                         identifier, RunState.BUDGET_EXHAUSTED, RunState.FINALIZING
                     )
+                close_session("production_complete")
                 return self._finalize(repository, context)
             if state != RunState.SEARCHING:
                 return self.status(identifier)
@@ -522,25 +601,17 @@ class ProductionAutopilot:
                 except ProductionPreparationRejected:
                     continue
                 self._run_candidate(repository, context, prepared.proposal.experiment_id)
+            close_session("production_complete")
             return self._finalize(repository, context)
         except BaseException:
             raise
         finally:
-            heartbeat_stop.set()
-            heartbeat.join(timeout=10)
-            try:
-                repository.close_process_session(
-                    session_id,
-                    exit_reason=(
-                        "production_complete"
-                        if RunState(repository.get_run(identifier)["state"]) == RunState.COMPLETE
-                        else "production_interrupted"
-                    ),
-                    monotonic_seconds=time.monotonic() - session_started,
-                )
-                closed = True
-            except RepositoryError:
-                if not closed:
+            if not closed:
+                heartbeat_stop.set()
+                heartbeat.join(timeout=10)
+                try:
+                    close_session("production_interrupted")
+                except RepositoryError:
                     pass
 
     def _new_deadline(self, external_deadline_epoch_ms: int | None) -> int:
@@ -693,6 +764,61 @@ class ProductionAutopilot:
                 repository.heartbeat_process_session(session_id, time.monotonic() - started)
             except RepositoryError:
                 continue
+
+    @staticmethod
+    def _proven_dead_docker_sessions(
+        repository: ExperimentRepository, run_id: str
+    ) -> frozenset[str]:
+        """Prove exact prior controller containers stopped before immediate takeover."""
+
+        if os.environ.get("REX_PRODUCTION_RUNTIME", "docker").strip().lower() != "docker":
+            return frozenset()
+        with repository.database.connect() as connection:
+            rows = connection.execute(
+                "SELECT session_id,host FROM process_sessions WHERE run_id=? AND ended_at IS NULL",
+                (run_id,),
+            ).fetchall()
+        proven: set[str] = set()
+        for row in rows:
+            host = str(row["host"])
+            full_container_id = re.fullmatch(r"[0-9a-f]{64}", host) is not None
+            named_controller = re.fullmatch(r"rex-[a-z0-9][a-z0-9_.-]{0,127}", host) is not None
+            if not full_container_id and not named_controller:
+                continue
+            inspected = subprocess.run(
+                ["docker", "container", "inspect", host],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if inspected.returncode != 0:
+                if full_container_id and "No such container" in inspected.stderr:
+                    proven.add(str(row["session_id"]))
+                continue
+            try:
+                payload = json.loads(inspected.stdout)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, list) or len(payload) != 1:
+                continue
+            container = payload[0]
+            labels = container.get("Config", {}).get("Labels", {})
+            state = container.get("State", {})
+            if (
+                isinstance(labels, dict)
+                and labels.get("rex.managed") == "true"
+                and labels.get("rex.role") == "controller"
+                and (
+                    labels.get("rex.run_id") == run_id
+                    or (full_container_id and labels.get("rex.run_id") is None)
+                )
+                and container.get("Image") == os.environ.get("REX_EXPECTED_IMAGE_DIGEST")
+                and isinstance(state, dict)
+                and state.get("Running") is False
+            ):
+                proven.add(str(row["session_id"]))
+        return frozenset(proven)
 
     def _stop_reason(self, run: dict[str, Any]) -> str | None:
         if run["stop_reason"] == "epsilon_plateau":
@@ -2194,8 +2320,34 @@ class ProductionAutopilot:
         context: ProductionContext,
     ) -> dict[str, Any]:
         run = repository.get_run(context.run_id)
-        if RunState(run["state"]) != RunState.FINALIZING:
+        state = RunState(run["state"])
+        if state not in {RunState.FINALIZING, RunState.COMPLETE}:
             raise RuntimeError("production finalization requires FINALIZING state")
+        report_root = context.run_dir / "report"
+        report_index = report_root / "evidence_index.json"
+        best_manifest = context.run_dir / "best-valid" / "best_valid_manifest.json"
+        if state == RunState.COMPLETE and best_manifest.is_file():
+            if not report_index.is_file():
+                raise RuntimeError("completed best-valid seal exists without its source report")
+            try:
+                best_payload = json.loads(best_manifest.read_text(encoding="utf-8"))
+                copied_report = best_payload["artifacts"]["evidence_index.json"]
+                copied_sha256 = str(copied_report["sha256"])
+            except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError) as error:
+                raise RuntimeError(f"completed best-valid seal is malformed: {error}") from error
+            if copied_sha256 != sha256_file(report_index):
+                raise RuntimeError("completed best-valid seal does not match its source report")
+            return {
+                **self.status(context.run_id),
+                "report": {
+                    "evidence_index": artifact_ref(report_index, "evidence_index").model_dump(
+                        mode="json"
+                    )
+                },
+                "best_valid_bundle": artifact_ref(best_manifest, "best_valid_manifest").model_dump(
+                    mode="json"
+                ),
+            }
         with repository.database.connect() as connection:
             experiment_ids = [
                 str(row["experiment_id"])
@@ -2205,11 +2357,12 @@ class ProductionAutopilot:
             ]
         for experiment_id in experiment_ids:
             self._cleanup_worktree(repository, context, experiment_id)
+        if state == RunState.FINALIZING:
+            repository.transition_run(
+                context.run_id, RunState.FINALIZING, RunState.COMPLETE, run["stop_reason"]
+            )
         report = build_report(repository.database, context.run_id, context.run_dir / "report")
         best_valid = self._create_best_valid(repository, context, report)
-        repository.transition_run(
-            context.run_id, RunState.FINALIZING, RunState.COMPLETE, run["stop_reason"]
-        )
         return {**self.status(context.run_id), "report": report, "best_valid_bundle": best_valid}
 
     def _create_best_valid(

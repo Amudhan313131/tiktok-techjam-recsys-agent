@@ -111,8 +111,56 @@ def _source_fixture(tmp_path: Path, *, state: str = "COMPLETE") -> SourceFixture
         "experiment_graph.json": '{"nodes":[]}\n',
         "experiments.md": "# Experiments\n",
         "interventions.json": "[]\n",
+        "manual_interventions.json": json.dumps(
+            {"manual_intervention_count": 0, "manual_interventions": []}
+        ),
+        "manual_interventions.md": "# Manual intervention summary\n\nNone.\n",
         "iteration_logs.json": "[]\n",
-        "resources.json": '{"wall_seconds":1}\n',
+        "resources.json": json.dumps(
+            {
+                "wall_seconds": 1,
+                "agent_wall_seconds": 1,
+                "llm_input_tokens": 7,
+                "llm_output_tokens": 3,
+                "llm_total_tokens": 10,
+                "iterations_used": 1,
+                "iteration_cap": 50,
+                "gpu_hours": 0.0,
+            }
+        ),
+        "results.json": json.dumps(
+            {
+                "dataset": "KuaiRand-Pure",
+                "validation_best": {
+                    "GAUC": 0.62,
+                    "nDCG@5": 0.58,
+                    "primary": 0.60,
+                    "split": "valid",
+                },
+                "validation_best_experiment_id": "candidate-001",
+                "official_baseline": {
+                    "GAUC": 0.6674,
+                    "nDCG@5": 0.5357,
+                    "primary": 0.6016,
+                    "split": "valid",
+                },
+                "delta_over_official_baseline": {
+                    "GAUC": -0.0474,
+                    "nDCG@5": 0.0443,
+                    "primary": -0.0016,
+                },
+                "hidden_test_scored_locally": False,
+            }
+        ),
+        "artifact_summary.json": "{}\n",
+        "recovery_events.json": "{}\n",
+        "environment_identity.json": json.dumps(
+            {
+                "runtime_kind": "docker",
+                "worker_image_digest": "sha256:" + "9" * 64,
+                "container_platform": "linux/arm64",
+            }
+        ),
     }
     for name, content in report_files.items():
         (report / name).write_text(content, encoding="utf-8")
@@ -315,6 +363,28 @@ def test_submission_job_runs_twice_checked_seals_and_hands_off(
     assert (sealed / "best-valid" / "model" / "model_bundle.json").is_file()
     assert (sealed / "source-report" / "events.jsonl").is_file()
     assert "source-report/resources.json" in seal["artifacts"]
+    summary_path = sealed / "final_results_summary.json"
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert seal["final_results_summary_sha256"] == sha256_file(summary_path)
+    assert summary["kind"] == "final_results_summary"
+    assert summary["submission_columns"] == ["row_id", "user_id", "video_id", "score"]
+    assert summary["organizer_checks"] == 2
+    assert summary["test_scored_locally"] is False
+    assert summary["validation_results"]["best"]["GAUC"] == 0.62
+    assert summary["validation_results"]["best"]["nDCG@5"] == 0.58
+    assert summary["resource_usage"]["iteration_cap"] == 50
+    assert summary["resource_usage"]["llm_total_tokens"] == 10
+    assert summary["resource_usage"]["manual_intervention_count"] == 0
+    assert summary["artifacts"]["submission_csv"]["sha256"] == ready["csv_sha256"]
+    assert summary["artifacts"]["test_predictions"]["sha256"] == ready["prediction_sha256"]
+    assert summary["source_identity"]["commit_sha"] == source.commit
+    assert summary["source_identity"]["environment"]["runtime_kind"] == "docker"
+    assert summary["source_identity"]["environment"]["worker_image_digest"] == (
+        "sha256:" + "9" * 64
+    )
+    assert summary["source_identity"]["environment_evidence"]["sha256"] == sha256_file(
+        sealed / "source-report" / "environment_identity.json"
+    )
 
     target = tmp_path / "authorized-handoff"
     handed = coordinator.handoff(
@@ -371,11 +441,35 @@ def test_checker_with_scoring_capability_is_rejected(tmp_path: Path) -> None:
         coordinator.advance(job["job_id"])
 
 
+def test_docker_final_summary_requires_immutable_image_digest(tmp_path: Path) -> None:
+    source = _source_fixture(tmp_path)
+    identity = source.production_db.parent / "report" / "environment_identity.json"
+    identity.write_text(
+        json.dumps({"runtime_kind": "docker", "worker_image_digest": "latest"}),
+        encoding="utf-8",
+    )
+    coordinator, repository, _, _ = _coordinator(tmp_path, source)
+    job = coordinator.create(source.production_db, source.run_id)
+
+    with pytest.raises(SubmissionCoordinatorError, match="immutable worker image digest"):
+        coordinator.run_until_ready(job["job_id"])
+    assert repository.get_job(job["job_id"])["state"] == SubmissionState.SECOND_CHECK_VALID
+
+
 def test_incomplete_production_run_cannot_create_submission_job(tmp_path: Path) -> None:
     source = _source_fixture(tmp_path, state="SEARCHING")
     coordinator, _, _, _ = _coordinator(tmp_path, source)
 
     with pytest.raises(SubmissionRepositoryError, match="must be COMPLETE"):
+        coordinator.create(source.production_db, source.run_id)
+
+
+def test_incomplete_judge_report_cannot_create_submission_job(tmp_path: Path) -> None:
+    source = _source_fixture(tmp_path)
+    (source.production_db.parent / "report" / "results.json").unlink()
+    coordinator, _, _, _ = _coordinator(tmp_path, source)
+
+    with pytest.raises(SubmissionRepositoryError, match="results.json"):
         coordinator.create(source.production_db, source.run_id)
 
 

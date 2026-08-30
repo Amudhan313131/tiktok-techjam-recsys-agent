@@ -178,6 +178,199 @@ def _safe_relative(root: Path, relative_name: str) -> Path:
     return candidate
 
 
+def _json_mapping(path: Path) -> dict[str, Any]:
+    if path.is_symlink() or not path.is_file():
+        raise SubmissionCoordinatorError(f"required report artifact is missing: {path.name}")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise SubmissionCoordinatorError(f"invalid report artifact {path.name}: {error}") from error
+    if not isinstance(value, dict):
+        raise SubmissionCoordinatorError(f"report artifact is not an object: {path.name}")
+    return value
+
+
+def _file_evidence(path: Path, root: Path) -> dict[str, Any]:
+    if path.is_symlink() or not path.is_file():
+        raise SubmissionCoordinatorError(f"sealed evidence is missing or unsafe: {path}")
+    try:
+        relative = path.resolve().relative_to(root.resolve()).as_posix()
+    except ValueError as error:
+        raise SubmissionCoordinatorError(f"sealed evidence escapes its root: {path}") from error
+    return {
+        "path": relative,
+        "sha256": sha256_file(path),
+        "size_bytes": path.stat().st_size,
+    }
+
+
+def _final_results_summary(
+    staging: Path,
+    job: Mapping[str, Any],
+    source: VerifiedSource,
+    *,
+    expected_test_rows: int,
+) -> dict[str, Any]:
+    """Build the self-contained, validation-only summary placed inside the seal."""
+
+    report_root = staging / "source-report"
+    results_path = report_root / "results.json"
+    resources_path = report_root / "resources.json"
+    interventions_path = report_root / "manual_interventions.json"
+    if results_path.is_file():
+        results = _json_mapping(results_path)
+    else:  # Compatibility for historical completed runs created before report v1.
+        metrics = Metrics.model_validate(source.manifest["metrics"])
+        official = {"GAUC": 0.6674, "nDCG@5": 0.5357, "primary": 0.6016}
+        selected = {
+            "GAUC": metrics.GAUC,
+            "nDCG@5": metrics.ndcg5,
+            "primary": metrics.primary,
+            "split": metrics.split,
+        }
+        results = {
+            "dataset": "KuaiRand-Pure",
+            "validation_best": selected,
+            "validation_best_experiment_id": source.incumbent_experiment_id,
+            "official_baseline": {**official, "split": "valid"},
+            "delta_over_official_baseline": {
+                name: float(selected[name]) - value for name, value in official.items()
+            },
+            "hidden_test_scored_locally": False,
+            "legacy_report_fallback": True,
+        }
+    resources = _json_mapping(resources_path)
+    if interventions_path.is_file():
+        interventions = _json_mapping(interventions_path)
+    else:
+        legacy = json.loads((report_root / "interventions.json").read_text(encoding="utf-8"))
+        interventions = {
+            "manual_intervention_count": len(legacy) if isinstance(legacy, list) else 0,
+            "legacy_report_fallback": True,
+        }
+    if results.get("hidden_test_scored_locally") is not False:
+        raise SubmissionCoordinatorError("source report does not prove validation-only scoring")
+    validation_best = results.get("validation_best")
+    if not isinstance(validation_best, dict) or validation_best.get("split") != "valid":
+        raise SubmissionCoordinatorError("source report has no validation-best result")
+    source_metrics = Metrics.model_validate(source.manifest["metrics"])
+    observed_metrics = Metrics(
+        GAUC=float(validation_best["GAUC"]),
+        **{"nDCG@5": float(validation_best["nDCG@5"])},
+        primary=float(validation_best["primary"]),
+        users=source_metrics.users,
+        rows=source_metrics.rows,
+        evaluator_sha256=source_metrics.evaluator_sha256,
+        split="valid",
+        fold=source_metrics.fold,
+        seed=source_metrics.seed,
+    )
+    for expected, observed in (
+        (source_metrics.GAUC, observed_metrics.GAUC),
+        (source_metrics.ndcg5, observed_metrics.ndcg5),
+        (source_metrics.primary, observed_metrics.primary),
+    ):
+        if not math.isclose(expected, observed, rel_tol=0.0, abs_tol=1e-6):
+            raise SubmissionCoordinatorError(
+                "source report validation winner disagrees with best-valid manifest"
+            )
+
+    model_manifest = staging / "best-valid/model/model_bundle.json"
+    loaded = validate_model_bundle(
+        model_manifest,
+        expected_commit_sha=source.commit_sha,
+        expected_config_sha256=source.config_sha256,
+    )
+    checkpoint = model_manifest.parent / loaded.manifest.primary_member
+    configs = sorted((staging / "best-valid").glob("config.*"))
+    if len(configs) != 1:
+        raise SubmissionCoordinatorError("sealed bundle has no unique experiment config")
+    checker_paths = [staging / "checks/first.json", staging / "checks/second.json"]
+    report_files = [
+        report_root / name
+        for name in (
+            "evidence_index.json",
+            "events.jsonl",
+            "iteration_logs.json",
+            "experiments.md",
+            "resources.json",
+        )
+    ]
+    if results_path.is_file():
+        report_files.append(results_path)
+    if interventions_path.is_file():
+        report_files.append(interventions_path)
+
+    environment_path = report_root / "environment_identity.json"
+    if environment_path.is_file():
+        environment_identity = _json_mapping(environment_path)
+        environment_evidence: dict[str, Any] | None = _file_evidence(environment_path, staging)
+    else:
+        environment_identity = {
+            "runtime_kind": "legacy",
+            "environment_sha256": source.locator.source_run["environment_sha256"],
+            "worker_image_digest": None,
+        }
+        environment_evidence = None
+    if environment_identity.get("runtime_kind") == "docker" and not str(
+        environment_identity.get("worker_image_digest") or ""
+    ).startswith("sha256:"):
+        raise SubmissionCoordinatorError("Docker report has no immutable worker image digest")
+
+    total_tokens = int(resources.get("llm_total_tokens", resources.get("llm_tokens", 0)))
+    return {
+        "schema_version": "1.0",
+        "kind": "final_results_summary",
+        "job_id": job["job_id"],
+        "source_run_id": job["source_run_id"],
+        "benchmark": "KuaiRand-Pure",
+        "test_rows": expected_test_rows,
+        "submission_columns": ["row_id", "user_id", "video_id", "score"],
+        "organizer_checks": 2,
+        "test_scored_locally": False,
+        "validation_results": {
+            "best": validation_best,
+            "official_baseline": results.get("official_baseline"),
+            "delta_over_official_baseline": results.get("delta_over_official_baseline"),
+            "winner_experiment_id": source.incumbent_experiment_id,
+        },
+        "resource_usage": {
+            "llm_input_tokens": int(resources.get("llm_input_tokens", 0)),
+            "llm_output_tokens": int(resources.get("llm_output_tokens", 0)),
+            "llm_total_tokens": total_tokens,
+            "agent_wall_seconds": float(
+                resources.get("agent_wall_seconds", resources.get("wall_seconds", 0.0))
+            ),
+            "iterations_used": int(
+                resources.get("iterations_used", resources.get("iterations", 0))
+            ),
+            "iteration_cap": int(resources.get("iteration_cap", 50)),
+            "gpu_hours": float(resources.get("gpu_hours", 0.0)),
+            "manual_intervention_count": int(interventions.get("manual_intervention_count", 0)),
+        },
+        "source_identity": {
+            "commit_sha": source.commit_sha,
+            "config_sha256": source.config_sha256,
+            "source_report_sha256": job["source_report_sha256"],
+            "best_valid_sha256": job["best_valid_sha256"],
+            "environment": environment_identity,
+            "environment_evidence": environment_evidence,
+        },
+        "artifacts": {
+            "submission_csv": _file_evidence(staging / "submission.csv", staging),
+            "test_predictions": _file_evidence(staging / "test_predictions.npz", staging),
+            "model_bundle": _file_evidence(model_manifest, staging),
+            "primary_checkpoint": _file_evidence(checkpoint, staging),
+            "experiment_config": _file_evidence(configs[0], staging),
+            "source_report": {
+                "fingerprint_sha256": job["source_report_sha256"],
+                "files": [_file_evidence(path, staging) for path in report_files],
+            },
+            "checker_evidence": [_file_evidence(path, staging) for path in checker_paths],
+        },
+    }
+
+
 class FinalSubmissionCoordinator:
     """Advance a final-submission job through durable, replayable gates."""
 
@@ -260,9 +453,7 @@ class FinalSubmissionCoordinator:
                 raise SubmissionCoordinatorError("one-time handoff cannot be redirected")
             return job
         if state == SubmissionState.READY_FOR_HANDOFF:
-            self.repository.authorize_handoff(
-                job_id, authorized_seal_sha256, Path(target_dir)
-            )
+            self.repository.authorize_handoff(job_id, authorized_seal_sha256, Path(target_dir))
             job = self.repository.get_job(job_id)
         if SubmissionState(job["state"]) != SubmissionState.HANDOFF_IN_PROGRESS:
             raise SubmissionCoordinatorError("submission is not ready for handoff")
@@ -271,7 +462,9 @@ class FinalSubmissionCoordinator:
             handoff["authorized_seal_sha256"] != authorized_seal_sha256
             or Path(handoff["target_path"]).resolve() != Path(target_dir).resolve()
         ):
-            raise SubmissionCoordinatorError("handoff request conflicts with one-time authorization")
+            raise SubmissionCoordinatorError(
+                "handoff request conflicts with one-time authorization"
+            )
         copied = self.handoff_transport(
             Path(job["sealed_path"]), Path(handoff["target_path"]), authorized_seal_sha256
         )
@@ -291,9 +484,7 @@ class FinalSubmissionCoordinator:
     def fail(self, job_id: str, *, code: str, summary: str) -> dict[str, Any]:
         """Explicitly close an unrecoverable job; ordinary exceptions remain resumable."""
 
-        return self.repository.terminate(
-            job_id, SubmissionState.FAILED, code=code, summary=summary
-        )
+        return self.repository.terminate(job_id, SubmissionState.FAILED, code=code, summary=summary)
 
     def _verify_source(self, job: Mapping[str, Any]) -> dict[str, Any]:
         source = self._strict_source(job)
@@ -372,16 +563,23 @@ class FinalSubmissionCoordinator:
             or not required.issubset(manifest)
             or set(manifest).difference(allowed)
         ):
-            raise SubmissionCoordinatorError("best-valid manifest does not satisfy the strict schema")
+            raise SubmissionCoordinatorError(
+                "best-valid manifest does not satisfy the strict schema"
+            )
         if (
             manifest["kind"] != "best_valid"
             or manifest["run_id"] != locator.source_run_id
             or manifest["test_prediction_created"] is not False
         ):
-            raise SubmissionCoordinatorError("best-valid manifest identity or split policy is invalid")
+            raise SubmissionCoordinatorError(
+                "best-valid manifest identity or split policy is invalid"
+            )
         if manifest.get("test_scored", False) is not False:
             raise SubmissionCoordinatorError("best-valid manifest claims test scoring")
-        if "validation_metrics" in manifest and manifest["validation_metrics"] != manifest["metrics"]:
+        if (
+            "validation_metrics" in manifest
+            and manifest["validation_metrics"] != manifest["metrics"]
+        ):
             raise SubmissionCoordinatorError("best-valid validation metrics disagree")
         try:
             Metrics.model_validate(manifest["metrics"])
@@ -409,10 +607,9 @@ class FinalSubmissionCoordinator:
                 )
         evidence_reference = artifacts.get("evidence_index.json")
         report_evidence = locator.source_report_path / "evidence_index.json"
-        if (
-            not isinstance(evidence_reference, dict)
-            or evidence_reference.get("sha256") != sha256_file(report_evidence)
-        ):
+        if not isinstance(evidence_reference, dict) or evidence_reference.get(
+            "sha256"
+        ) != sha256_file(report_evidence):
             raise SubmissionCoordinatorError(
                 "best-valid evidence index is not the immutable completed-run report"
             )
@@ -426,7 +623,9 @@ class FinalSubmissionCoordinator:
                 expected_config_sha256=config_hash,
             )
         except Exception as error:
-            raise SubmissionCoordinatorError(f"best-valid model bundle is invalid: {error}") from error
+            raise SubmissionCoordinatorError(
+                f"best-valid model bundle is invalid: {error}"
+            ) from error
         if manifest.get("model_bundle_sha256", sha256_file(model_path)) != sha256_file(model_path):
             raise SubmissionCoordinatorError("best-valid model-bundle digest disagrees")
         config_names = [
@@ -477,7 +676,9 @@ class FinalSubmissionCoordinator:
                 raise SubmissionCoordinatorError("registered best-valid artifact hash disagrees")
             if incumbent == "baseline":
                 if commit != locator.source_run["root_commit"]:
-                    raise SubmissionCoordinatorError("baseline best-valid commit is not the run root")
+                    raise SubmissionCoordinatorError(
+                        "baseline best-valid commit is not the run root"
+                    )
                 return
             experiment = connection.execute(
                 "SELECT commit_sha,config_sha256 FROM experiments WHERE run_id=? AND experiment_id=?",
@@ -490,9 +691,7 @@ class FinalSubmissionCoordinator:
         if experiment["commit_sha"] != commit or experiment["config_sha256"] != config_sha256:
             raise SubmissionCoordinatorError("best-valid provenance disagrees with production DB")
 
-    def _prepare_worktree(
-        self, job: Mapping[str, Any], source: VerifiedSource
-    ) -> dict[str, Any]:
+    def _prepare_worktree(self, job: Mapping[str, Any], source: VerifiedSource) -> dict[str, Any]:
         root = (self.config.jobs_root / str(job["job_id"])).resolve()
         worktree = root / "worktree"
         repository = self.config.repository_root.resolve(strict=True)
@@ -511,9 +710,7 @@ class FinalSubmissionCoordinator:
             updates={"worktree_path": str(worktree)},
         )
 
-    def _prediction_request(
-        self, job: Mapping[str, Any], source: VerifiedSource
-    ) -> RunRequest:
+    def _prediction_request(self, job: Mapping[str, Any], source: VerifiedSource) -> RunRequest:
         stored = job.get("prediction_request_json")
         if stored:
             return RunRequest.model_validate_json(stored)
@@ -566,9 +763,7 @@ class FinalSubmissionCoordinator:
                     "split": "test",
                     "target_view_path": None,
                 },
-                updates={
-                    "prediction_request_json": request.model_dump_json(by_alias=True)
-                },
+                updates={"prediction_request_json": request.model_dump_json(by_alias=True)},
             )
         else:
             request = RunRequest.model_validate_json(str(job["prediction_request_json"]))
@@ -719,14 +914,10 @@ class FinalSubmissionCoordinator:
         self._require_check_only_command(command, csv_path)
         if not result.valid or result.returncode != 0:
             raise SubmissionCoordinatorError(
-                f"organizer checker {ordinal} rejected submission: "
-                f"{result.stdout}\n{result.stderr}"
+                f"organizer checker {ordinal} rejected submission: {result.stdout}\n{result.stderr}"
             )
         transcript = (
-            self.config.jobs_root
-            / str(job["job_id"])
-            / "checks"
-            / f"checker-{ordinal}.json"
+            self.config.jobs_root / str(job["job_id"]) / "checks" / f"checker-{ordinal}.json"
         ).resolve()
         atomic_write_json(
             transcript,
@@ -792,9 +983,7 @@ class FinalSubmissionCoordinator:
             evidence={"checker_transcript_sha256": sha256_file(transcript)},
         )
 
-    def _stage_and_check(
-        self, job: Mapping[str, Any], source: VerifiedSource
-    ) -> dict[str, Any]:
+    def _stage_and_check(self, job: Mapping[str, Any], source: VerifiedSource) -> dict[str, Any]:
         state = SubmissionState(job["state"])
         staging = (self.config.jobs_root / str(job["job_id"]) / "final.staging").resolve()
         if state == SubmissionState.FIRST_CHECK_VALID:
@@ -850,6 +1039,16 @@ class FinalSubmissionCoordinator:
             checks_dir = staging / "checks"
             checks_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy2(second, checks_dir / "second.json")
+            final_results_path = staging / "final_results_summary.json"
+            atomic_write_json(
+                final_results_path,
+                _final_results_summary(
+                    staging,
+                    job,
+                    source,
+                    expected_test_rows=self.config.expected_test_rows,
+                ),
+            )
             required_files = (
                 staging / "submission.csv",
                 staging / "test_predictions.npz",
@@ -859,6 +1058,7 @@ class FinalSubmissionCoordinator:
                 staging / "source-report" / "resources.json",
                 staging / "checks" / "first.json",
                 staging / "checks" / "second.json",
+                final_results_path,
             )
             if any(not path.is_file() for path in required_files):
                 raise SubmissionCoordinatorError("staged final bundle is incomplete")
@@ -898,6 +1098,7 @@ class FinalSubmissionCoordinator:
                     "expected_test_rows": self.config.expected_test_rows,
                     "submission_sha256": job["csv_sha256"],
                     "prediction_sha256": job["prediction_sha256"],
+                    "final_results_summary_sha256": sha256_file(final_results_path),
                     "organizer_checks": 2,
                     "test_scored": False,
                     "artifacts": artifact_hashes,
@@ -917,9 +1118,7 @@ class FinalSubmissionCoordinator:
             updates={"sealed_path": str(sealed), "seal_sha256": seal_hash},
         )
 
-    def _validate_sealed(
-        self, sealed: Path, job: Mapping[str, Any], source: VerifiedSource
-    ) -> str:
+    def _validate_sealed(self, sealed: Path, job: Mapping[str, Any], source: VerifiedSource) -> str:
         manifest_path = sealed / FilesystemHandoff.manifest_name
         if not manifest_path.is_file() or manifest_path.is_symlink():
             raise SubmissionCoordinatorError("partial sealed directory has no regular manifest")
@@ -927,6 +1126,9 @@ class FinalSubmissionCoordinator:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
             raise SubmissionCoordinatorError(f"sealed manifest is invalid: {error}") from error
+        final_results_path = sealed / "final_results_summary.json"
+        if final_results_path.is_symlink() or not final_results_path.is_file():
+            raise SubmissionCoordinatorError("sealed bundle has no final results summary")
         expected = {
             "kind": "sealed_final_submission",
             "job_id": job["job_id"],
@@ -938,6 +1140,7 @@ class FinalSubmissionCoordinator:
             "expected_test_rows": self.config.expected_test_rows,
             "submission_sha256": job["csv_sha256"],
             "prediction_sha256": job["prediction_sha256"],
+            "final_results_summary_sha256": sha256_file(final_results_path),
             "organizer_checks": 2,
             "test_scored": False,
         }

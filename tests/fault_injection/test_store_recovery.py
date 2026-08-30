@@ -144,6 +144,34 @@ def test_dead_same_host_pid_is_taken_over_without_waiting_for_timeout(tmp_path: 
     assert stale["exit_reason"] == "dead_process_takeover"
 
 
+def test_exact_dead_docker_controller_proof_allows_immediate_takeover(
+    tmp_path: Path,
+) -> None:
+    repository, database, run_id = _repository(tmp_path)
+    repository.open_process_session(
+        session_id="docker-owner",
+        run_id=run_id,
+        pid=1,
+        host="rex-run-initial",
+    )
+
+    takeover = repository.open_process_session(
+        session_id="docker-recovery",
+        run_id=run_id,
+        pid=1,
+        host="rex-run-resumed",
+        stale_after_seconds=900,
+        proven_dead_session_ids=frozenset({"docker-owner"}),
+    )
+
+    assert takeover["stale_session_ids"] == ["docker-owner"]
+    with database.connect() as connection:
+        stale = connection.execute(
+            "SELECT exit_reason FROM process_sessions WHERE session_id='docker-owner'"
+        ).fetchone()
+    assert stale["exit_reason"] == "dead_docker_controller_takeover"
+
+
 def test_event_export_rebuilds_atomically_without_replay_duplicates(tmp_path: Path) -> None:
     _, database, run_id = _repository(tmp_path)
     destination = tmp_path / "events.jsonl"

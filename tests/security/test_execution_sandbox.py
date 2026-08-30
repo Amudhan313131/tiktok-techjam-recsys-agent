@@ -14,7 +14,12 @@ from rex.contracts import AttemptStatus, RunRequest
 from rex.data.manifest import sha256_file
 from rex.execution.gate import execute_gate
 from rex.execution.runner import execute_request
-from rex.execution.sandbox import SandboxError, SandboxMode, production_backend, sanitized_environment
+from rex.execution.sandbox import (
+    SandboxError,
+    SandboxMode,
+    production_backend,
+    sanitized_environment,
+)
 from rex.execution.sandbox_macos import MacOSSandboxBackend
 
 
@@ -165,6 +170,8 @@ def test_production_backend_fails_closed_on_unsupported_host(
 def test_production_worker_has_only_declared_capabilities(
     feature_target_paths: tuple[Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("REX_PRODUCTION_RUNTIME", "native_macos")
+    monkeypatch.setenv("REX_ALLOW_NATIVE_MACOS_ROLLBACK", "1")
     trusted_root, project, commit = _sandbox_worktree(tmp_path)
     request = _request(feature_target_paths, tmp_path, project, commit)
     monkeypatch.setenv("REX_TEST_SECRET", "must-not-reach-worker")
@@ -223,7 +230,11 @@ def test_production_worker_has_only_declared_capabilities(
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox backend test")
-def test_production_candidate_gate_cannot_escape_sandbox(tmp_path: Path) -> None:
+def test_production_candidate_gate_cannot_escape_sandbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("REX_PRODUCTION_RUNTIME", "native_macos")
+    monkeypatch.setenv("REX_ALLOW_NATIVE_MACOS_ROLLBACK", "1")
     trusted_root, project, _commit = _sandbox_worktree(tmp_path)
     secret = tmp_path / "gate-secret.txt"
     escaped = tmp_path / "gate-escaped.txt"
@@ -275,7 +286,11 @@ print(json.dumps(observed, sort_keys=True))
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox backend test")
-def test_production_sandbox_can_load_pinned_lightgbm_runtime(tmp_path: Path) -> None:
+def test_production_sandbox_can_load_pinned_lightgbm_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("REX_PRODUCTION_RUNTIME", "native_macos")
+    monkeypatch.setenv("REX_ALLOW_NATIVE_MACOS_ROLLBACK", "1")
     lightgbm = pytest.importorskip("lightgbm")
     trusted_root, project, _commit = _sandbox_worktree(tmp_path)
 
@@ -299,8 +314,12 @@ def test_production_sandbox_can_load_pinned_lightgbm_runtime(tmp_path: Path) -> 
 
 
 def test_production_execution_fails_closed_without_verified_worktree(
-    feature_target_paths: tuple[Path, Path], tmp_path: Path
+    feature_target_paths: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("REX_PRODUCTION_RUNTIME", "native_macos")
+    monkeypatch.setenv("REX_ALLOW_NATIVE_MACOS_ROLLBACK", "1")
     features, targets = feature_target_paths
     config_path = tmp_path / "config.json"
     config_path.write_text("{}", encoding="utf-8")
@@ -336,8 +355,12 @@ def test_production_execution_fails_closed_without_verified_worktree(
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox backend test")
 def test_production_worker_rejects_output_outside_trusted_root(
-    feature_target_paths: tuple[Path, Path], tmp_path: Path
+    feature_target_paths: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setenv("REX_PRODUCTION_RUNTIME", "native_macos")
+    monkeypatch.setenv("REX_ALLOW_NATIVE_MACOS_ROLLBACK", "1")
     trusted_root, project, commit = _sandbox_worktree(tmp_path)
     request = _request(feature_target_paths, tmp_path, project, commit)
     values = request.model_dump()
@@ -351,6 +374,4 @@ def test_production_worker_rejects_output_outside_trusted_root(
     )
     assert result.status == AttemptStatus.CONTRACT
     assert result.error_type == "SandboxUnavailable"
-    assert "worker output directory is outside its trusted root" in (
-        result.error_summary or ""
-    )
+    assert "worker output directory is outside its trusted root" in (result.error_summary or "")

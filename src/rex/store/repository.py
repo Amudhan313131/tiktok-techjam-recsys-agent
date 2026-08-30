@@ -159,7 +159,9 @@ class ExperimentRepository:
                 payload={"state": RunState.INITIALIZING},
             )
 
-    def transition_run(self, run_id: str, expected: RunState, next_state: RunState, reason: str | None = None) -> None:
+    def transition_run(
+        self, run_id: str, expected: RunState, next_state: RunState, reason: str | None = None
+    ) -> None:
         require_run_transition(expected, next_state)
         with self.database.transaction() as connection:
             row = connection.execute("SELECT state FROM runs WHERE run_id=?", (run_id,)).fetchone()
@@ -255,6 +257,7 @@ class ExperimentRepository:
         pid: int | None = None,
         host: str | None = None,
         stale_after_seconds: float | None = None,
+        proven_dead_session_ids: frozenset[str] = frozenset(),
         now: datetime | None = None,
     ) -> dict[str, Any]:
         """Open the run lease, optionally taking over only sessions proven stale."""
@@ -265,7 +268,10 @@ class ExperimentRepository:
         process_id = os.getpid() if pid is None else pid
         hostname = socket.gethostname() if host is None else host
         with self.database.transaction() as connection:
-            if connection.execute("SELECT 1 FROM runs WHERE run_id=?", (run_id,)).fetchone() is None:
+            if (
+                connection.execute("SELECT 1 FROM runs WHERE run_id=?", (run_id,)).fetchone()
+                is None
+            ):
                 raise RepositoryError(f"unknown run: {run_id}")
             existing = connection.execute(
                 "SELECT * FROM process_sessions WHERE session_id=?", (session_id,)
@@ -288,20 +294,25 @@ class ExperimentRepository:
             stale_reasons: dict[str, str] = {}
             for item in active:
                 latest = item["last_heartbeat"] or item["started_at"]
-                timed_out = (
-                    stale_after_seconds is not None
-                    and observed_at - _parse_timestamp(latest)
-                    >= timedelta(seconds=stale_after_seconds)
-                )
+                timed_out = stale_after_seconds is not None and observed_at - _parse_timestamp(
+                    latest
+                ) >= timedelta(seconds=stale_after_seconds)
                 dead_local_process = _same_host_pid_is_missing(item["host"], item["pid"])
-                stale = timed_out or dead_local_process
+                proven_dead_controller = item["session_id"] in proven_dead_session_ids
+                stale = timed_out or dead_local_process or proven_dead_controller
                 if not stale:
                     raise RepositoryError(
                         f"run {run_id} already has active process session {item['session_id']}"
                     )
                 stale_ids.append(item["session_id"])
                 stale_reasons[item["session_id"]] = (
-                    "dead_process_takeover" if dead_local_process else "stale_takeover"
+                    "dead_process_takeover"
+                    if dead_local_process
+                    else (
+                        "dead_docker_controller_takeover"
+                        if proven_dead_controller
+                        else "stale_takeover"
+                    )
                 )
             for stale_id in stale_ids:
                 connection.execute(
@@ -383,9 +394,7 @@ class ExperimentRepository:
             if row is None:
                 raise RepositoryError(f"unknown process session: {session_id}")
             final_monotonic = (
-                float(row["monotonic_seconds"])
-                if monotonic_seconds is None
-                else monotonic_seconds
+                float(row["monotonic_seconds"]) if monotonic_seconds is None else monotonic_seconds
             )
             if final_monotonic < float(row["monotonic_seconds"]):
                 raise RepositoryError("session monotonic clock moved backwards")
@@ -521,7 +530,11 @@ class ExperimentRepository:
                 run_id=run_id,
                 event_type="experiment.proposed",
                 aggregate_id=proposal.experiment_id,
-                payload={"iteration": iteration, "parent": proposal.parent_id, "operator": proposal.operator},
+                payload={
+                    "iteration": iteration,
+                    "parent": proposal.parent_id,
+                    "operator": proposal.operator,
+                },
             )
             return iteration
 
@@ -605,7 +618,9 @@ class ExperimentRepository:
                 "SELECT run_id,state FROM experiments WHERE experiment_id=?", (experiment_id,)
             ).fetchone()
             if row is None or ExperimentState(row["state"]) != expected:
-                raise RepositoryError(f"experiment {experiment_id} is not in expected state {expected}")
+                raise RepositoryError(
+                    f"experiment {experiment_id} is not in expected state {expected}"
+                )
             now = utc_now()
             connection.execute(
                 "UPDATE experiments SET state=?,updated_at=?,terminal_reason=COALESCE(?,terminal_reason) "
@@ -615,7 +630,14 @@ class ExperimentRepository:
             connection.execute(
                 "INSERT INTO transitions(experiment_id,from_state,to_state,payload_json,created_at,idempotency_key) "
                 "VALUES(?,?,?,?,?,?)",
-                (experiment_id, expected, next_state, _canonical_json(payload), now, idempotency_key),
+                (
+                    experiment_id,
+                    expected,
+                    next_state,
+                    _canonical_json(payload),
+                    now,
+                    idempotency_key,
+                ),
             )
             self._event(
                 connection,
@@ -682,9 +704,7 @@ class ExperimentRepository:
                     expected_content,
                     entity=f"artifact {ref.artifact_id}",
                 )
-            provenance = (
-                f"{ref.artifact_id}\0{experiment_id or ''}\0{attempt_id or ''}\0{ref.path}"
-            )
+            provenance = f"{ref.artifact_id}\0{experiment_id or ''}\0{attempt_id or ''}\0{ref.path}"
             link_id = "artifact-link-" + hashlib.sha256(provenance.encode("utf-8")).hexdigest()
             link = connection.execute(
                 "SELECT * FROM artifact_links WHERE link_id=?", (link_id,)
@@ -742,9 +762,12 @@ class ExperimentRepository:
             "commit_sha": commit_sha,
         }
         with self.database.transaction() as connection:
-            if connection.execute(
-                "SELECT 1 FROM experiments WHERE experiment_id=?", (experiment_id,)
-            ).fetchone() is None:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM experiments WHERE experiment_id=?", (experiment_id,)
+                ).fetchone()
+                is None
+            ):
                 raise RepositoryError(f"unknown experiment: {experiment_id}")
             row = connection.execute(
                 "SELECT * FROM attempts WHERE attempt_id=?", (attempt_id,)
@@ -929,7 +952,9 @@ class ExperimentRepository:
             if artifact is None:
                 raise RepositoryError("repair config artifact is not linked to the experiment")
             if artifact["kind"] != "repaired_experiment_config":
-                raise RepositoryError("repair revision requires a repaired_experiment_config artifact")
+                raise RepositoryError(
+                    "repair revision requires a repaired_experiment_config artifact"
+                )
             expected = {
                 "repaired_commit_sha": repaired_commit_sha,
                 "repaired_config_sha256": artifact["sha256"],
@@ -1006,8 +1031,12 @@ class ExperimentRepository:
             )
 
     def record_attempt(self, result: RunResult, *, rung: str, repair_number: int = 0) -> None:
-        stdout_id = next((item.artifact_id for item in result.artifacts if item.kind == "stdout"), None)
-        stderr_id = next((item.artifact_id for item in result.artifacts if item.kind == "stderr"), None)
+        stdout_id = next(
+            (item.artifact_id for item in result.artifacts if item.kind == "stdout"), None
+        )
+        stderr_id = next(
+            (item.artifact_id for item in result.artifacts if item.kind == "stderr"), None
+        )
         with self.database.transaction() as connection:
             row = connection.execute(
                 "SELECT run_id FROM experiments WHERE experiment_id=?", (result.experiment_id,)
@@ -1163,7 +1192,10 @@ class ExperimentRepository:
                     ),
                 )
                 return
-            if metrics.split == "valid" and int(row["official_evaluation_count"]) >= max_official_evaluations:
+            if (
+                metrics.split == "valid"
+                and int(row["official_evaluation_count"]) >= max_official_evaluations
+            ):
                 raise RepositoryError(
                     f"official evaluation cap reached: {max_official_evaluations}"
                 )
@@ -1392,8 +1424,13 @@ class ExperimentRepository:
                 "SELECT state FROM experiments WHERE run_id=? AND experiment_id=?",
                 (run_id, experiment_id),
             ).fetchone()
-            if experiment is None or ExperimentState(experiment["state"]) != ExperimentState.FAILED_FINAL:
-                raise RepositoryError("only FAILED_FINAL experiments can count as failed transactions")
+            if (
+                experiment is None
+                or ExperimentState(experiment["state"]) != ExperimentState.FAILED_FINAL
+            ):
+                raise RepositoryError(
+                    "only FAILED_FINAL experiments can count as failed transactions"
+                )
             prior = connection.execute(
                 "SELECT * FROM convergence_transactions WHERE experiment_id=?", (experiment_id,)
             ).fetchone()
@@ -1473,7 +1510,9 @@ class ExperimentRepository:
             if run is None or experiment is None:
                 raise RepositoryError("run or candidate missing for search promotion")
             if ExperimentState(experiment["state"]) != ExperimentState.OFFICIAL_VALID_COMPLETE:
-                raise RepositoryError("candidate must complete official validation before promotion")
+                raise RepositoryError(
+                    "candidate must complete official validation before promotion"
+                )
             if evidence:
                 placeholders = ",".join("?" for _ in evidence)
                 linked = connection.execute(
@@ -1739,12 +1778,16 @@ class ExperimentRepository:
         evidence_artifact_ids: list[str],
     ) -> None:
         with self.database.transaction() as connection:
-            known = connection.execute(
-                "SELECT COUNT(DISTINCT artifact_id) AS n FROM artifact_links WHERE experiment_id=? "
-                "AND artifact_id IN "
-                f"({','.join('?' for _ in evidence_artifact_ids)})",
-                (experiment_id, *evidence_artifact_ids),
-            ).fetchone()["n"] if evidence_artifact_ids else 0
+            known = (
+                connection.execute(
+                    "SELECT COUNT(DISTINCT artifact_id) AS n FROM artifact_links WHERE experiment_id=? "
+                    "AND artifact_id IN "
+                    f"({','.join('?' for _ in evidence_artifact_ids)})",
+                    (experiment_id, *evidence_artifact_ids),
+                ).fetchone()["n"]
+                if evidence_artifact_ids
+                else 0
+            )
             if known != len(evidence_artifact_ids):
                 raise RepositoryError("lesson cites missing evidence artifacts")
             evidence_json = _canonical_json(evidence_artifact_ids)
@@ -1782,7 +1825,11 @@ class ExperimentRepository:
                 run_id=run_id,
                 event_type="lesson.recorded",
                 aggregate_id=lesson_id,
-                payload={"experiment_id": experiment_id, "scope": scope, "evidence": evidence_artifact_ids},
+                payload={
+                    "experiment_id": experiment_id,
+                    "scope": scope,
+                    "evidence": evidence_artifact_ids,
+                },
             )
 
     def record_intervention(
@@ -1857,7 +1904,8 @@ class ExperimentRepository:
                 if (
                     duplicate["experiment_id"] != experiment_id
                     or duplicate["from_state"] != ExperimentState.SUBMISSION_VALID
-                    or duplicate["to_state"] not in {
+                    or duplicate["to_state"]
+                    not in {
                         ExperimentState.PROMOTED,
                         ExperimentState.REJECTED,
                     }
@@ -1888,7 +1936,9 @@ class ExperimentRepository:
                 (*artifact_ids, experiment_id),
             ).fetchone()["n"]
             if count != len(artifact_ids):
-                raise RepositoryError("promotion artifacts are missing or belong to another experiment")
+                raise RepositoryError(
+                    "promotion artifacts are missing or belong to another experiment"
+                )
             update = update_metric_trackers(
                 previous_best_units=run["best_primary_units"],
                 candidate_primary=primary,
@@ -1897,7 +1947,9 @@ class ExperimentRepository:
                 patience=patience,
             )
             now = utc_now()
-            target_state = ExperimentState.PROMOTED if update.is_new_best else ExperimentState.REJECTED
+            target_state = (
+                ExperimentState.PROMOTED if update.is_new_best else ExperimentState.REJECTED
+            )
             require_experiment_transition(ExperimentState.SUBMISSION_VALID, target_state)
             connection.execute(
                 "UPDATE experiments SET state=?,updated_at=?,terminal_reason=? WHERE experiment_id=?",

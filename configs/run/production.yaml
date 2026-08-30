@@ -5,10 +5,12 @@ execution_mode: production
 # test prediction, and final submission remain explicitly disabled in code.
 scientific_execution_enabled: true
 scientific_execution:
-  max_parallel_workers: 6
+  # Four 1.5 GiB workers fit Docker Desktop's 8 GiB VM while still running
+  # candidate/control pairs across two folds concurrently.
+  max_parallel_workers: 4
   max_parallel_folds: 3
   parallel_candidate_control: true
-  max_memory_mb: 2048
+  max_memory_mb: 1536
 
 project_root: .
 runs_dir: runs

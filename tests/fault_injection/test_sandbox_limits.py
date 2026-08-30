@@ -56,7 +56,11 @@ def test_macos_uses_runner_rss_monitor_instead_of_broken_rlimit_as() -> None:
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox backend test")
-def test_sandboxed_gate_timeout_kills_spawned_descendant(tmp_path: Path) -> None:
+def test_sandboxed_gate_timeout_kills_spawned_descendant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("REX_PRODUCTION_RUNTIME", "native_macos")
+    monkeypatch.setenv("REX_ALLOW_NATIVE_MACOS_ROLLBACK", "1")
     trusted_root = tmp_path / "worktrees"
     workspace = trusted_root / "candidate"
     workspace.mkdir(parents=True)
@@ -92,9 +96,7 @@ def test_sandboxed_gate_timeout_kills_spawned_descendant(tmp_path: Path) -> None
         trusted_output_root=tmp_path,
     )
     assert result.timed_out
-    child_pid = int(
-        (artifacts / "timeout-sandbox-temp" / "child.pid").read_text(encoding="utf-8")
-    )
+    child_pid = int((artifacts / "timeout-sandbox-temp" / "child.pid").read_text(encoding="utf-8"))
     for _ in range(40):
         try:
             os.kill(child_pid, 0)

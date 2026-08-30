@@ -82,8 +82,14 @@ def report_fingerprint(report: Path) -> str:
         "evidence_index.json",
         "experiment_graph.json",
         "experiments.md",
+        "artifact_summary.json",
+        "environment_identity.json",
         "interventions.json",
         "iteration_logs.json",
+        "manual_interventions.json",
+        "manual_interventions.md",
+        "recovery_events.json",
+        "results.json",
         "resources.json",
     }
     observed: dict[str, dict[str, Any]] = {}
@@ -120,7 +126,9 @@ def discover_completed_source(
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA query_only = ON")
         try:
-            row = connection.execute("SELECT * FROM runs WHERE run_id=?", (source_run_id,)).fetchone()
+            row = connection.execute(
+                "SELECT * FROM runs WHERE run_id=?", (source_run_id,)
+            ).fetchone()
         finally:
             connection.close()
     except sqlite3.Error as error:
@@ -270,11 +278,15 @@ class SubmissionRepository:
         updates: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if target not in _NEXT[expected]:
-            raise SubmissionRepositoryError(f"invalid submission transition: {expected} -> {target}")
+            raise SubmissionRepositoryError(
+                f"invalid submission transition: {expected} -> {target}"
+            )
         update_values = dict(updates or {})
         unknown = set(update_values).difference(self._UPDATE_COLUMNS)
         if unknown:
-            raise SubmissionRepositoryError(f"unsupported submission job updates: {sorted(unknown)}")
+            raise SubmissionRepositoryError(
+                f"unsupported submission job updates: {sorted(unknown)}"
+            )
         now = utc_now()
         with self.transaction() as connection:
             row = connection.execute(
@@ -324,7 +336,11 @@ class SubmissionRepository:
             if row is None:
                 raise SubmissionRepositoryError(f"unknown submission job: {job_id}")
             observed = SubmissionState(row["state"])
-            if observed in {SubmissionState.HANDED_OFF, SubmissionState.REJECTED, SubmissionState.FAILED}:
+            if observed in {
+                SubmissionState.HANDED_OFF,
+                SubmissionState.REJECTED,
+                SubmissionState.FAILED,
+            }:
                 raise SubmissionRepositoryError(f"cannot terminate job in {observed}")
             now = utc_now()
             connection.execute(

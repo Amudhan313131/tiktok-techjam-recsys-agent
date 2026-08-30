@@ -26,6 +26,22 @@ from rex.execution.lease import (
     command_sha256,
     recover_orphan_worker,
 )
+from rex.execution.docker_lease import (
+    DockerLeaseError,
+    archive_closed_docker_lease,
+    read_docker_lease,
+    runtime_handle_from_docker_lease,
+)
+from rex.execution.runtime import (
+    ExecutionOutcome,
+    ExecutionRuntime,
+    ExecutionRuntimeError,
+    ExecutionSpec,
+    RuntimeMount,
+    RuntimeLifecycleState,
+    production_runtime,
+)
+from rex.execution.runtime_docker import docker_security_policy_sha256
 from rex.execution.sandbox import (
     PreparedSandbox,
     SandboxError,
@@ -317,6 +333,433 @@ def _fixture_plan(workspace: Path, command: list[str]) -> PreparedSandbox:
     )
 
 
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _docker_worker_request(
+    request: RunRequest,
+    attempt_dir: Path,
+    *,
+    trusted_worktree_root: str | Path | None,
+    trusted_output_root: str | Path | None,
+    runtime: ExecutionRuntime | None,
+) -> RunResult:
+    """Execute generated code only in a disposable, fail-closed Docker worker."""
+
+    started = time.monotonic()
+    directory = attempt_dir.resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    request_root = directory / "input"
+    result_root = directory / "worker"
+    request_root.mkdir(parents=True, exist_ok=True)
+    result_root.mkdir(parents=True, exist_ok=True)
+    request_path = request_root / "request.json"
+    docker_request_path = request_root / "docker-request.json"
+    result_path = result_root / "result.json"
+    stdout_path = directory / "stdout.log"
+    stderr_path = directory / "stderr.log"
+    evidence_path = directory / "sandbox_evidence.json"
+    lease_path = directory / "worker_lease.json"
+    recovery_path = directory / "worker_recovery.json"
+    replay_path = directory / "worker_replay.json"
+    original_payload = request.model_dump(mode="json", by_alias=True)
+    request_sha = hashlib.sha256(canonical_json_bytes(original_payload)).hexdigest()
+    command = (
+        "python",
+        "-m",
+        "rex.execution.worker",
+        "--request",
+        "/request.json",
+        "--result",
+        "/output/.rex-worker-result.json",
+    )
+    try:
+        attempt_lock = AttemptLock.acquire(directory / "worker_lease.lock")
+    except WorkerLeaseError as error:
+        return _contract_result(
+            request,
+            error_type="WorkerLeaseConflict",
+            summary=str(error),
+            command=list(command),
+            started=started,
+        )
+    try:
+        if request_path.is_file():
+            prior = RunRequest.model_validate_json(request_path.read_text(encoding="utf-8"))
+            prior_sha = hashlib.sha256(
+                canonical_json_bytes(prior.model_dump(mode="json", by_alias=True))
+            ).hexdigest()
+            if prior_sha != request_sha:
+                raise WorkerLeaseError("attempt directory belongs to a different request hash")
+        atomic_write_json(request_path, original_payload)
+        replay = _validated_replay(request, result_path)
+        workspace = _validated_workspace(request, trusted_worktree_root)
+        if trusted_output_root is None:
+            raise SandboxError("production Docker execution requires trusted_output_root")
+        output_root = Path(trusted_output_root).resolve(strict=True)
+        _inside(output_root, directory, label="attempt directory")
+        output_dir = _inside(output_root, Path(request.output_dir), label="worker output directory")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        config_path = Path(request.config_path).resolve(strict=True)
+        feature_path = Path(request.feature_view_path).resolve(strict=True)
+        target_path = (
+            Path(request.target_view_path).resolve(strict=True)
+            if request.target_view_path is not None
+            else None
+        )
+        bundle_root: Path | None = None
+        if request.model_bundle_path is not None:
+            bundle = validate_model_bundle(
+                request.model_bundle_path,
+                expected_plugin=request.plugin,
+                expected_config_sha256=request.config_sha256,
+                expected_commit_sha=request.commit_sha,
+            )
+            bundle_root = bundle.manifest_path.parent.resolve()
+        elif request.effective_operation == "predict":
+            raise SandboxError("production prediction requires an immutable model bundle")
+        worker_request = request.model_copy(update={"output_dir": "/output"})
+        worker_payload = worker_request.model_dump(mode="json", by_alias=True)
+        worker_request_sha = hashlib.sha256(canonical_json_bytes(worker_payload)).hexdigest()
+        atomic_write_json(docker_request_path, worker_payload)
+        mounts: list[RuntimeMount] = [
+            RuntimeMount(workspace, str(workspace), True),
+            RuntimeMount(docker_request_path, "/request.json", True),
+            RuntimeMount(output_dir, "/output", False),
+        ]
+        for path in (config_path, feature_path, target_path, bundle_root):
+            if path is None or _is_relative_to(path, workspace):
+                continue
+            if any(item.source == path for item in mounts):
+                continue
+            mounts.append(RuntimeMount(path, str(path), True))
+        environment = {
+            "HOME": "/tmp",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "MPLCONFIGDIR": "/tmp/matplotlib",
+            "OMP_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "NUMEXPR_NUM_THREADS": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONHASHSEED": "0",
+            "PYTHONPATH": f"{workspace}/src",
+            "TMPDIR": "/tmp",
+            "XDG_CACHE_HOME": "/tmp/cache",
+        }
+        execution_sha = hashlib.sha256(
+            canonical_json_bytes(
+                {
+                    "request_sha256": request_sha,
+                    "worker_request_sha256": worker_request_sha,
+                    "command": list(command),
+                    "mounts": [
+                        {
+                            "source": str(item.source),
+                            "target": item.target,
+                            "read_only": item.read_only,
+                        }
+                        for item in mounts
+                    ],
+                    "environment": environment,
+                    "environment_sha256": request.environment_sha256,
+                    "docker_security_policy_sha256": docker_security_policy_sha256(),
+                }
+            )
+        ).hexdigest()
+        selected_runtime = production_runtime() if runtime is None else runtime
+        recovered_handle = None
+        recovered_result = None
+        recovery_archive: dict[str, object] | None = None
+        worker_result_path = output_dir / ".rex-worker-result.json"
+        if lease_path.is_file():
+            prior_lease = read_docker_lease(lease_path)
+            if prior_lease.request_sha256 != request_sha:
+                raise DockerLeaseError("attempt lease belongs to a different request")
+            if prior_lease.execution_sha256 != execution_sha:
+                raise DockerLeaseError("attempt lease belongs to a different execution")
+            recovery = selected_runtime.recover(prior_lease)
+            recovered_lease = read_docker_lease(lease_path)
+            prior_handle = runtime_handle_from_docker_lease(
+                recovered_lease,
+                timeout_seconds=min(float(request.timeout_seconds), 21_600.0),
+            )
+            prior_status = selected_runtime.inspect(prior_handle)
+            container_absent = prior_status.state == RuntimeLifecycleState.REMOVED
+            prior_result = None if container_absent else selected_runtime.collect(prior_handle)
+            reuse_completed_result = replay is not None or (
+                worker_result_path.is_file()
+                and prior_result is not None
+                and prior_result.outcome
+                not in {
+                    ExecutionOutcome.TIMEOUT,
+                    ExecutionOutcome.OOM,
+                    ExecutionOutcome.INTERRUPTED,
+                }
+            )
+            recovery_event = {
+                "schema_version": "rex.docker-recovery.v1",
+                "outcome": recovery.outcome,
+                "container_id": recovery.container_id,
+                "terminated": recovery.terminated,
+                "detail": recovery.detail,
+                "container_absent": container_absent,
+                "completed_result_reused": reuse_completed_result,
+                "recorded_at_epoch_ms": int(time.time() * 1000),
+            }
+            if replay is not None:
+                if not container_absent:
+                    selected_runtime.cleanup(prior_handle)
+            elif container_absent:
+                atomic_write_json(recovery_path, recovery_event)
+                recovery_archive = archive_closed_docker_lease(
+                    lease_path, related_evidence_paths=(recovery_path,)
+                )
+                atomic_write_json(
+                    recovery_path,
+                    {
+                        "schema_version": "rex.docker-recovery.v1",
+                        "outcome": "closed-lease-container-absent",
+                        "container_id": prior_lease.container_id,
+                        "completed_result_reused": replay is not None,
+                        "lease_archive": recovery_archive,
+                        "recorded_at_epoch_ms": int(time.time() * 1000),
+                    },
+                )
+                worker_result_path.unlink(missing_ok=True)
+            elif reuse_completed_result:
+                atomic_write_json(recovery_path, recovery_event)
+                recovered_handle = prior_handle
+                recovered_result = prior_result
+            else:
+                atomic_write_json(recovery_path, recovery_event)
+                selected_runtime.cleanup(prior_handle)
+                recovery_archive = archive_closed_docker_lease(
+                    lease_path, related_evidence_paths=(recovery_path,)
+                )
+                atomic_write_json(
+                    recovery_path,
+                    {
+                        "schema_version": "rex.docker-recovery.v1",
+                        "outcome": "incomplete-worker-relaunched",
+                        "container_id": prior_lease.container_id,
+                        "lease_archive": recovery_archive,
+                        "recorded_at_epoch_ms": int(time.time() * 1000),
+                    },
+                )
+                worker_result_path.unlink(missing_ok=True)
+        if replay is not None:
+            atomic_write_json(
+                replay_path,
+                {
+                    "schema_version": "1.0",
+                    "outcome": "complete-result-replayed",
+                    "request_sha256": request_sha,
+                    "result_sha256": sha256_file(result_path),
+                    "replayed_at_epoch_ms": int(time.time() * 1000),
+                },
+            )
+            additions = [artifact_ref(replay_path, "worker_replay")]
+            for path, kind in (
+                (stdout_path, "stdout"),
+                (stderr_path, "stderr"),
+                (evidence_path, "sandbox_evidence"),
+                (lease_path, "worker_lease"),
+                (recovery_path, "worker_recovery"),
+            ):
+                if path.is_file():
+                    additions.append(artifact_ref(path, kind))
+            archived_path = (
+                Path(str(recovery_archive["lease_path"])) if recovery_archive is not None else None
+            )
+            if archived_path is not None and archived_path.is_file():
+                additions.append(artifact_ref(archived_path, "worker_lease_archive"))
+            return _append_artifacts(replay, additions)
+        if os.geteuid() == 0:
+            raise SandboxError("production Docker controller must not run as root")
+        specification = ExecutionSpec(
+            command=command,
+            working_directory=str(workspace),
+            mounts=tuple(mounts),
+            environment=environment,
+            timeout_seconds=min(
+                float(request.timeout_seconds),
+                max(0.1, (request.deadline_epoch_ms / 1000) - time.time()),
+            ),
+            memory_bytes=max(64, request.max_memory_mb or 2048) * 1024 * 1024,
+            nano_cpus=1_000_000_000,
+            pids_limit=128,
+            run_id=request.run_id,
+            experiment_id=request.experiment_id,
+            attempt_id=request.attempt_id,
+            request_sha256=request_sha,
+            execution_sha256=execution_sha,
+            lease_path=lease_path,
+            user=f"{os.geteuid()}:{os.getegid()}",
+        )
+        handle = recovered_handle or selected_runtime.launch(specification)
+        runtime_result = recovered_result
+        if runtime_result is None:
+            runtime_result = selected_runtime.collect(handle)
+        stdout_path.write_text(runtime_result.stdout, encoding="utf-8")
+        stderr_path.write_text(runtime_result.stderr, encoding="utf-8")
+        atomic_write_json(
+            evidence_path,
+            {
+                "schema_version": "rex.docker-worker-evidence.v1",
+                "mode": SandboxMode.PRODUCTION.value,
+                "backend": "docker",
+                "sandboxed": True,
+                "container_id": handle.container_id,
+                "container_name": handle.container_name,
+                "worker_image_digest": handle.worker_image_digest,
+                "worker_image_id": handle.worker_image_id,
+                "daemon_identity": handle.daemon_identity,
+                "request_sha256": request_sha,
+                "worker_request_sha256": worker_request_sha,
+                "execution_sha256": execution_sha,
+                "docker_security_policy_sha256": docker_security_policy_sha256(),
+                "outcome": runtime_result.outcome.value,
+                "exit_code": runtime_result.exit_code,
+                "timed_out": runtime_result.timed_out,
+                "oom_killed": runtime_result.oom_killed,
+                "environment_keys": sorted(environment),
+                "mounts": [{"target": item.target, "read_only": item.read_only} for item in mounts],
+            },
+        )
+        assert runtime_result is not None
+        additions: list[ArtifactRef] = [
+            artifact_ref(stdout_path, "stdout"),
+            artifact_ref(stderr_path, "stderr"),
+            artifact_ref(evidence_path, "sandbox_evidence"),
+            artifact_ref(lease_path, "worker_lease"),
+        ]
+        if recovery_path.is_file():
+            additions.append(artifact_ref(recovery_path, "worker_recovery"))
+        if recovery_archive is not None:
+            archived_lease = Path(str(recovery_archive["lease_path"]))
+            if archived_lease.is_file():
+                additions.append(artifact_ref(archived_lease, "worker_lease_archive"))
+        durable_result: RunResult
+        if worker_result_path.is_file() and runtime_result.outcome not in {
+            ExecutionOutcome.TIMEOUT,
+            ExecutionOutcome.OOM,
+        }:
+            worker_result = RunResult.model_validate_json(
+                worker_result_path.read_text(encoding="utf-8")
+            )
+            if worker_result.command_sha256 != worker_request_sha:
+                raise ValueError("Docker worker result request hash mismatch")
+            translated: list[ArtifactRef] = []
+            worker_output = Path("/output")
+            for ref in worker_result.artifacts:
+                worker_path = Path(ref.path)
+                try:
+                    relative = worker_path.relative_to(worker_output)
+                except ValueError as error:
+                    raise ValueError("Docker worker artifact escaped /output") from error
+                translated_path = (output_dir / relative).resolve()
+                _inside(output_dir, translated_path, label="Docker worker artifact")
+                if not translated_path.is_file() or sha256_file(translated_path) != ref.sha256:
+                    raise ValueError("Docker worker artifact is missing or corrupt")
+                translated.append(ref.model_copy(update={"path": str(translated_path)}))
+            durable_result = worker_result.model_copy(
+                update={
+                    "command_sha256": request_sha,
+                    "artifacts": [*translated, *additions],
+                    "wall_seconds": runtime_result.wall_seconds,
+                }
+            )
+        else:
+            if runtime_result.outcome == ExecutionOutcome.OOM:
+                status = AttemptStatus.OOM
+                error_type = "MemoryLimit"
+            elif runtime_result.outcome == ExecutionOutcome.TIMEOUT:
+                status = AttemptStatus.TIMEOUT
+                error_type = "Timeout"
+            elif runtime_result.outcome == ExecutionOutcome.INTERRUPTED:
+                status = AttemptStatus.INTERRUPTED
+                error_type = "Interrupted"
+            else:
+                status = _typed_failure(
+                    runtime_result.stderr,
+                    False,
+                    return_code=runtime_result.exit_code,
+                )
+                error_type = "WorkerFailure"
+            durable_result = RunResult(
+                run_id=request.run_id,
+                experiment_id=request.experiment_id,
+                attempt_id=request.attempt_id,
+                status=status,
+                exit_code=runtime_result.exit_code,
+                error_type=error_type,
+                error_summary=runtime_result.stderr[-4000:] or "Docker worker returned no result",
+                command_sha256=request_sha,
+                commit_sha=request.commit_sha,
+                config_sha256=request.config_sha256,
+                data_view_sha256=request.data_view_sha256,
+                environment_sha256=request.environment_sha256,
+                artifacts=additions,
+                wall_seconds=runtime_result.wall_seconds,
+            )
+        # The result is made durable and revalidated before container cleanup.
+        # A controller crash after this point can replay the result without
+        # duplicating artifact registration, while still retrying cleanup first.
+        atomic_write_json(result_path, durable_result.model_dump(mode="json", by_alias=True))
+        if _validated_replay(request, result_path) is None:
+            raise ExecutionRuntimeError("durable Docker worker result verification failed")
+        try:
+            selected_runtime.cleanup(handle)
+        except ExecutionRuntimeError as error:
+            raise ExecutionRuntimeError(f"Docker worker cleanup failed closed: {error}") from error
+        worker_result_path.unlink(missing_ok=True)
+        return durable_result
+    except (
+        DockerLeaseError,
+        ExecutionRuntimeError,
+        OSError,
+        SandboxError,
+        subprocess.SubprocessError,
+        ValidationError,
+        ValueError,
+        json.JSONDecodeError,
+        WorkerLeaseError,
+    ) as error:
+        stderr_path.write_text(str(error), encoding="utf-8")
+        artifacts = [artifact_ref(stderr_path, "stderr")]
+        for path, kind in (
+            (evidence_path, "sandbox_evidence"),
+            (lease_path, "worker_lease"),
+            (recovery_path, "worker_recovery"),
+        ):
+            if path.is_file():
+                artifacts.append(artifact_ref(path, kind))
+        return RunResult(
+            run_id=request.run_id,
+            experiment_id=request.experiment_id,
+            attempt_id=request.attempt_id,
+            status=AttemptStatus.CONTRACT,
+            error_type="DockerRuntimeViolation",
+            error_summary=str(error)[-4000:],
+            command_sha256=request_sha,
+            commit_sha=request.commit_sha,
+            config_sha256=request.config_sha256,
+            data_view_sha256=request.data_view_sha256,
+            environment_sha256=request.environment_sha256,
+            artifacts=artifacts,
+            wall_seconds=time.monotonic() - started,
+        )
+    finally:
+        attempt_lock.release()
+
+
 def execute_request(
     request: RunRequest,
     attempt_dir: str | Path,
@@ -326,7 +769,37 @@ def execute_request(
     sandbox_mode: SandboxMode | str = SandboxMode.FIXTURE,
     trusted_output_root: str | Path | None = None,
     environment_overrides: dict[str, str] | None = None,
+    execution_runtime: ExecutionRuntime | None = None,
 ) -> RunResult:
+    selected_mode = SandboxMode(sandbox_mode)
+    runtime_kind = os.environ.get("REX_PRODUCTION_RUNTIME", "docker").strip().lower()
+    if selected_mode == SandboxMode.PRODUCTION and runtime_kind != "native_macos":
+        if environment_overrides:
+            return _contract_result(
+                request,
+                error_type="DockerRuntimeViolation",
+                summary="Docker workers do not accept arbitrary environment overrides",
+                command=["python", "-m", "rex.execution.worker"],
+                started=time.monotonic(),
+            )
+        return _docker_worker_request(
+            request,
+            Path(attempt_dir),
+            trusted_worktree_root=trusted_worktree_root,
+            trusted_output_root=trusted_output_root,
+            runtime=execution_runtime,
+        )
+    if (
+        selected_mode == SandboxMode.PRODUCTION
+        and os.environ.get("REX_ALLOW_NATIVE_MACOS_ROLLBACK") != "1"
+    ):
+        return _contract_result(
+            request,
+            error_type="SandboxUnavailable",
+            summary="native macOS production rollback requires explicit authorization",
+            command=[python_executable, "-m", "rex.execution.worker"],
+            started=time.monotonic(),
+        )
     started = time.monotonic()
     directory = Path(attempt_dir).resolve()
     directory.mkdir(parents=True, exist_ok=True)
@@ -401,7 +874,7 @@ def execute_request(
     sandbox_error: str | None = None
     launch_error: str | None = None
     plan: PreparedSandbox | None = None
-    selected_mode: SandboxMode | None = None
+    selected_mode = None
     execution_sha: str | None = None
     try:
         workspace = _validated_workspace(request, trusted_worktree_root)
@@ -469,9 +942,7 @@ def execute_request(
             )
         except WorkerLeaseError as error:
             recovery_ref = (
-                artifact_ref(recovery_path, "worker_recovery")
-                if recovery_path.is_file()
-                else None
+                artifact_ref(recovery_path, "worker_recovery") if recovery_path.is_file() else None
             )
             attempt_lock.release()
             return _contract_result(
@@ -614,7 +1085,9 @@ def execute_request(
     stderr_text = stderr_path.read_text(encoding="utf-8", errors="replace")[-4000:]
     stdout_ref = artifact_ref(stdout_path, "stdout")
     stderr_ref = artifact_ref(stderr_path, "stderr")
-    sandbox_ref = artifact_ref(evidence_path, "sandbox_evidence") if evidence_path.is_file() else None
+    sandbox_ref = (
+        artifact_ref(evidence_path, "sandbox_evidence") if evidence_path.is_file() else None
+    )
     profile_ref = artifact_ref(policy_path, "sandbox_profile") if policy_path.is_file() else None
     lease_ref = artifact_ref(lease_path, "worker_lease") if lease_path.is_file() else None
     recovery_ref = (
@@ -631,9 +1104,10 @@ def execute_request(
     ):
         try:
             result = RunResult.model_validate_json(result_path.read_text(encoding="utf-8"))
-            if result.command_sha256 != hashlib.sha256(
-                canonical_json_bytes(request.model_dump(mode="json"))
-            ).hexdigest():
+            if (
+                result.command_sha256
+                != hashlib.sha256(canonical_json_bytes(request.model_dump(mode="json"))).hexdigest()
+            ):
                 raise ValueError("worker result command hash mismatch")
             artifacts = [*result.artifacts, stdout_ref, stderr_ref]
             if sandbox_ref is not None:

@@ -333,6 +333,7 @@ class ProductionScientificHooks(ProductionHooks):
             requirements_lock=self.config.environment_lock,
             python_executable=self.python_executable,
             pyproject=pyproject if pyproject.is_file() else None,
+            additional_components=self._runtime_cache_components(),
         )
         train = dict(manifest["splits"]["train"])
         valid = dict(manifest["splits"]["valid"])
@@ -368,6 +369,14 @@ class ProductionScientificHooks(ProductionHooks):
             train_rows=int(train["row_count"]),
             valid_rows=int(valid["row_count"]),
         )
+
+    def _runtime_cache_components(self) -> dict[str, str]:
+        identity = self.config.runtime_environment_identity
+        if not identity:
+            return {}
+        return {
+            "production_runtime": sha256_bytes(canonical_json_bytes(dict(sorted(identity.items()))))
+        }
 
     @staticmethod
     def _load_baseline_evidence(evidence_root: Path) -> BaselineEvidence:
@@ -2050,6 +2059,7 @@ class ProductionScientificHooks(ProductionHooks):
             requirements_lock=self.config.environment_lock,
             python_executable=self.python_executable,
             pyproject=pyproject if pyproject.is_file() else None,
+            additional_components=self._runtime_cache_components(),
         )
         return ControlCacheIdentity.from_paths(
             plugin=plugin,
