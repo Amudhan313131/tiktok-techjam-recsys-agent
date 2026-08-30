@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import os
+import socket
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import pytest
 
 from rex.agents.recovery import decide_repair
 from rex.contracts import AttemptStatus, ExperimentProposal, Operator, RunResult
 from rex.control.budget import deadline_epoch_ms
 from rex.store.db import Database
 from rex.store.event_log import export_events, verify_event_chain
-from rex.store.repository import ExperimentRepository
+from rex.store.repository import ExperimentRepository, RepositoryError
 
 
 HASH = "0" * 64
@@ -90,6 +95,53 @@ def test_stale_session_takeover_leaves_exactly_one_active_owner(tmp_path: Path) 
         ).fetchone()
     assert [row["session_id"] for row in active] == ["recovery-owner"]
     assert stale["exit_reason"] == "stale_takeover"
+
+
+def test_live_same_host_pid_blocks_process_session_takeover(tmp_path: Path) -> None:
+    repository, _, run_id = _repository(tmp_path)
+    repository.open_process_session(
+        session_id="live-owner",
+        run_id=run_id,
+        pid=os.getpid(),
+        host=socket.gethostname(),
+    )
+
+    with pytest.raises(RepositoryError, match="already has active process session"):
+        repository.open_process_session(
+            session_id="unsafe-takeover",
+            run_id=run_id,
+            pid=os.getpid(),
+            host=socket.gethostname(),
+            stale_after_seconds=900,
+        )
+
+
+def test_dead_same_host_pid_is_taken_over_without_waiting_for_timeout(tmp_path: Path) -> None:
+    repository, database, run_id = _repository(tmp_path)
+    process = subprocess.Popen(["true"])
+    dead_pid = process.pid
+    assert process.wait(timeout=5) == 0
+    repository.open_process_session(
+        session_id="dead-owner",
+        run_id=run_id,
+        pid=dead_pid,
+        host=socket.gethostname(),
+    )
+
+    takeover = repository.open_process_session(
+        session_id="immediate-recovery",
+        run_id=run_id,
+        pid=os.getpid(),
+        host=socket.gethostname(),
+        stale_after_seconds=900,
+    )
+
+    assert takeover["stale_session_ids"] == ["dead-owner"]
+    with database.connect() as connection:
+        stale = connection.execute(
+            "SELECT exit_reason FROM process_sessions WHERE session_id='dead-owner'"
+        ).fetchone()
+    assert stale["exit_reason"] == "dead_process_takeover"
 
 
 def test_event_export_rebuilds_atomically_without_replay_duplicates(tmp_path: Path) -> None:

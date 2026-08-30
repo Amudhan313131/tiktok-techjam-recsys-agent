@@ -174,7 +174,7 @@ def test_three_cheap_rejections_trigger_convergence(tmp_path: Path) -> None:
                 experiment_id, current, target, idempotency_key=f"{experiment_id}:{index}"
             )
             current = target
-        result = repo.reject_non_improving(
+        result = repo.reject_candidate(
             run_id=run_id,
             experiment_id=experiment_id,
             expected_state=ExperimentState.CHEAP_COMPLETE,
@@ -185,6 +185,60 @@ def test_three_cheap_rejections_trigger_convergence(tmp_path: Path) -> None:
     assert result["converged"] is True
     assert repo.get_run(run_id)["non_improvement_streak"] == 3
     assert repo.get_run(run_id)["stop_reason"] == "epsilon_plateau"
+
+
+def test_failed_transaction_counts_once_and_preserves_baseline_incumbent(tmp_path: Path) -> None:
+    repo, _, run_id = repository(tmp_path)
+    repo.transition_run(run_id, RunState.INITIALIZING, RunState.BASELINE_VERIFYING)
+    repo.establish_baseline(
+        run_id=run_id,
+        metrics=Metrics(
+            GAUC=0.5,
+            **{"nDCG@5": 0.5},
+            primary=0.5,
+            users=2,
+            rows=4,
+            evaluator_sha256=HASH,
+            split="valid",
+        ),
+        evidence_artifact_ids=[],
+    )
+    repo.transition_run(run_id, RunState.BASELINE_VERIFYING, RunState.SEARCHING)
+    repo.create_experiment(run_id, proposal("failed"), "root")
+    current = ExperimentState.PROPOSED
+    for index, target in enumerate(
+        (
+            ExperimentState.WORKTREE_READY,
+            ExperimentState.PATCHED,
+            ExperimentState.STATIC_VALID,
+            ExperimentState.FIXTURE_VALID,
+            ExperimentState.CHEAP_RUNNING,
+            ExperimentState.FAILED_FINAL,
+        )
+    ):
+        repo.transition_experiment("failed", current, target, idempotency_key=f"failed:{index}")
+        current = target
+
+    first = repo.count_failed_transaction(
+        run_id=run_id,
+        experiment_id="failed",
+        reason="controlled failure",
+        patience=3,
+    )
+    second = repo.count_failed_transaction(
+        run_id=run_id,
+        experiment_id="failed",
+        reason="controlled failure",
+        patience=3,
+    )
+
+    run = repo.get_run(run_id)
+    assert first["idempotent"] is False
+    assert second["idempotent"] is True
+    assert run["non_improvement_streak"] == 1
+    assert run["best_primary_units"] == 500_000_000
+    assert run["best_ever_experiment_id"] == "baseline"
+    assert run["search_champion_experiment_id"] == "baseline"
 
 
 def test_process_session_lease_heartbeat_stale_takeover_and_close(tmp_path: Path) -> None:
@@ -405,5 +459,154 @@ def test_schema_migration_and_workspace_provenance(tmp_path: Path) -> None:
     assert experiment["experiment_kind"] == "FIXTURE"
     assert experiment["workspace_path"] == "/tmp/worktree"
     with database.connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 2
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 4
+
+
+def test_migration_adds_production_run_columns_to_old_database(tmp_path: Path) -> None:
+    database = Database(tmp_path / "old-state.sqlite3")
+    with database.connect() as connection:
+        connection.execute(
+            "CREATE TABLE runs ("
+            "run_id TEXT PRIMARY KEY,state TEXT NOT NULL,created_at TEXT NOT NULL,"
+            "updated_at TEXT NOT NULL,deadline_epoch_ms INTEGER NOT NULL,root_commit TEXT NOT NULL,"
+            "environment_sha256 TEXT NOT NULL,data_manifest_sha256 TEXT NOT NULL,"
+            "evaluator_sha256 TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO runs(run_id,state,created_at,updated_at,deadline_epoch_ms,root_commit,"
+            "environment_sha256,data_manifest_sha256,evaluator_sha256) VALUES(?,?,?,?,?,?,?,?,?)",
+            ("legacy", "INITIALIZING", "then", "then", 1, "root", HASH, HASH, HASH),
+        )
+        connection.execute("PRAGMA user_version = 1")
+
+    database.initialize()
+
+    with database.connect() as connection:
+        columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(runs)").fetchall()
+        }
+        run = connection.execute("SELECT * FROM runs WHERE run_id='legacy'").fetchone()
+        assert {
+            "hypothesis_count",
+            "official_evaluation_count",
+            "non_improvement_streak",
+            "best_primary_units",
+            "best_ever_experiment_id",
+            "search_champion_experiment_id",
+            "stop_reason",
+        } <= columns
+        assert run["hypothesis_count"] == 0
+        assert run["official_evaluation_count"] == 0
+        assert run["non_improvement_streak"] == 0
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+
+
+def test_migration_adds_immutable_repair_revision_columns(tmp_path: Path) -> None:
+    database = Database(tmp_path / "old-repairs.sqlite3")
+    database.initialize()
+    with database.connect() as connection:
+        connection.execute("DROP TABLE experiment_repairs")
+        connection.execute(
+            "CREATE TABLE experiment_repairs ("
+            "repair_id TEXT PRIMARY KEY,experiment_id TEXT NOT NULL,"
+            "repair_number INTEGER NOT NULL,phase TEXT NOT NULL,failure_status TEXT NOT NULL,"
+            "plan_json TEXT NOT NULL,evidence_json TEXT,created_at TEXT NOT NULL,"
+            "completed_at TEXT,UNIQUE(experiment_id,repair_number))"
+        )
+        connection.execute("PRAGMA user_version = 3")
+
+    database.initialize()
+
+    with database.connect() as connection:
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(experiment_repairs)").fetchall()
+        }
+        assert {
+            "previous_commit_sha",
+            "repaired_commit_sha",
+            "previous_config_sha256",
+            "repaired_config_sha256",
+            "effective_config_artifact_id",
+        } <= columns
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+
+
+def test_repair_revision_atomically_supersedes_effective_commit_and_config(
+    tmp_path: Path,
+) -> None:
+    repo, database, run_id = repository(tmp_path)
+    original = tmp_path / "original.yaml"
+    original.write_text("batch_size: 1024\n", encoding="utf-8")
+    repaired = tmp_path / "repaired.yaml"
+    repaired.write_text("batch_size: 512\n", encoding="utf-8")
+    original_ref = artifact_ref(original, "experiment_config")
+    repaired_ref = artifact_ref(repaired, "repaired_experiment_config")
+    repo.create_experiment(
+        run_id,
+        proposal("repair-revision"),
+        "root",
+        commit_sha="candidate-v1",
+        config_sha256=original_ref.sha256,
+    )
+    repo.register_artifact(original_ref, experiment_id="repair-revision")
+    repo.transition_experiment(
+        "repair-revision",
+        ExperimentState.PROPOSED,
+        ExperimentState.WORKTREE_READY,
+        idempotency_key="repair-revision:worktree",
+    )
+    repo.transition_experiment(
+        "repair-revision",
+        ExperimentState.WORKTREE_READY,
+        ExperimentState.FAILED_REPAIRABLE,
+        idempotency_key="repair-revision:failed",
+    )
+    reservation = repo.reserve_experiment_repair(
+        experiment_id="repair-revision",
+        phase="cheap",
+        failure_status=AttemptStatus.NAN,
+        plan={"action": "request_constrained_patch"},
+    )
+    repo.transition_experiment(
+        "repair-revision",
+        ExperimentState.FAILED_REPAIRABLE,
+        ExperimentState.REPAIRING,
+        idempotency_key="repair-revision:repairing",
+    )
+    repo.register_artifact(repaired_ref, experiment_id="repair-revision")
+
+    first = repo.apply_experiment_repair_revision(
+        reservation["repair_id"],
+        repaired_commit_sha="candidate-v2",
+        effective_config_artifact_id=repaired_ref.artifact_id,
+    )
+    replay = repo.apply_experiment_repair_revision(
+        reservation["repair_id"],
+        repaired_commit_sha="candidate-v2",
+        effective_config_artifact_id=repaired_ref.artifact_id,
+    )
+
+    assert not first["idempotent"]
+    assert replay["idempotent"]
+    experiment = repo.get_experiment("repair-revision")
+    assert experiment["commit_sha"] == "candidate-v2"
+    assert experiment["config_sha256"] == repaired_ref.sha256
+    assert repo.get_run(run_id)["hypothesis_count"] == 1
+    with database.connect() as connection:
+        revision = connection.execute(
+            "SELECT * FROM experiment_repairs WHERE repair_id=?",
+            (reservation["repair_id"],),
+        ).fetchone()
+    assert revision["previous_commit_sha"] == "candidate-v1"
+    assert revision["repaired_commit_sha"] == "candidate-v2"
+    assert revision["previous_config_sha256"] == original_ref.sha256
+    assert revision["repaired_config_sha256"] == repaired_ref.sha256
+    assert revision["effective_config_artifact_id"] == repaired_ref.artifact_id
+    with pytest.raises(RepositoryError, match="conflicting replay"):
+        repo.apply_experiment_repair_revision(
+            reservation["repair_id"],
+            repaired_commit_sha="candidate-v3",
+            effective_config_artifact_id=repaired_ref.artifact_id,
+        )

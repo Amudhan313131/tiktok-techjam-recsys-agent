@@ -75,7 +75,19 @@ EXPERIMENT_TRANSITIONS: dict[ExperimentState, set[ExperimentState]] = {
         ExperimentState.FAILED_FINAL,
     },
     ExperimentState.DIAGNOSED: {
+        ExperimentState.OFFICIAL_VALID_RUNNING,
         ExperimentState.CONFIRMING,
+        ExperimentState.REJECTED,
+        ExperimentState.ABANDONED,
+    },
+    ExperimentState.OFFICIAL_VALID_RUNNING: {
+        ExperimentState.OFFICIAL_VALID_COMPLETE,
+        ExperimentState.FAILED_REPAIRABLE,
+        ExperimentState.FAILED_FINAL,
+        ExperimentState.ABANDONED,
+    },
+    ExperimentState.OFFICIAL_VALID_COMPLETE: {
+        ExperimentState.PROMOTED,
         ExperimentState.REJECTED,
         ExperimentState.ABANDONED,
     },
@@ -103,6 +115,9 @@ EXPERIMENT_TRANSITIONS: dict[ExperimentState, set[ExperimentState]] = {
     },
     ExperimentState.REPAIRING: {
         ExperimentState.PATCHED,
+        ExperimentState.CHEAP_RUNNING,
+        ExperimentState.FULL_RUNNING,
+        ExperimentState.OFFICIAL_VALID_RUNNING,
         ExperimentState.FAILED_FINAL,
     },
     ExperimentState.PROMOTED: set(),

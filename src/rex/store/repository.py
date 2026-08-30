@@ -11,6 +11,7 @@ from typing import Any
 
 from rex.contracts import (
     ArtifactRef,
+    AttemptStatus,
     ExperimentProposal,
     ExperimentState,
     Metrics,
@@ -53,6 +54,20 @@ def _require_identical(
 def _parse_timestamp(value: str) -> datetime:
     parsed = datetime.fromisoformat(value)
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
+def _same_host_pid_is_missing(host: str | None, pid: int | None) -> bool:
+    """Return true only when the recorded local process is conclusively gone."""
+
+    if host != socket.gethostname() or pid is None or int(pid) <= 0:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return True
+    except (PermissionError, OSError):
+        return False
+    return False
 
 
 class ExperimentRepository:
@@ -162,6 +177,76 @@ class ExperimentRepository:
                 payload={"from": expected, "to": next_state, "reason": reason},
             )
 
+    def establish_baseline(
+        self,
+        *,
+        run_id: str,
+        metrics: Metrics,
+        evidence_artifact_ids: list[str],
+    ) -> dict[str, Any]:
+        """Atomically establish the validation baseline before search can start."""
+
+        evidence = sorted(set(evidence_artifact_ids))
+        evidence_json = _canonical_json(evidence)
+        primary_units = metric_units(metrics.primary)
+        with self.database.transaction() as connection:
+            run = connection.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            if run is None:
+                raise RepositoryError(f"unknown run: {run_id}")
+            prior = connection.execute(
+                "SELECT * FROM baseline_gates WHERE run_id=?", (run_id,)
+            ).fetchone()
+            expected = {
+                "primary_units": primary_units,
+                "gauc": metrics.GAUC,
+                "ndcg5": metrics.ndcg5,
+                "evidence_json": evidence_json,
+            }
+            if prior is not None:
+                _require_identical(prior, expected, entity=f"baseline gate {run_id}")
+                return {"idempotent": True, "primary_units": primary_units}
+            if RunState(run["state"]) != RunState.BASELINE_VERIFYING:
+                raise RepositoryError("baseline can only be established while BASELINE_VERIFYING")
+            if evidence:
+                placeholders = ",".join("?" for _ in evidence)
+                known = connection.execute(
+                    f"SELECT COUNT(DISTINCT artifact_id) AS n FROM artifacts "
+                    f"WHERE artifact_id IN ({placeholders})",
+                    evidence,
+                ).fetchone()["n"]
+                if known != len(evidence):
+                    raise RepositoryError("baseline cites missing evidence artifacts")
+            connection.execute(
+                "INSERT INTO baseline_gates(run_id,primary_units,gauc,ndcg5,evidence_json,created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (run_id, primary_units, metrics.GAUC, metrics.ndcg5, evidence_json, utc_now()),
+            )
+            connection.execute(
+                "UPDATE runs SET best_primary_units=?,best_ever_experiment_id='baseline',"
+                "search_champion_experiment_id='baseline',updated_at=? WHERE run_id=?",
+                (primary_units, utc_now(), run_id),
+            )
+            self._event(
+                connection,
+                run_id=run_id,
+                event_type="baseline.validated",
+                aggregate_id=run_id,
+                payload={
+                    "primary_units": primary_units,
+                    "gauc": metrics.GAUC,
+                    "ndcg5": metrics.ndcg5,
+                    "evidence_artifact_ids": evidence,
+                },
+            )
+            return {"idempotent": False, "primary_units": primary_units}
+
+    def get_baseline(self, run_id: str) -> dict[str, Any] | None:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM baseline_gates WHERE run_id=?", (run_id,)
+            ).fetchone()
+        return None if row is None else dict(row)
+
     def open_process_session(
         self,
         *,
@@ -200,29 +285,38 @@ class ExperimentRepository:
                 (run_id,),
             ).fetchall()
             stale_ids: list[str] = []
+            stale_reasons: dict[str, str] = {}
             for item in active:
                 latest = item["last_heartbeat"] or item["started_at"]
-                stale = (
+                timed_out = (
                     stale_after_seconds is not None
                     and observed_at - _parse_timestamp(latest)
                     >= timedelta(seconds=stale_after_seconds)
                 )
+                dead_local_process = _same_host_pid_is_missing(item["host"], item["pid"])
+                stale = timed_out or dead_local_process
                 if not stale:
                     raise RepositoryError(
                         f"run {run_id} already has active process session {item['session_id']}"
                     )
                 stale_ids.append(item["session_id"])
+                stale_reasons[item["session_id"]] = (
+                    "dead_process_takeover" if dead_local_process else "stale_takeover"
+                )
             for stale_id in stale_ids:
                 connection.execute(
                     "UPDATE process_sessions SET ended_at=?,exit_reason=? WHERE session_id=?",
-                    (observed_text, "stale_takeover", stale_id),
+                    (observed_text, stale_reasons[stale_id], stale_id),
                 )
                 self._event(
                     connection,
                     run_id=run_id,
                     event_type="session.stale",
                     aggregate_id=stale_id,
-                    payload={"taken_over_by": session_id},
+                    payload={
+                        "taken_over_by": session_id,
+                        "reason": stale_reasons[stale_id],
+                    },
                 )
             connection.execute(
                 "INSERT INTO process_sessions(session_id,run_id,pid,host,started_at,last_heartbeat) "
@@ -690,6 +784,227 @@ class ExperimentRepository:
             )
             return {"idempotent": False}
 
+    def reserve_experiment_repair(
+        self,
+        *,
+        experiment_id: str,
+        phase: str,
+        failure_status: AttemptStatus,
+        plan: dict[str, Any],
+        maximum: int = 2,
+    ) -> dict[str, Any]:
+        """Reserve one repair from the experiment-wide allowance.
+
+        A currently incomplete reservation is returned idempotently so a killed
+        coordinator resumes the same repair instead of consuming another slot.
+        """
+
+        with self.database.transaction() as connection:
+            experiment = connection.execute(
+                "SELECT run_id FROM experiments WHERE experiment_id=?", (experiment_id,)
+            ).fetchone()
+            if experiment is None:
+                raise RepositoryError(f"unknown experiment: {experiment_id}")
+            incomplete = connection.execute(
+                "SELECT * FROM experiment_repairs WHERE experiment_id=? AND completed_at IS NULL "
+                "ORDER BY repair_number DESC LIMIT 1",
+                (experiment_id,),
+            ).fetchone()
+            plan_json = _canonical_json(plan)
+            if incomplete is not None:
+                _require_identical(
+                    incomplete,
+                    {
+                        "phase": phase,
+                        "failure_status": failure_status,
+                        "plan_json": plan_json,
+                    },
+                    entity=f"incomplete repair {incomplete['repair_id']}",
+                )
+                return {
+                    "idempotent": True,
+                    "repair_id": incomplete["repair_id"],
+                    "repair_number": int(incomplete["repair_number"]),
+                }
+            used = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM experiment_repairs WHERE experiment_id=?",
+                    (experiment_id,),
+                ).fetchone()[0]
+            )
+            if used >= maximum:
+                raise RepositoryError(f"experiment repair limit {maximum} reached")
+            number = used + 1
+            repair_id = f"{experiment_id}:repair:{number}"
+            connection.execute(
+                "INSERT INTO experiment_repairs(repair_id,experiment_id,repair_number,phase,"
+                "failure_status,plan_json,created_at) VALUES(?,?,?,?,?,?,?)",
+                (
+                    repair_id,
+                    experiment_id,
+                    number,
+                    phase,
+                    failure_status,
+                    plan_json,
+                    utc_now(),
+                ),
+            )
+            self._event(
+                connection,
+                run_id=experiment["run_id"],
+                event_type="repair.reserved",
+                aggregate_id=repair_id,
+                payload={
+                    "experiment_id": experiment_id,
+                    "repair_number": number,
+                    "phase": phase,
+                    "failure_status": failure_status,
+                    "plan": plan,
+                },
+            )
+            return {"idempotent": False, "repair_id": repair_id, "repair_number": number}
+
+    def complete_experiment_repair(
+        self,
+        repair_id: str,
+        *,
+        evidence_artifact_ids: list[str],
+    ) -> dict[str, Any]:
+        evidence_json = _canonical_json(sorted(set(evidence_artifact_ids)))
+        with self.database.transaction() as connection:
+            row = connection.execute(
+                "SELECT repair.*,experiment.run_id FROM experiment_repairs repair "
+                "JOIN experiments experiment ON experiment.experiment_id=repair.experiment_id "
+                "WHERE repair.repair_id=?",
+                (repair_id,),
+            ).fetchone()
+            if row is None:
+                raise RepositoryError(f"unknown repair: {repair_id}")
+            if row["completed_at"] is not None:
+                _require_identical(
+                    row,
+                    {"evidence_json": evidence_json},
+                    entity=f"repair completion {repair_id}",
+                )
+                return {"idempotent": True}
+            connection.execute(
+                "UPDATE experiment_repairs SET evidence_json=?,completed_at=? WHERE repair_id=?",
+                (evidence_json, utc_now(), repair_id),
+            )
+            self._event(
+                connection,
+                run_id=row["run_id"],
+                event_type="repair.completed",
+                aggregate_id=repair_id,
+                payload={"evidence_artifact_ids": json.loads(evidence_json)},
+            )
+            return {"idempotent": False}
+
+    def apply_experiment_repair_revision(
+        self,
+        repair_id: str,
+        *,
+        repaired_commit_sha: str,
+        effective_config_artifact_id: str,
+    ) -> dict[str, Any]:
+        """Atomically make one immutable repair revision the experiment's effective provenance."""
+
+        if not repaired_commit_sha:
+            raise RepositoryError("repaired commit SHA must be non-empty")
+        with self.database.transaction() as connection:
+            row = connection.execute(
+                "SELECT repair.*,experiment.run_id,experiment.state,experiment.commit_sha,"
+                "experiment.config_sha256 FROM experiment_repairs repair JOIN experiments experiment "
+                "ON experiment.experiment_id=repair.experiment_id WHERE repair.repair_id=?",
+                (repair_id,),
+            ).fetchone()
+            if row is None:
+                raise RepositoryError(f"unknown repair: {repair_id}")
+            artifact = connection.execute(
+                "SELECT artifact.artifact_id,artifact.kind,artifact.sha256 FROM artifacts artifact "
+                "JOIN artifact_links link ON link.artifact_id=artifact.artifact_id "
+                "WHERE artifact.artifact_id=? AND link.experiment_id=? LIMIT 1",
+                (effective_config_artifact_id, row["experiment_id"]),
+            ).fetchone()
+            if artifact is None:
+                raise RepositoryError("repair config artifact is not linked to the experiment")
+            if artifact["kind"] != "repaired_experiment_config":
+                raise RepositoryError("repair revision requires a repaired_experiment_config artifact")
+            expected = {
+                "repaired_commit_sha": repaired_commit_sha,
+                "repaired_config_sha256": artifact["sha256"],
+                "effective_config_artifact_id": effective_config_artifact_id,
+            }
+            if row["repaired_commit_sha"] is not None:
+                _require_identical(row, expected, entity=f"repair revision {repair_id}")
+                if (
+                    row["commit_sha"] != repaired_commit_sha
+                    or row["config_sha256"] != artifact["sha256"]
+                ):
+                    raise RepositoryError(
+                        f"experiment provenance drifted after repair revision {repair_id}"
+                    )
+                return {
+                    "idempotent": True,
+                    "commit_sha": repaired_commit_sha,
+                    "config_sha256": artifact["sha256"],
+                }
+            if row["state"] != ExperimentState.REPAIRING:
+                raise RepositoryError(
+                    f"repair revision {repair_id} requires experiment state REPAIRING"
+                )
+            connection.execute(
+                "UPDATE experiment_repairs SET previous_commit_sha=?,repaired_commit_sha=?,"
+                "previous_config_sha256=?,repaired_config_sha256=?,"
+                "effective_config_artifact_id=? WHERE repair_id=?",
+                (
+                    row["commit_sha"],
+                    repaired_commit_sha,
+                    row["config_sha256"],
+                    artifact["sha256"],
+                    effective_config_artifact_id,
+                    repair_id,
+                ),
+            )
+            connection.execute(
+                "UPDATE experiments SET commit_sha=?,config_sha256=?,updated_at=? "
+                "WHERE experiment_id=?",
+                (
+                    repaired_commit_sha,
+                    artifact["sha256"],
+                    utc_now(),
+                    row["experiment_id"],
+                ),
+            )
+            self._event(
+                connection,
+                run_id=row["run_id"],
+                event_type="repair.revision_applied",
+                aggregate_id=repair_id,
+                payload={
+                    "experiment_id": row["experiment_id"],
+                    "previous_commit_sha": row["commit_sha"],
+                    "repaired_commit_sha": repaired_commit_sha,
+                    "previous_config_sha256": row["config_sha256"],
+                    "repaired_config_sha256": artifact["sha256"],
+                    "effective_config_artifact_id": effective_config_artifact_id,
+                },
+            )
+            return {
+                "idempotent": False,
+                "commit_sha": repaired_commit_sha,
+                "config_sha256": artifact["sha256"],
+            }
+
+    def experiment_repairs_used(self, experiment_id: str) -> int:
+        with self.database.connect() as connection:
+            return int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM experiment_repairs WHERE experiment_id=?",
+                    (experiment_id,),
+                ).fetchone()[0]
+            )
+
     def record_attempt(self, result: RunResult, *, rung: str, repair_number: int = 0) -> None:
         stdout_id = next((item.artifact_id for item in result.artifacts if item.kind == "stdout"), None)
         stderr_id = next((item.artifact_id for item in result.artifacts if item.kind == "stderr"), None)
@@ -930,6 +1245,11 @@ class ExperimentRepository:
                 (ExperimentState.REJECTED, reason, now, experiment_id),
             )
             connection.execute(
+                "INSERT INTO convergence_transactions(experiment_id,run_id,outcome,delta_units,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (experiment_id, run_id, "rejected", None, now),
+            )
+            connection.execute(
                 "INSERT INTO transitions(experiment_id,from_state,to_state,payload_json,created_at,"
                 "idempotency_key) VALUES(?,?,?,?,?,?)",
                 (
@@ -961,6 +1281,301 @@ class ExperimentRepository:
                 "idempotent": False,
                 "non_improvement_streak": streak,
                 "converged": converged,
+            }
+
+    def reject_candidate(
+        self,
+        *,
+        run_id: str,
+        experiment_id: str,
+        expected_state: ExperimentState,
+        reason: str,
+        patience: int,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Reject a cheap/full candidate and count the hypothesis exactly once."""
+
+        require_experiment_transition(expected_state, ExperimentState.REJECTED)
+        with self.database.transaction() as connection:
+            duplicate = connection.execute(
+                "SELECT * FROM transitions WHERE idempotency_key=?", (idempotency_key,)
+            ).fetchone()
+            if duplicate is not None:
+                if (
+                    duplicate["experiment_id"] != experiment_id
+                    or duplicate["from_state"] != expected_state
+                    or duplicate["to_state"] != ExperimentState.REJECTED
+                    or json.loads(duplicate["payload_json"]).get("reason") != reason
+                ):
+                    raise RepositoryError(f"conflicting replay for rejection {idempotency_key}")
+                run = connection.execute(
+                    "SELECT non_improvement_streak,stop_reason FROM runs WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+                return {
+                    "idempotent": True,
+                    "non_improvement_streak": int(run["non_improvement_streak"]),
+                    "converged": run["stop_reason"] == "epsilon_plateau",
+                }
+            row = connection.execute(
+                "SELECT state FROM experiments WHERE run_id=? AND experiment_id=?",
+                (run_id, experiment_id),
+            ).fetchone()
+            if row is None or ExperimentState(row["state"]) != expected_state:
+                raise RepositoryError("candidate is not in the expected rejection state")
+            now = utc_now()
+            run = connection.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            streak = int(run["non_improvement_streak"]) + 1
+            converged = streak >= patience
+            payload = _canonical_json(
+                {
+                    "reason": reason,
+                    "convergence_counted": True,
+                    "convergence_streak": streak,
+                }
+            )
+            connection.execute(
+                "UPDATE experiments SET state=?,terminal_reason=?,updated_at=? WHERE experiment_id=?",
+                (ExperimentState.REJECTED, reason, now, experiment_id),
+            )
+            connection.execute(
+                "INSERT INTO transitions(experiment_id,from_state,to_state,payload_json,created_at,"
+                "idempotency_key) VALUES(?,?,?,?,?,?)",
+                (
+                    experiment_id,
+                    expected_state,
+                    ExperimentState.REJECTED,
+                    payload,
+                    now,
+                    idempotency_key,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO convergence_transactions(experiment_id,run_id,outcome,delta_units,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (experiment_id, run_id, "rejected_before_official", None, now),
+            )
+            connection.execute(
+                "UPDATE runs SET non_improvement_streak=?,updated_at=?,stop_reason=CASE WHEN ? "
+                "THEN 'epsilon_plateau' ELSE stop_reason END WHERE run_id=?",
+                (streak, now, int(converged), run_id),
+            )
+            self._event(
+                connection,
+                run_id=run_id,
+                event_type="candidate.rejected",
+                aggregate_id=experiment_id,
+                payload={
+                    "reason": reason,
+                    "convergence_counted": True,
+                    "convergence_streak": streak,
+                },
+            )
+            return {
+                "idempotent": False,
+                "non_improvement_streak": streak,
+                "converged": converged,
+            }
+
+    def count_failed_transaction(
+        self,
+        *,
+        run_id: str,
+        experiment_id: str,
+        reason: str,
+        patience: int,
+    ) -> dict[str, Any]:
+        """Count a terminal failure once without changing the incumbent."""
+
+        with self.database.transaction() as connection:
+            experiment = connection.execute(
+                "SELECT state FROM experiments WHERE run_id=? AND experiment_id=?",
+                (run_id, experiment_id),
+            ).fetchone()
+            if experiment is None or ExperimentState(experiment["state"]) != ExperimentState.FAILED_FINAL:
+                raise RepositoryError("only FAILED_FINAL experiments can count as failed transactions")
+            prior = connection.execute(
+                "SELECT * FROM convergence_transactions WHERE experiment_id=?", (experiment_id,)
+            ).fetchone()
+            run = connection.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            if prior is not None:
+                return {
+                    "idempotent": True,
+                    "non_improvement_streak": int(run["non_improvement_streak"]),
+                    "converged": run["stop_reason"] == "epsilon_plateau",
+                }
+            streak = int(run["non_improvement_streak"]) + 1
+            converged = streak >= patience
+            now = utc_now()
+            connection.execute(
+                "INSERT INTO convergence_transactions(experiment_id,run_id,outcome,delta_units,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (experiment_id, run_id, "failed_final", None, now),
+            )
+            connection.execute(
+                "UPDATE runs SET non_improvement_streak=?,updated_at=?,stop_reason=CASE WHEN ? "
+                "THEN 'epsilon_plateau' ELSE stop_reason END WHERE run_id=?",
+                (streak, now, int(converged), run_id),
+            )
+            self._event(
+                connection,
+                run_id=run_id,
+                event_type="candidate.failed",
+                aggregate_id=experiment_id,
+                payload={
+                    "reason": reason,
+                    "convergence_streak": streak,
+                    "converged": converged,
+                },
+            )
+            return {
+                "idempotent": False,
+                "non_improvement_streak": streak,
+                "converged": converged,
+            }
+
+    def promote_search_candidate(
+        self,
+        *,
+        run_id: str,
+        experiment_id: str,
+        primary: float,
+        evidence_artifact_ids: list[str],
+        epsilon: float,
+        patience: int,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Promote a validation-best search candidate without building a test submission."""
+
+        evidence = sorted(set(evidence_artifact_ids))
+        evidence_json = _canonical_json(evidence)
+        with self.database.transaction() as connection:
+            duplicate = connection.execute(
+                "SELECT * FROM transitions WHERE idempotency_key=?", (idempotency_key,)
+            ).fetchone()
+            if duplicate is not None:
+                if (
+                    duplicate["experiment_id"] != experiment_id
+                    or duplicate["from_state"] != ExperimentState.OFFICIAL_VALID_COMPLETE
+                    or duplicate["to_state"]
+                    not in {ExperimentState.PROMOTED, ExperimentState.REJECTED}
+                    or json.loads(duplicate["payload_json"]).get("primary") != primary
+                ):
+                    raise RepositoryError(
+                        f"conflicting replay for search promotion {idempotency_key}"
+                    )
+                return {"idempotent": True}
+            run = connection.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            experiment = connection.execute(
+                "SELECT * FROM experiments WHERE run_id=? AND experiment_id=?",
+                (run_id, experiment_id),
+            ).fetchone()
+            if run is None or experiment is None:
+                raise RepositoryError("run or candidate missing for search promotion")
+            if ExperimentState(experiment["state"]) != ExperimentState.OFFICIAL_VALID_COMPLETE:
+                raise RepositoryError("candidate must complete official validation before promotion")
+            if evidence:
+                placeholders = ",".join("?" for _ in evidence)
+                linked = connection.execute(
+                    f"SELECT COUNT(DISTINCT artifact_id) AS n FROM artifact_links "
+                    f"WHERE experiment_id=? AND artifact_id IN ({placeholders})",
+                    (experiment_id, *evidence),
+                ).fetchone()["n"]
+                if linked != len(evidence):
+                    raise RepositoryError("search promotion cites missing candidate evidence")
+            update = update_metric_trackers(
+                previous_best_units=run["best_primary_units"],
+                candidate_primary=primary,
+                previous_streak=int(run["non_improvement_streak"]),
+                epsilon_units=metric_units(epsilon),
+                patience=patience,
+            )
+            target = ExperimentState.PROMOTED if update.is_new_best else ExperimentState.REJECTED
+            require_experiment_transition(ExperimentState.OFFICIAL_VALID_COMPLETE, target)
+            now = utc_now()
+            payload_value = {
+                "primary": primary,
+                "delta_units": update.delta_units,
+                "is_new_best": update.is_new_best,
+                "convergence_streak": update.non_improvement_streak,
+                "evidence_artifact_ids": evidence,
+                "test_submission_created": False,
+            }
+            connection.execute(
+                "UPDATE experiments SET state=?,updated_at=?,terminal_reason=? WHERE experiment_id=?",
+                (
+                    target,
+                    now,
+                    None if update.is_new_best else "not better than validation incumbent",
+                    experiment_id,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO transitions(experiment_id,from_state,to_state,payload_json,created_at,"
+                "idempotency_key) VALUES(?,?,?,?,?,?)",
+                (
+                    experiment_id,
+                    ExperimentState.OFFICIAL_VALID_COMPLETE,
+                    target,
+                    _canonical_json(payload_value),
+                    now,
+                    idempotency_key,
+                ),
+            )
+            if update.is_new_best:
+                connection.execute(
+                    "INSERT INTO search_promotions(run_id,previous_experiment_id,experiment_id,"
+                    "primary_units,evidence_json,created_at) VALUES(?,?,?,?,?,?)",
+                    (
+                        run_id,
+                        run["search_champion_experiment_id"],
+                        experiment_id,
+                        update.best_primary_units,
+                        evidence_json,
+                        now,
+                    ),
+                )
+            connection.execute(
+                "INSERT INTO convergence_transactions(experiment_id,run_id,outcome,delta_units,created_at) "
+                "VALUES(?,?,?,?,?)",
+                (
+                    experiment_id,
+                    run_id,
+                    "promoted" if update.is_new_best else "official_rejected",
+                    update.delta_units,
+                    now,
+                ),
+            )
+            connection.execute(
+                "UPDATE runs SET best_primary_units=?,best_ever_experiment_id=CASE WHEN ? THEN ? "
+                "ELSE best_ever_experiment_id END,search_champion_experiment_id=CASE WHEN ? THEN ? "
+                "ELSE search_champion_experiment_id END,non_improvement_streak=?,updated_at=?,"
+                "stop_reason=CASE WHEN ? THEN 'epsilon_plateau' ELSE stop_reason END WHERE run_id=?",
+                (
+                    update.best_primary_units,
+                    int(update.is_new_best),
+                    experiment_id,
+                    int(update.is_new_best),
+                    experiment_id,
+                    update.non_improvement_streak,
+                    now,
+                    int(update.converged),
+                    run_id,
+                ),
+            )
+            self._event(
+                connection,
+                run_id=run_id,
+                event_type="search_candidate.validated",
+                aggregate_id=experiment_id,
+                payload=payload_value,
+            )
+            return {
+                "idempotent": False,
+                "is_new_best": update.is_new_best,
+                "converged": update.converged,
+                "non_improvement_streak": update.non_improvement_streak,
+                "best_primary_units": update.best_primary_units,
             }
 
     def get_run(self, run_id: str) -> dict[str, Any]:

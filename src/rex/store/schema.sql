@@ -33,6 +33,15 @@ CREATE TABLE IF NOT EXISTS process_sessions (
     console_log_sha256 TEXT
 );
 
+CREATE TABLE IF NOT EXISTS baseline_gates (
+    run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+    primary_units INTEGER NOT NULL,
+    gauc REAL NOT NULL,
+    ndcg5 REAL NOT NULL,
+    evidence_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS experiments (
     experiment_id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL REFERENCES runs(run_id),
@@ -82,6 +91,24 @@ CREATE TABLE IF NOT EXISTS attempts (
     error_summary TEXT,
     stdout_artifact_id TEXT,
     stderr_artifact_id TEXT
+);
+
+CREATE TABLE IF NOT EXISTS experiment_repairs (
+    repair_id TEXT PRIMARY KEY,
+    experiment_id TEXT NOT NULL REFERENCES experiments(experiment_id),
+    repair_number INTEGER NOT NULL,
+    phase TEXT NOT NULL,
+    failure_status TEXT NOT NULL,
+    plan_json TEXT NOT NULL,
+    evidence_json TEXT,
+    previous_commit_sha TEXT,
+    repaired_commit_sha TEXT,
+    previous_config_sha256 TEXT,
+    repaired_config_sha256 TEXT,
+    effective_config_artifact_id TEXT REFERENCES artifacts(artifact_id),
+    created_at TEXT NOT NULL,
+    completed_at TEXT,
+    UNIQUE(experiment_id, repair_number)
 );
 
 CREATE TABLE IF NOT EXISTS metrics (
@@ -135,6 +162,24 @@ CREATE TABLE IF NOT EXISTS promotions (
     prediction_artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
     submission_artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
     validator_artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS search_promotions (
+    promotion_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL REFERENCES runs(run_id),
+    previous_experiment_id TEXT,
+    experiment_id TEXT NOT NULL REFERENCES experiments(experiment_id),
+    primary_units INTEGER NOT NULL,
+    evidence_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS convergence_transactions (
+    experiment_id TEXT PRIMARY KEY REFERENCES experiments(experiment_id),
+    run_id TEXT NOT NULL REFERENCES runs(run_id),
+    outcome TEXT NOT NULL,
+    delta_units INTEGER,
     created_at TEXT NOT NULL
 );
 

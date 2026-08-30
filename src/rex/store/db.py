@@ -31,6 +31,21 @@ class Database:
     @staticmethod
     def _migrate(connection: sqlite3.Connection) -> None:
         """Apply additive, restart-safe migrations to databases from earlier builds."""
+        run_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(runs)").fetchall()
+        }
+        for name, declaration in (
+            ("hypothesis_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("official_evaluation_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("non_improvement_streak", "INTEGER NOT NULL DEFAULT 0"),
+            ("best_primary_units", "INTEGER"),
+            ("best_ever_experiment_id", "TEXT"),
+            ("search_champion_experiment_id", "TEXT"),
+            ("stop_reason", "TEXT"),
+        ):
+            if name not in run_columns:
+                connection.execute(f"ALTER TABLE runs ADD COLUMN {name} {declaration}")
+
         columns = {
             row["name"] for row in connection.execute("PRAGMA table_info(experiments)").fetchall()
         }
@@ -94,7 +109,75 @@ class Database:
             "INSERT OR IGNORE INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)",
             (2, "durable_sessions_and_exactly_once_records", now),
         )
-        connection.execute("PRAGMA user_version = 2")
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS baseline_gates (
+                run_id TEXT PRIMARY KEY REFERENCES runs(run_id),
+                primary_units INTEGER NOT NULL,
+                gauc REAL NOT NULL,
+                ndcg5 REAL NOT NULL,
+                evidence_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS experiment_repairs (
+                repair_id TEXT PRIMARY KEY,
+                experiment_id TEXT NOT NULL REFERENCES experiments(experiment_id),
+                repair_number INTEGER NOT NULL,
+                phase TEXT NOT NULL,
+                failure_status TEXT NOT NULL,
+                plan_json TEXT NOT NULL,
+                evidence_json TEXT,
+                previous_commit_sha TEXT,
+                repaired_commit_sha TEXT,
+                previous_config_sha256 TEXT,
+                repaired_config_sha256 TEXT,
+                effective_config_artifact_id TEXT REFERENCES artifacts(artifact_id),
+                created_at TEXT NOT NULL,
+                completed_at TEXT,
+                UNIQUE(experiment_id, repair_number)
+            );
+            CREATE TABLE IF NOT EXISTS search_promotions (
+                promotion_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id TEXT NOT NULL REFERENCES runs(run_id),
+                previous_experiment_id TEXT,
+                experiment_id TEXT NOT NULL REFERENCES experiments(experiment_id),
+                primary_units INTEGER NOT NULL,
+                evidence_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS convergence_transactions (
+                experiment_id TEXT PRIMARY KEY REFERENCES experiments(experiment_id),
+                run_id TEXT NOT NULL REFERENCES runs(run_id),
+                outcome TEXT NOT NULL,
+                delta_units INTEGER,
+                created_at TEXT NOT NULL
+            );
+            """
+        )
+        repair_columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(experiment_repairs)").fetchall()
+        }
+        for name, declaration in (
+            ("previous_commit_sha", "TEXT"),
+            ("repaired_commit_sha", "TEXT"),
+            ("previous_config_sha256", "TEXT"),
+            ("repaired_config_sha256", "TEXT"),
+            ("effective_config_artifact_id", "TEXT REFERENCES artifacts(artifact_id)"),
+        ):
+            if name not in repair_columns:
+                connection.execute(
+                    f"ALTER TABLE experiment_repairs ADD COLUMN {name} {declaration}"
+                )
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)",
+            (3, "production_control_plane", now),
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)",
+            (4, "repair_revision_provenance", now),
+        )
+        connection.execute("PRAGMA user_version = 4")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

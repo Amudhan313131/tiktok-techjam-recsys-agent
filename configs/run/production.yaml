@@ -1,0 +1,71 @@
+schema_version: "1.0"
+execution_mode: production
+
+# Running this configuration executes validation-only search. Confirmation,
+# test prediction, and final submission remain explicitly disabled in code.
+scientific_execution_enabled: true
+
+project_root: .
+runs_dir: runs
+budget_config: configs/budget.yaml
+protected_paths: configs/security/protected_paths.yaml
+data_manifest: runs/data/data_manifest.json
+evaluator_path: kuairand-starter-kit/evaluate.py
+environment_lock: requirements-lock.txt
+process_stale_after_seconds: 900
+cleanup_worktrees: true
+
+# Versioned method-card bindings. E09 and neural E11-E13 are intentionally not
+# selectable in this phase. E10 trains its two-branch blend with weights derived
+# only from shadow evidence before any official-validation comparison.
+method_cards:
+  E01:
+    config: configs/experiments/e01_pair_rank_fm.yaml
+    feature_recipe: control
+  E02:
+    config: configs/experiments/e02_tree_ranker.yaml
+    feature_recipe: video_statistics
+  E03:
+    config: configs/experiments/e03_candidate_history.yaml
+    feature_recipe: history_length
+  E04:
+    config: configs/experiments/e04_delta_ndcg_pair.yaml
+    feature_recipe: control
+  E05:
+    config: configs/experiments/e05_hybrid_pair.yaml
+    feature_recipe: control
+  E06:
+    config: configs/experiments/e06_repeat_exposure.yaml
+    feature_recipe: repeat_exposure
+  E07:
+    config: configs/experiments/e07_affinity.yaml
+    feature_recipe: author_duration_affinity
+  E08:
+    config: configs/experiments/e08_recency.yaml
+    feature_recipe: recency_history
+  E10:
+    config: configs/experiments/e10_blend.yaml
+    feature_recipe: shadow_blend
+
+llm:
+  mode: fixed
+  retries: 2
+  timeout_seconds: 180
+  max_output_tokens_per_call: 3000
+  codex_cli:
+    executable: codex
+    model: null
+  claude_cli:
+    executable: claude
+    model: null
+  openai_api:
+    api_key_env: OPENAI_API_KEY
+    model_env: OPENAI_MODEL
+    store: false
+    max_calls_per_run: 60
+    max_total_tokens: 300000
+  auto:
+    # Automatic scientific mode never changes transaction type mid-flight.
+    # Use `--llm fixed` explicitly for the deterministic config queue.
+    provider_order: [codex_cli, claude_cli, openai_api]
+    allow_paid_api_fallback: false
