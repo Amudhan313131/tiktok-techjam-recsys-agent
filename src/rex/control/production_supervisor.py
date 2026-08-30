@@ -87,6 +87,8 @@ class ProductionRunConfig:
     llm: dict[str, Any]
     raw_data_dir: Path | None = None
     scientific_execution: dict[str, Any] = field(default_factory=dict)
+    baseline_cache_dir: Path | None = None
+    control_cache_dir: Path | None = None
 
     @classmethod
     def load(cls, path: str | Path) -> "ProductionRunConfig":
@@ -106,7 +108,11 @@ class ProductionRunConfig:
         for card_id, value in dict(raw.get("method_cards", {})).items():
             if value is None:
                 continue
-            if not isinstance(value, dict) or "config" not in value or "feature_recipe" not in value:
+            if (
+                not isinstance(value, dict)
+                or "config" not in value
+                or "feature_recipe" not in value
+            ):
                 raise ValueError(f"method card {card_id} needs config and feature_recipe")
             supported_cards = {"E01", "E02", "E03", "E04", "E05", "E06", "E07", "E08", "E10"}
             if card_id not in supported_cards:
@@ -138,10 +144,14 @@ class ProductionRunConfig:
             cleanup_worktrees=bool(raw.get("cleanup_worktrees", True)),
             method_cards=bindings,
             llm=dict(raw.get("llm", {})),
-            raw_data_dir=resolve(
-                str(raw.get("raw_data_dir", "data/KuaiRand-Pure/data"))
-            ),
+            raw_data_dir=resolve(str(raw.get("raw_data_dir", "data/KuaiRand-Pure/data"))),
             scientific_execution=dict(scientific_execution),
+            baseline_cache_dir=(
+                resolve(str(raw["baseline_cache_dir"])) if raw.get("baseline_cache_dir") else None
+            ),
+            control_cache_dir=(
+                resolve(str(raw["control_cache_dir"])) if raw.get("control_cache_dir") else None
+            ),
         )
         if config.process_stale_after_seconds <= 0:
             raise ValueError("process_stale_after_seconds must be positive")
@@ -388,7 +398,9 @@ class ProductionAutopilot:
         try:
             run_dir.relative_to(runs_root)
         except ValueError as error:  # pragma: no cover - regex is the primary guard
-            raise RuntimeError("production run directory escapes the configured runs root") from error
+            raise RuntimeError(
+                "production run directory escapes the configured runs root"
+            ) from error
         run_dir.mkdir(parents=True, exist_ok=True)
         database = Database(run_dir / "state.sqlite3")
         database.initialize()
@@ -421,9 +433,8 @@ class ProductionAutopilot:
             raise RuntimeError("production run data manifest differs from the durable snapshot")
         if run["evaluator_sha256"] != sha256_file(self.config.evaluator_path):
             raise RuntimeError("production run evaluator differs from the durable snapshot")
-        if (
-            external_deadline_epoch_ms is not None
-            and int(run["deadline_epoch_ms"]) != int(external_deadline_epoch_ms)
+        if external_deadline_epoch_ms is not None and int(run["deadline_epoch_ms"]) != int(
+            external_deadline_epoch_ms
         ):
             raise RuntimeError("production run deadline differs from the R3 envelope")
         if RunState(run["state"]) == RunState.COMPLETE:
@@ -698,9 +709,7 @@ class ProductionAutopilot:
             return "finalization_reserve_reached"
         return None
 
-    def _next_card(
-        self, repository: ExperimentRepository, run_id: str
-    ) -> ExperimentCard | None:
+    def _next_card(self, repository: ExperimentRepository, run_id: str) -> ExperimentCard | None:
         with repository.database.connect() as connection:
             rows = connection.execute(
                 "SELECT method_card_id,state FROM experiments WHERE run_id=?", (run_id,)
@@ -712,11 +721,7 @@ class ProductionAutopilot:
                 (run_id, ExperimentState.DIAGNOSED),
             ).fetchall()
         attempted = {str(row["method_card_id"]) for row in rows if row["method_card_id"]}
-        supported = {
-            str(row["method_card_id"])
-            for row in supported_rows
-            if row["method_card_id"]
-        }
+        supported = {str(row["method_card_id"]) for row in supported_rows if row["method_card_id"]}
         unsupported = {
             card.card_id
             for card in self.search_policy.cards
@@ -967,8 +972,7 @@ class ProductionAutopilot:
                     {
                         "primary": float(item["candidate"]["primary"])
                         - float(item["reference"]["primary"]),
-                        "GAUC": float(item["candidate"]["GAUC"])
-                        - float(item["reference"]["GAUC"]),
+                        "GAUC": float(item["candidate"]["GAUC"]) - float(item["reference"]["GAUC"]),
                         "nDCG@5": float(item["candidate"]["nDCG@5"])
                         - float(item["reference"]["nDCG@5"]),
                         "fold": item["candidate"].get("fold"),
@@ -1013,7 +1017,9 @@ class ProductionAutopilot:
             if isinstance(item, dict):
                 return {
                     str(key)[:120]: bounded(child, depth + 1)
-                    for key, child in list(sorted(item.items(), key=lambda pair: str(pair[0])))[:100]
+                    for key, child in list(sorted(item.items(), key=lambda pair: str(pair[0])))[
+                        :100
+                    ]
                 }
             return str(item)[:200]
 
@@ -1091,16 +1097,16 @@ class ProductionAutopilot:
         effective_config: Path,
         effective_config_sha256: str,
     ) -> tuple[ArtifactRef, ArtifactRef]:
-        directory = context.run_dir / "evidence" / str(proposal_context.get("resume_experiment_id") or "")
+        directory = (
+            context.run_dir / "evidence" / str(proposal_context.get("resume_experiment_id") or "")
+        )
         if not directory.name:
             raise RuntimeError("preparation evidence needs an experiment identity")
         decision_path = directory / "method-card-decision.json"
         atomic_write_json(
             decision_path,
             {
-                "provider": "fixed_config"
-                if self._fixed_mode()
-                else "live_researcher",
+                "provider": "fixed_config" if self._fixed_mode() else "live_researcher",
                 "method_card_version": METHOD_CARD_VERSION,
                 "citation_id": f"method-card:{METHOD_CARD_VERSION}:{card.card_id}",
                 "card_id": card.card_id,
@@ -1278,7 +1284,9 @@ class ProductionAutopilot:
         assert self.hooks is not None
         experiment = repository.get_experiment(experiment_id)
         card = next(
-            item for item in self.search_policy.cards if item.card_id == experiment["method_card_id"]
+            item
+            for item in self.search_policy.cards
+            if item.card_id == experiment["method_card_id"]
         )
         binding = self.config.method_cards[card.card_id]
         parent_commit = str(experiment["parent_commit"] or context.root_commit)
@@ -1524,7 +1532,9 @@ class ProductionAutopilot:
             return True
         assert self.hooks is not None
         card = next(
-            card for card in self.search_policy.cards if card.card_id == experiment["method_card_id"]
+            card
+            for card in self.search_policy.cards
+            if card.card_id == experiment["method_card_id"]
         )
         try:
             result = self.hooks.run_rung(
@@ -1647,7 +1657,9 @@ class ProductionAutopilot:
         evidence = self._experiment_evidence(repository, experiment_id)
         experiment = repository.get_experiment(experiment_id)
         card = next(
-            item for item in self.search_policy.cards if item.card_id == experiment["method_card_id"]
+            item
+            for item in self.search_policy.cards
+            if item.card_id == experiment["method_card_id"]
         )
         research = self._research_context_summary(
             repository,
@@ -1667,7 +1679,9 @@ class ProductionAutopilot:
             "artifact_ids": evidence,
             "method_card_id": experiment["method_card_id"],
             "fold_metric_deltas": [item.primary_delta for item in result.observations],
-            "metric_component_summary": None if current_summary is None else current_summary["rungs"],
+            "metric_component_summary": None
+            if current_summary is None
+            else current_summary["rungs"],
             "segment_diagnostics": [
                 item
                 for item in research["segment_diagnostics"]
@@ -1901,9 +1915,7 @@ class ProductionAutopilot:
                     )
                 )
             for ref in evidence:
-                repository.register_artifact(
-                    ref, experiment_id=experiment_id
-                )
+                repository.register_artifact(ref, experiment_id=experiment_id)
             if self.lifecycle_checkpoint is not None:
                 self.lifecycle_checkpoint("repair_evidence_registered", experiment_id)
             self._apply_repair_revision(
@@ -1926,9 +1938,7 @@ class ProductionAutopilot:
                 payload={"reason": f"repair failed: {type(error).__name__}: {str(error)[-500:]}"},
                 idempotency_key=f"{reservation['repair_id']}:failed-final",
             )
-            self._count_failed_transaction(
-                repository, context, str(experiment["experiment_id"])
-            )
+            self._count_failed_transaction(repository, context, str(experiment["experiment_id"]))
             return False
         target = {
             "cheap": ExperimentState.CHEAP_RUNNING,
@@ -1967,9 +1977,7 @@ class ProductionAutopilot:
             if marker == override_path and str(payload["phase"]) != phase:
                 return None
             config_value = payload.get("config_path") or payload.get("repaired_config_path")
-            config_sha256 = payload.get("config_sha256") or payload.get(
-                "repaired_config_sha256"
-            )
+            config_sha256 = payload.get("config_sha256") or payload.get("repaired_config_sha256")
             refs: list[ArtifactRef] = []
             if config_value:
                 config_path = Path(str(config_value)).resolve()
@@ -2094,9 +2102,7 @@ class ProductionAutopilot:
         )
 
     @staticmethod
-    def _repair_rows(
-        repository: ExperimentRepository, experiment_id: str
-    ) -> list[dict[str, Any]]:
+    def _repair_rows(repository: ExperimentRepository, experiment_id: str) -> list[dict[str, Any]]:
         with repository.database.connect() as connection:
             return [
                 dict(row)
@@ -2116,9 +2122,7 @@ class ProductionAutopilot:
         return str(row["phase"])
 
     @staticmethod
-    def _experiment_evidence(
-        repository: ExperimentRepository, experiment_id: str
-    ) -> list[str]:
+    def _experiment_evidence(repository: ExperimentRepository, experiment_id: str) -> list[str]:
         with repository.database.connect() as connection:
             return [
                 str(row["artifact_id"])
@@ -2146,7 +2150,9 @@ class ProductionAutopilot:
         try:
             workspace.relative_to(root)
         except ValueError as error:
-            raise RuntimeError("refusing to clean a worktree outside the run worktree root") from error
+            raise RuntimeError(
+                "refusing to clean a worktree outside the run worktree root"
+            ) from error
         with repository.database.connect() as connection:
             prior = connection.execute(
                 "SELECT 1 FROM artifact_links link JOIN artifacts artifact "
@@ -2301,8 +2307,7 @@ class ProductionAutopilot:
             (
                 item
                 for item in refs
-                if item.kind == "experiment_config"
-                and item.sha256 == experiment["config_sha256"]
+                if item.kind == "experiment_config" and item.sha256 == experiment["config_sha256"]
             ),
             None,
         )
@@ -2358,9 +2363,7 @@ class ProductionAutopilot:
         metrics = Metrics.model_validate(selected["metrics"])
         baseline_root = (context.run_dir / "baseline").resolve()
         for field_name in ("prediction_path", "model_bundle_path", "config_path"):
-            if not self._is_relative_to(
-                Path(str(selected[field_name])).resolve(), baseline_root
-            ):
+            if not self._is_relative_to(Path(str(selected[field_name])).resolve(), baseline_root):
                 raise RuntimeError("baseline selection references evidence outside the run")
 
         by_id = {item.artifact_id: item for item in refs}
@@ -2369,7 +2372,9 @@ class ProductionAutopilot:
             predictions = by_id[str(selected["prediction_artifact_id"])]
             config_ref = by_id[str(selected["config_artifact_id"])]
         except KeyError as error:
-            raise RuntimeError("baseline gate references an unregistered selected artifact") from error
+            raise RuntimeError(
+                "baseline gate references an unregistered selected artifact"
+            ) from error
         for ref, expected_path, expected_sha256 in (
             (model_bundle, selected["model_bundle_path"], selected["model_bundle_sha256"]),
             (predictions, selected["prediction_path"], selected["prediction_sha256"]),
@@ -2396,9 +2401,7 @@ class ProductionAutopilot:
         return manifest.model_dump(mode="json")
 
     @staticmethod
-    def _artifact_refs(
-        repository: ExperimentRepository, experiment_id: str
-    ) -> list[ArtifactRef]:
+    def _artifact_refs(repository: ExperimentRepository, experiment_id: str) -> list[ArtifactRef]:
         with repository.database.connect() as connection:
             rows = connection.execute(
                 "SELECT DISTINCT artifact.artifact_id,artifact.kind,link.artifact_path AS path,"

@@ -39,6 +39,14 @@ from rex.contracts import (
     RunResult,
 )
 from rex.control.budget import BudgetConfig
+from rex.control.control_cache import (
+    ControlCacheConsumer,
+    ControlCacheError,
+    ControlCacheIdentity,
+    ControlCacheProvenance,
+    ControlPredictionCache,
+    stable_environment_sha256,
+)
 from rex.control.production_supervisor import (
     BaselineGateResult,
     CandidatePreparation,
@@ -59,7 +67,25 @@ from rex.data.firewall import CapabilityRoots, validate_worker_request
 from rex.data.manifest import canonical_json_bytes, sha256_bytes, sha256_file
 from rex.data.shadow_views import MaterializedFold, materialize_cheap_view, materialize_shadow_folds
 from rex.data.views import FeatureView, load_feature_view, load_target_view
-from rex.evaluation.baseline import BaselineEvidence, run_baseline_verification
+from rex.evaluation.baseline import (
+    BaselineAcceptance,
+    BaselineBundle,
+    BaselineEvidence,
+    BaselineSeedResult,
+    assess_baseline,
+    run_baseline_verification_from_views,
+)
+from rex.evaluation.baseline_cache import (
+    BaselineCacheError,
+    BaselineCacheIdentity,
+    BaselineCacheMiss,
+    baseline_cache_entry_path,
+    hash_canonical_config,
+    hash_named_files,
+    materialize_baseline_cache,
+    publish_baseline_cache,
+    quarantine_baseline_cache,
+)
 from rex.evaluation.diagnostics import compare_diagnostics
 from rex.evaluation.official_adapter import EvaluationError, evaluate_predictions
 from rex.execution.artifacts import (
@@ -83,6 +109,7 @@ from rex.features.recipes import (
     materialize_feature_recipe,
 )
 from rex.models.ensemble import blend_scores
+from rex.models.bundle import create_model_bundle
 from rex.store.db import Database
 from rex.store.repository import ExperimentRepository, RepositoryError
 
@@ -133,12 +160,13 @@ class _PreparedViews:
 
 @dataclass(frozen=True)
 class _ModelExecution:
-    result: RunResult
+    result: RunResult | None
     bundle_path: Path
     prediction_path: Path
     scores: np.ndarray
     artifacts: tuple[ArtifactRef, ...]
     component_scores: tuple[np.ndarray, np.ndarray] | None = None
+    fit_result: RunResult | None = None
 
 
 RECIPE_BY_NAME: dict[str, FeatureRecipe] = {
@@ -184,7 +212,9 @@ REPAIR_MIRROR_KEYS = frozenset(
 
 
 def _safe_id(value: str) -> str:
-    return "".join(character if character.isalnum() or character in "-_." else "-" for character in value)
+    return "".join(
+        character if character.isalnum() or character in "-_." else "-" for character in value
+    )
 
 
 def _all_files(root: Path) -> tuple[Path, ...]:
@@ -236,7 +266,7 @@ class ProductionScientificHooks(ProductionHooks):
         view_dir: str | Path | None = None,
         settings: ScientificExecutionSettings | None = None,
         execute: ExecuteRequest = execute_request,
-        baseline_verifier: BaselineVerifier = run_baseline_verification,
+        baseline_verifier: BaselineVerifier | None = None,
         python_executable: str = sys.executable,
         preparation_checkpoint: Callable[[str, str], None] | None = None,
     ):
@@ -246,7 +276,8 @@ class ProductionScientificHooks(ProductionHooks):
         self.view_dir = Path(view_dir).resolve() if view_dir is not None else None
         self.settings = settings or ScientificExecutionSettings()
         self.execute = execute
-        self.baseline_verifier = baseline_verifier
+        self.baseline_verifier = baseline_verifier or run_baseline_verification_from_views
+        self._baseline_verifier_bootstraps = baseline_verifier is not None
         self.python_executable = python_executable
         self.preparation_checkpoint = preparation_checkpoint
         self.budget = BudgetConfig.from_yaml(config.budget_config)
@@ -282,20 +313,242 @@ class ProductionScientificHooks(ProductionHooks):
             Path(detail["target_path"]).resolve() if detail.get("target_path") else None
         )
 
+    def _baseline_cache_identity(self, manifest: dict[str, Any]) -> BaselineCacheIdentity:
+        root = self.config.project_root
+        code_members = {
+            name: root / name
+            for name in (
+                "src/rex/evaluation/baseline.py",
+                "src/rex/evaluation/official_adapter.py",
+                "src/rex/evaluation/evaluator_process.py",
+                "src/rex/models/official_fm.py",
+                "src/rex/models/bundle.py",
+                "src/rex/execution/artifacts.py",
+                "src/rex/data/views.py",
+                "src/rex/contracts.py",
+            )
+        }
+        pyproject = root / "pyproject.toml"
+        environment = stable_environment_sha256(
+            requirements_lock=self.config.environment_lock,
+            python_executable=self.python_executable,
+            pyproject=pyproject if pyproject.is_file() else None,
+        )
+        train = dict(manifest["splits"]["train"])
+        valid = dict(manifest["splits"]["valid"])
+        baseline_config = {
+            "seeds": [0, 1, 2, 3, 4],
+            "fm": {
+                "k": 16,
+                "lr": 0.001,
+                "l2": 1e-6,
+                "epochs": 40,
+                "batch_size": 8192,
+                "patience": 4,
+            },
+            "item_popularity_prior_strength": 20.0,
+            "acceptance": {
+                "reference_tolerance": 0.001,
+                "fm_tolerance": 0.002,
+                "max_fm_std": 0.0015,
+            },
+        }
+        return BaselineCacheIdentity(
+            benchmark_sha256=str(manifest["benchmark_sha256"]),
+            raw_dataset_identity_sha256=str(manifest["raw_dataset_identity_sha256"]),
+            train_feature_sha256=str(train["feature_sha256"]),
+            train_target_sha256=str(train["target_sha256"]),
+            valid_feature_sha256=str(valid["feature_sha256"]),
+            valid_target_sha256=str(valid["target_sha256"]),
+            valid_row_id_sha256=str(valid["row_id_sha256"]),
+            baseline_code_sha256=hash_named_files(code_members),
+            baseline_config_sha256=hash_canonical_config(baseline_config),
+            environment_sha256=environment,
+            evaluator_sha256=sha256_file(self.config.evaluator_path),
+            train_rows=int(train["row_count"]),
+            valid_rows=int(valid["row_count"]),
+        )
+
+    @staticmethod
+    def _load_baseline_evidence(evidence_root: Path) -> BaselineEvidence:
+        summary = json.loads((evidence_root / "summary.json").read_text(encoding="utf-8"))
+        random_metrics = Metrics.model_validate(summary["random"])
+        popularity_metrics = Metrics.model_validate(summary["item_popularity"])
+        results = tuple(
+            BaselineSeedResult(
+                seed=int(item["seed"]),
+                metrics=Metrics.model_validate(item["metrics"]),
+                best_epoch=int(item["best_epoch"]),
+                evidence_dir=evidence_root / f"seed-{int(item['seed'])}",
+                prediction_sha256=str(item["prediction_sha256"]),
+                model_sha256=str(item["model_sha256"]),
+            )
+            for item in summary["fm"]["seeds"]
+        )
+        fm = BaselineBundle(
+            results=results,
+            mean_primary=float(summary["fm"]["mean_primary"]),
+            std_primary=float(summary["fm"]["std_primary"]),
+        )
+        acceptance: BaselineAcceptance = assess_baseline(random_metrics, popularity_metrics, fm)
+        return BaselineEvidence(
+            random_metrics,
+            popularity_metrics,
+            fm,
+            acceptance,
+            evidence_root / "summary.json",
+        )
+
+    def _replay_cached_baseline(self, evidence_root: Path) -> BaselineEvidence:
+        valid_features, valid_targets = self._split_paths("valid")
+        if valid_targets is None:
+            raise RuntimeError("baseline cache replay requires validation targets")
+        evidence = self._load_baseline_evidence(evidence_root)
+        expected = {
+            "random": evidence.random_metrics,
+            "item-popularity": evidence.popularity_metrics,
+            **{f"seed-{item.seed}": item.metrics for item in evidence.fm.results},
+        }
+        for name, metric in expected.items():
+            observed = self._metrics(
+                valid_features,
+                valid_targets,
+                evidence_root / name / "predictions.npz",
+                split="valid",
+                fold=None,
+                seed=metric.seed or 0,
+            )
+            if observed != metric:
+                raise RuntimeError(f"cached baseline evaluator replay drifted for {name}")
+        if not evidence.acceptance.accepted:
+            raise RuntimeError("cached baseline no longer satisfies current acceptance")
+        return evidence
+
+    def _rebind_baseline_bundles(
+        self,
+        evidence_root: Path,
+        context: ProductionContext,
+    ) -> None:
+        train_features, _ = self._split_paths("train")
+        features = load_feature_view(train_features)
+        for seed in (0, 1, 2, 3, 4):
+            directory = evidence_root / f"seed-{seed}"
+            create_model_bundle(
+                directory,
+                directory / "model.npz",
+                plugin="rex.models.official_fm:OfficialFMPlugin",
+                seed=seed,
+                commit_sha=context.root_commit,
+                config_sha256=sha256_file(directory / "config.json"),
+                data_view_sha256=sha256_file(train_features),
+                features=features,
+                member_paths=(directory / "model.npz", directory / "encoder.json"),
+            )
+
     def verify_baseline(self, context: ProductionContext) -> BaselineGateResult:
         try:
             manifest = self._manifest()
-            generated_view_root = context.run_dir / "baseline" / "views"
             evidence_root = context.run_dir / "baseline" / "evidence"
-            evidence = self.baseline_verifier(
-                self.data_dir,
-                generated_view_root,
-                evidence_root,
-                seeds=(0, 1, 2, 3, 4),
-            )
-            generated_manifest = json.loads(
-                (generated_view_root / "data_manifest.json").read_text(encoding="utf-8")
-            )
+            cache_info: dict[str, Any] = {"outcome": "disabled", "test_scored": False}
+            if self._baseline_verifier_bootstraps:
+                generated_view_root = context.run_dir / "baseline" / "views"
+                evidence = self.baseline_verifier(
+                    self.data_dir,
+                    generated_view_root,
+                    evidence_root,
+                    seeds=(0, 1, 2, 3, 4),
+                )
+                generated_manifest = json.loads(
+                    (generated_view_root / "data_manifest.json").read_text(encoding="utf-8")
+                )
+            else:
+                generated_view_root = self.config.data_manifest.parent
+                generated_manifest = manifest
+                identity = self._baseline_cache_identity(manifest)
+                cache_root = self.config.baseline_cache_dir
+                cache_entry = (
+                    baseline_cache_entry_path(cache_root, identity)
+                    if cache_root is not None
+                    else None
+                )
+                evidence = None
+                if cache_entry is not None:
+                    try:
+                        materialized = materialize_baseline_cache(
+                            cache_entry, evidence_root, identity
+                        )
+                        evidence = self._replay_cached_baseline(evidence_root)
+                        self._rebind_baseline_bundles(evidence_root, context)
+                        cache_info = {
+                            "outcome": "hit",
+                            "cache_key": identity.key,
+                            "cache_manifest_sha256": materialized.cache.manifest_sha256,
+                            "origin_run_id": materialized.cache.origin_run_id,
+                            "origin_source_commit": materialized.cache.origin_source_commit,
+                            "evaluator_replayed": True,
+                            "test_scored": False,
+                        }
+                    except BaselineCacheMiss:
+                        cache_info = {
+                            "outcome": "miss",
+                            "cache_key": identity.key,
+                            "test_scored": False,
+                        }
+                    except (BaselineCacheError, OSError, RuntimeError, ValueError) as error:
+                        if evidence_root.exists():
+                            shutil.rmtree(evidence_root)
+                        try:
+                            quarantine = quarantine_baseline_cache(cache_entry, identity, error)
+                            quarantine_error = None
+                        except (BaselineCacheError, OSError) as quarantine_failure:
+                            quarantine = None
+                            quarantine_error = (
+                                f"{type(quarantine_failure).__name__}: "
+                                f"{redact_secrets(str(quarantine_failure))[-500:]}"
+                            )
+                        cache_info = {
+                            "outcome": "bypass",
+                            "cache_key": identity.key,
+                            "error_type": type(error).__name__,
+                            "error": redact_secrets(str(error))[-1000:],
+                            "quarantine_evidence": (
+                                str(quarantine.evidence_path) if quarantine is not None else None
+                            ),
+                            "quarantine_error": quarantine_error,
+                            "test_scored": False,
+                        }
+                if evidence is None:
+                    evidence = self.baseline_verifier(
+                        generated_view_root,
+                        evidence_root,
+                        seeds=(0, 1, 2, 3, 4),
+                    )
+                    if evidence.acceptance.accepted and cache_root is not None:
+                        try:
+                            publication = publish_baseline_cache(
+                                cache_root,
+                                evidence_root,
+                                identity,
+                                origin_run_id=context.run_id,
+                                origin_source_commit=context.root_commit,
+                            )
+                            cache_info = {
+                                "outcome": "published" if publication.published else "race_hit",
+                                "cache_key": identity.key,
+                                "cache_manifest_sha256": publication.cache.manifest_sha256,
+                                "test_scored": False,
+                            }
+                        except (BaselineCacheError, OSError, ValueError) as error:
+                            cache_info = {
+                                "outcome": "publish_bypass",
+                                "cache_key": identity.key,
+                                "error_type": type(error).__name__,
+                                "error": redact_secrets(str(error))[-1000:],
+                                "test_scored": False,
+                            }
+                cache_path = atomic_write_json(
+                    context.run_dir / "baseline" / "cache.json", cache_info
+                )
             if generated_manifest.get("raw_dataset_identity_sha256") != manifest.get(
                 "raw_dataset_identity_sha256"
             ):
@@ -304,7 +557,10 @@ class ProductionScientificHooks(ProductionHooks):
                 return BaselineGateResult(
                     False,
                     None,
-                    tuple(artifact_ref(path, "baseline_evidence") for path in _all_files(evidence_root)),
+                    tuple(
+                        artifact_ref(path, "baseline_evidence")
+                        for path in _all_files(evidence_root)
+                    ),
                     "; ".join(evidence.acceptance.reasons),
                 )
             results = evidence.fm.results
@@ -333,6 +589,7 @@ class ProductionScientificHooks(ProductionHooks):
                     "configured_data_manifest_sha256": sha256_file(self.config.data_manifest),
                     "raw_dataset_identity_sha256": manifest.get("raw_dataset_identity_sha256"),
                     "generated_manifest_sha256": generated_manifest.get("manifest_sha256"),
+                    "cache": cache_info,
                     "metrics": metrics.model_dump(mode="json", by_alias=True),
                     "five_seed_reproduction": {
                         "mean_primary": evidence.fm.mean_primary,
@@ -359,11 +616,15 @@ class ProductionScientificHooks(ProductionHooks):
                 },
             )
             refs = [artifact_ref(self.config.data_manifest, "data_manifest")]
-            refs.extend(artifact_ref(path, "baseline_evidence") for path in _all_files(evidence_root))
+            refs.extend(
+                artifact_ref(path, "baseline_evidence") for path in _all_files(evidence_root)
+            )
             refs.extend(
                 (selected_prediction, selected_checkpoint, selected_bundle, selected_config)
             )
             refs.append(artifact_ref(baseline_manifest_path, "baseline_gate"))
+            if not self._baseline_verifier_bootstraps:
+                refs.append(artifact_ref(cache_path, "baseline_cache_evidence"))
             return BaselineGateResult(True, metrics, tuple(refs))
         except Exception as error:
             failure_path = context.run_dir / "baseline" / "failure.json"
@@ -488,9 +749,13 @@ class ProductionScientificHooks(ProductionHooks):
         )
         effective_config = binding.config_path
         if card.card_id == "E10":
-            effective_config, selection_refs = self._derive_e10_config(context, proposal.experiment_id)
+            effective_config, selection_refs = self._derive_e10_config(
+                context, proposal.experiment_id
+            )
             refs.extend(selection_refs)
-        transaction_path = context.run_dir / "evidence" / proposal.experiment_id / "fixed-config.json"
+        transaction_path = (
+            context.run_dir / "evidence" / proposal.experiment_id / "fixed-config.json"
+        )
         atomic_write_json(
             transaction_path,
             {
@@ -547,12 +812,12 @@ class ProductionScientificHooks(ProductionHooks):
                 fold = fold_by_name[fold_name]
                 features = load_feature_view(fold.valid_features)
                 labels = load_target_view(fold.valid_targets).labels
-                pair_scores = load_prediction_artifact(
-                    pair_predictions[fold_name], features
-                )["score"]
-                tree_scores = load_prediction_artifact(
-                    tree_predictions[fold_name], features
-                )["score"]
+                pair_scores = load_prediction_artifact(pair_predictions[fold_name], features)[
+                    "score"
+                ]
+                tree_scores = load_prediction_artifact(tree_predictions[fold_name], features)[
+                    "score"
+                ]
                 scores = blend_scores(
                     features.arrays["user_id"],
                     [pair_scores, tree_scores],
@@ -612,12 +877,8 @@ class ProductionScientificHooks(ProductionHooks):
                 "grid": grid,
                 "selected": selected,
                 "prediction_sha256": {
-                    "pair": {
-                        name: sha256_file(path) for name, path in pair_predictions.items()
-                    },
-                    "tree": {
-                        name: sha256_file(path) for name, path in tree_predictions.items()
-                    },
+                    "pair": {name: sha256_file(path) for name, path in pair_predictions.items()},
+                    "tree": {name: sha256_file(path) for name, path in tree_predictions.items()},
                 },
             },
         )
@@ -664,7 +925,9 @@ class ProductionScientificHooks(ProductionHooks):
         ranked: list[tuple[float, str]] = []
         for row in rows:
             experiment_id = str(row["experiment_id"])
-            if set(ProductionScientificHooks._full_shadow_predictions(repository, experiment_id)) != {
+            if set(
+                ProductionScientificHooks._full_shadow_predictions(repository, experiment_id)
+            ) != {
                 "A",
                 "B",
                 "C",
@@ -695,9 +958,7 @@ class ProductionScientificHooks(ProductionHooks):
                 continue
             ranked.append((mean_primary, experiment_id))
         if not ranked:
-            raise RuntimeError(
-                "E10 requires supported pairwise and tree/history branch evidence"
-            )
+            raise RuntimeError("E10 requires supported pairwise and tree/history branch evidence")
         return max(ranked, key=lambda item: (item[0], item[1]))[1]
 
     @staticmethod
@@ -790,22 +1051,16 @@ class ProductionScientificHooks(ProductionHooks):
         root = worktree_root / name
         branch = f"codex/rex-{name}"
         if root.is_dir():
-            observed = subprocess_run(
-                ["git", "rev-parse", "HEAD"], root
-            )
+            observed = subprocess_run(["git", "rev-parse", "HEAD"], root)
             status = subprocess_run(
                 ["git", "status", "--porcelain", "--untracked-files=normal"], root
             )
             if observed == parent_commit and not status:
                 return GitWorkspace(root.resolve(), branch)
             raise RuntimeError("existing candidate worktree is dirty or at an unexpected commit")
-        branch_query = subprocess_run(
-            ["git", "branch", "--list", branch], self.config.project_root
-        )
+        branch_query = subprocess_run(["git", "branch", "--list", branch], self.config.project_root)
         if branch_query:
-            branch_commit = subprocess_run(
-                ["git", "rev-parse", branch], self.config.project_root
-            )
+            branch_commit = subprocess_run(["git", "rev-parse", branch], self.config.project_root)
             if branch_commit != parent_commit:
                 raise RuntimeError("generated candidate branch points at an unexpected commit")
             completed = subprocess.run(
@@ -816,7 +1071,9 @@ class ProductionScientificHooks(ProductionHooks):
                 check=False,
             )
             if completed.returncode != 0:
-                raise RuntimeError(f"cannot recycle generated candidate branch: {completed.stderr[-500:]}")
+                raise RuntimeError(
+                    f"cannot recycle generated candidate branch: {completed.stderr[-500:]}"
+                )
         return GitWorkspace.create(
             self.config.project_root, worktree_root, experiment_id, parent_commit
         )
@@ -950,7 +1207,9 @@ class ProductionScientificHooks(ProductionHooks):
             paths = set(changed_paths(patch_path.read_text(encoding="utf-8")))
             worktree_config = prepared.workspace.root / relative_config
             config_value = yaml.safe_load(worktree_config.read_text(encoding="utf-8"))
-            if not isinstance(config_value, dict) or not isinstance(config_value.get("plugin"), str):
+            if not isinstance(config_value, dict) or not isinstance(
+                config_value.get("plugin"), str
+            ):
                 raise RuntimeError("live candidate config must name the exact model plugin")
             plugin_module = str(config_value["plugin"]).split(":", 1)[0]
             plugin_path = plugin_module.replace(".", "/") + ".py"
@@ -1073,9 +1332,7 @@ class ProductionScientificHooks(ProductionHooks):
                 idempotency_key=f"{experiment_id}:preparation-abandoned",
             )
         elif main_state != ExperimentState.ABANDONED:
-            raise RuntimeError(
-                f"exhausted preparation has unexpected main state: {main_state}"
-            )
+            raise RuntimeError(f"exhausted preparation has unexpected main state: {main_state}")
 
     @staticmethod
     def _exhausted_preparation(
@@ -1164,7 +1421,9 @@ class ProductionScientificHooks(ProductionHooks):
             if not path.is_file():
                 raise RuntimeError(f"live coding allowlist file is missing: {raw}")
             if path.stat().st_size > 200_000:
-                raise RuntimeError(f"live coding allowlist file is too large for bounded context: {raw}")
+                raise RuntimeError(
+                    f"live coding allowlist file is too large for bounded context: {raw}"
+                )
             snapshots[relative.as_posix()] = path.read_text(encoding="utf-8")
         return snapshots
 
@@ -1190,9 +1449,7 @@ class ProductionScientificHooks(ProductionHooks):
             transaction_repository = ExperimentRepository(transaction_database)
             exhausted = self._exhausted_preparation(transaction_repository, context.run_id)
             if exhausted is not None:
-                reason = str(
-                    exhausted.get("terminal_reason") or "patch repairs exhausted"
-                )
+                reason = str(exhausted.get("terminal_reason") or "patch repairs exhausted")
                 self._abandon_exhausted_preparation(
                     context=context,
                     card_id=card_id,
@@ -1207,7 +1464,10 @@ class ProductionScientificHooks(ProductionHooks):
         commit_sha = str(experiment.get("commit_sha") or "")
         branch = str(experiment.get("branch_name") or f"codex/rex-{_safe_id(experiment_id)}")
         workspace = Path(
-            str(experiment.get("workspace_path") or context.run_dir / "worktrees" / _safe_id(experiment_id))
+            str(
+                experiment.get("workspace_path")
+                or context.run_dir / "worktrees" / _safe_id(experiment_id)
+            )
         ).resolve()
         if not commit_sha:
             raise RuntimeError("durable live preparation has no committed candidate snapshot")
@@ -1251,9 +1511,7 @@ class ProductionScientificHooks(ProductionHooks):
                 )
         if subprocess_run(["git", "rev-parse", "HEAD"], workspace) != commit_sha:
             raise RuntimeError("restored live worktree commit mismatch")
-        if subprocess_run(
-            ["git", "status", "--porcelain", "--untracked-files=normal"], workspace
-        ):
+        if subprocess_run(["git", "status", "--porcelain", "--untracked-files=normal"], workspace):
             raise RuntimeError("restored live worktree is not clean")
         config_path = self._durable_config_for_experiment(repository, experiment)
         refs = self._experiment_artifacts(repository, experiment_id)
@@ -1288,9 +1546,7 @@ class ProductionScientificHooks(ProductionHooks):
             ):
                 return path
         evidence_dir = (
-            repository.database.path.parent
-            / "evidence"
-            / str(experiment["experiment_id"])
+            repository.database.path.parent / "evidence" / str(experiment["experiment_id"])
         )
         for path in sorted(evidence_dir.glob("effective-config.*"), reverse=True):
             if path.is_file() and sha256_file(path) == experiment["config_sha256"]:
@@ -1320,7 +1576,10 @@ class ProductionScientificHooks(ProductionHooks):
         proposal_context: dict[str, object],
         parent_commit: str,
     ) -> CandidatePreparation:
-        if isinstance(self.provider, ProductionFixedProvider) or self.config.llm.get("mode") == "fixed":
+        if (
+            isinstance(self.provider, ProductionFixedProvider)
+            or self.config.llm.get("mode") == "fixed"
+        ):
             return self._fixed_candidate(context, card, binding, proposal_context, parent_commit)
         return self._live_candidate(context, card, binding, proposal_context, parent_commit)
 
@@ -1449,21 +1708,15 @@ class ProductionScientificHooks(ProductionHooks):
             ).fetchall()
         for row in repaired_rows:
             path = Path(str(row["artifact_path"])).resolve()
-            if (
-                row["sha256"] == expected
-                and path.is_file()
-                and sha256_file(path) == expected
-            ):
+            if row["sha256"] == expected and path.is_file() and sha256_file(path) == expected:
                 return path
         for row in rows:
             path = Path(str(row["artifact_path"])).resolve()
-            if (
-                row["sha256"] == expected
-                and path.is_file()
-                and sha256_file(path) == expected
-            ):
+            if row["sha256"] == expected and path.is_file() and sha256_file(path) == expected:
                 return path
-        evidence_dir = request.context.run_dir / "evidence" / str(request.experiment["experiment_id"])
+        evidence_dir = (
+            request.context.run_dir / "evidence" / str(request.experiment["experiment_id"])
+        )
         snapshots = sorted(evidence_dir.glob("effective-config.*"))
         for path in reversed(snapshots):
             if expected and sha256_file(path) == expected:
@@ -1480,7 +1733,9 @@ class ProductionScientificHooks(ProductionHooks):
         candidate_config: Path,
     ) -> Path:
         relative = REFERENCE_CONFIG_BY_CARD.get(card_id)
-        reference = (self.config.project_root / relative).resolve() if relative else candidate_config
+        reference = (
+            (self.config.project_root / relative).resolve() if relative else candidate_config
+        )
         candidate_hash = sha256_file(candidate_config)
         with self._main_repository(context).database.connect() as connection:
             repaired = connection.execute(
@@ -1619,7 +1874,9 @@ class ProductionScientificHooks(ProductionHooks):
             (item for item in fit_result.artifacts if item.kind.endswith("model_bundle")), None
         )
         if bundle_ref is None:
-            raise ProductionRungFailure(AttemptStatus.INVALID_ARTIFACT, "fit returned no model bundle")
+            raise ProductionRungFailure(
+                AttemptStatus.INVALID_ARTIFACT, "fit returned no model bundle"
+            )
         predict_id = f"{experiment_id}:{prefix}:predict"
         predict_output = attempt_root / "predict-output"
         predict_request = RunRequest(
@@ -1695,6 +1952,7 @@ class ProductionScientificHooks(ProductionHooks):
             np.asarray(arrays["score"], dtype=np.float64),
             artifacts,
             component_scores,
+            fit_result,
         )
 
     def _run_and_record(
@@ -1746,9 +2004,7 @@ class ProductionScientificHooks(ProductionHooks):
                 else:
                     kind = "shadow_predictions"
             scoped.append(
-                ref.model_copy(
-                    update={"artifact_id": f"{kind}-{ref.sha256[:16]}", "kind": kind}
-                )
+                ref.model_copy(update={"artifact_id": f"{kind}-{ref.sha256[:16]}", "kind": kind})
             )
         result = result.model_copy(update={"artifacts": scoped})
         for ref in result.artifacts:
@@ -1779,6 +2035,199 @@ class ProductionScientificHooks(ProductionHooks):
             seed=seed,
         )
 
+    def _control_cache_identity(
+        self,
+        *,
+        context: ProductionContext,
+        request: RungRequest,
+        partition: _Partition,
+        config_path: Path,
+        plugin: str,
+        views: _PreparedViews,
+    ) -> ControlCacheIdentity:
+        pyproject = self.config.project_root / "pyproject.toml"
+        environment = stable_environment_sha256(
+            requirements_lock=self.config.environment_lock,
+            python_executable=self.python_executable,
+            pyproject=pyproject if pyproject.is_file() else None,
+        )
+        return ControlCacheIdentity.from_paths(
+            plugin=plugin,
+            config_path=config_path,
+            source_commit=str(request.experiment["commit_sha"]),
+            environment_sha256=environment,
+            seed=self.settings.model_seed,
+            rung=request.rung,
+            split="valid" if request.rung == "official_valid" else "shadow",
+            fold=partition.name,
+            partition_sha256=partition.identity_sha256,
+            train_feature_path=views.train_features,
+            train_target_path=partition.train_targets,
+            apply_feature_path=views.apply_features,
+            feature_provenance_paths=views.manifests,
+        )
+
+    def _execute_reference_with_cache(
+        self,
+        *,
+        context: ProductionContext,
+        request: RungRequest,
+        partition: _Partition,
+        config_path: Path,
+        plugin: str,
+        views: _PreparedViews,
+        split: str,
+        repair_number: int,
+    ) -> _ModelExecution:
+        cache_root = self.config.control_cache_dir
+        if cache_root is None:
+            return self._execute_one(
+                context=context,
+                experiment=request.experiment,
+                rung=request.rung,
+                fold=partition.name,
+                side="reference",
+                config_path=config_path,
+                plugin=plugin,
+                views=views,
+                targets=partition.train_targets,
+                split=split,
+                repair_number=repair_number,
+            )
+
+        experiment_id = str(request.experiment["experiment_id"])
+        evidence_dir = (
+            context.run_dir
+            / "evidence"
+            / experiment_id
+            / request.rung
+            / partition.name
+            / "control-cache"
+        )
+        event_path = evidence_dir / "cache.json"
+        identity = self._control_cache_identity(
+            context=context,
+            request=request,
+            partition=partition,
+            config_path=config_path,
+            plugin=plugin,
+            views=views,
+        )
+        cache = ControlPredictionCache(cache_root)
+        try:
+            imported = cache.import_entry(
+                identity,
+                train_feature_path=views.train_features,
+                train_target_path=partition.train_targets,
+                apply_feature_path=views.apply_features,
+                destination_dir=evidence_dir / "imported",
+                consumer=ControlCacheConsumer(
+                    run_id=context.run_id,
+                    experiment_id=experiment_id,
+                    rung=request.rung,
+                    fold=partition.name,
+                ),
+            )
+        except (ControlCacheError, OSError) as error:
+            imported = None
+            atomic_write_json(
+                event_path,
+                {
+                    "schema_version": "1.0",
+                    "outcome": "bypass",
+                    "cache_key": identity.cache_key,
+                    "error_type": type(error).__name__,
+                    "error": redact_secrets(str(error))[-1000:],
+                    "test_scored": False,
+                },
+            )
+        if imported is not None:
+            arrays = load_prediction_artifact(imported.prediction_path, views.apply_features)
+            event = atomic_write_json(
+                event_path,
+                {
+                    "schema_version": "1.0",
+                    "outcome": "hit",
+                    "cache_key": identity.cache_key,
+                    "cache_manifest_sha256": sha256_file(imported.manifest_path),
+                    "import_evidence_sha256": sha256_file(imported.evidence_path),
+                    "origin_run_id": imported.manifest.provenance.producer_run_id,
+                    "origin_experiment_id": imported.manifest.provenance.producer_experiment_id,
+                    "test_scored": False,
+                },
+            )
+            return _ModelExecution(
+                result=None,
+                bundle_path=imported.bundle_path,
+                prediction_path=imported.prediction_path,
+                scores=np.asarray(arrays["score"], dtype=np.float64),
+                artifacts=(
+                    artifact_ref(imported.bundle_path, "reference_shadow_model_bundle"),
+                    artifact_ref(imported.prediction_path, "reference_shadow_predictions"),
+                    artifact_ref(imported.evidence_path, "control_cache_import"),
+                    artifact_ref(event, "control_cache_hit"),
+                ),
+            )
+
+        execution = self._execute_one(
+            context=context,
+            experiment=request.experiment,
+            rung=request.rung,
+            fold=partition.name,
+            side="reference",
+            config_path=config_path,
+            plugin=plugin,
+            views=views,
+            targets=partition.train_targets,
+            split=split,
+            repair_number=repair_number,
+        )
+        if execution.fit_result is None or execution.result is None:
+            raise RuntimeError("fresh reference execution lacks worker provenance")
+        try:
+            published = cache.publish(
+                identity,
+                bundle_path=execution.bundle_path,
+                prediction_path=execution.prediction_path,
+                train_feature_path=views.train_features,
+                train_target_path=partition.train_targets,
+                apply_feature_path=views.apply_features,
+                provenance=ControlCacheProvenance(
+                    producer_run_id=context.run_id,
+                    producer_experiment_id=experiment_id,
+                    fit_attempt_id=execution.fit_result.attempt_id,
+                    predict_attempt_id=execution.result.attempt_id,
+                    fit_request_sha256=execution.fit_result.command_sha256,
+                    predict_request_sha256=execution.result.command_sha256,
+                ),
+            )
+            event_value = {
+                "schema_version": "1.0",
+                "outcome": "published",
+                "cache_key": identity.cache_key,
+                "cache_manifest_sha256": sha256_file(published.manifest_path),
+                "test_scored": False,
+            }
+        except (ControlCacheError, OSError) as error:
+            event_value = {
+                "schema_version": "1.0",
+                "outcome": "publish_bypass",
+                "cache_key": identity.cache_key,
+                "error_type": type(error).__name__,
+                "error": redact_secrets(str(error))[-1000:],
+                "test_scored": False,
+            }
+        event = atomic_write_json(event_path, event_value)
+        return _ModelExecution(
+            result=execution.result,
+            bundle_path=execution.bundle_path,
+            prediction_path=execution.prediction_path,
+            scores=execution.scores,
+            artifacts=(*execution.artifacts, artifact_ref(event, "control_cache_event")),
+            component_scores=execution.component_scores,
+            fit_result=execution.fit_result,
+        )
+
     def _evaluate_pair(
         self,
         context: ProductionContext,
@@ -1794,6 +2243,7 @@ class ProductionScientificHooks(ProductionHooks):
         )
         split = "valid" if request.rung == "official_valid" else "shadow"
         evaluation_fold = None if split == "valid" else partition.name
+
         def execute_candidate() -> _ModelExecution:
             return self._execute_one(
                 context=context,
@@ -1856,9 +2306,14 @@ class ProductionScientificHooks(ProductionHooks):
                 fold=evaluation_fold,
                 seed=self.settings.model_seed,
             )
-            reference_path = context.run_dir / "evidence" / str(
-                request.experiment["experiment_id"]
-            ) / request.rung / partition.name / "strongest-component.npz"
+            reference_path = (
+                context.run_dir
+                / "evidence"
+                / str(request.experiment["experiment_id"])
+                / request.rung
+                / partition.name
+                / "strongest-component.npz"
+            )
             from rex.execution.artifacts import write_prediction_artifact
 
             write_prediction_artifact(reference_path, evaluation, reference_scores)
@@ -1875,24 +2330,18 @@ class ProductionScientificHooks(ProductionHooks):
             )
 
             def execute_reference() -> _ModelExecution:
-                return self._execute_one(
+                return self._execute_reference_with_cache(
                     context=context,
-                    experiment=request.experiment,
-                    rung=request.rung,
-                    fold=partition.name,
-                    side="reference",
+                    request=request,
+                    partition=partition,
                     config_path=reference_config,
                     plugin=self._plugin(reference_config, card_id=card_id),
                     views=reference_views,
-                    targets=partition.train_targets,
                     split=split,
                     repair_number=repair_number,
                 )
 
-            if (
-                self.settings.parallel_candidate_control
-                and self.settings.max_parallel_workers >= 2
-            ):
+            if self.settings.parallel_candidate_control and self.settings.max_parallel_workers >= 2:
                 side_results: dict[int, _ModelExecution] = {}
                 side_errors: dict[int, Exception] = {}
                 with ThreadPoolExecutor(max_workers=2, thread_name_prefix="rex-side") as executor:
@@ -1968,7 +2417,9 @@ class ProductionScientificHooks(ProductionHooks):
             },
         )
         refs = [*candidate.artifacts, *reference_artifacts]
-        refs.extend(artifact_ref(path, "feature_recipe_manifest") for path in candidate_views.manifests)
+        refs.extend(
+            artifact_ref(path, "feature_recipe_manifest") for path in candidate_views.manifests
+        )
         refs.extend(
             (
                 artifact_ref(diagnostics_path, "diagnostics"),
@@ -1982,8 +2433,10 @@ class ProductionScientificHooks(ProductionHooks):
         )
 
     def _search_champion(self, context: ProductionContext) -> str | None:
-        value = self._main_repository(context).get_run(context.run_id).get(
-            "search_champion_experiment_id"
+        value = (
+            self._main_repository(context)
+            .get_run(context.run_id)
+            .get("search_champion_experiment_id")
         )
         return str(value) if value else None
 
@@ -2004,9 +2457,8 @@ class ProductionScientificHooks(ProductionHooks):
             gate = json.loads(gate_path.read_text(encoding="utf-8"))
             selected = gate.get("selected_seed", {})
             prediction = Path(str(selected.get("prediction_path", ""))).resolve()
-            if (
-                not prediction.is_file()
-                or sha256_file(prediction) != selected.get("prediction_sha256")
+            if not prediction.is_file() or sha256_file(prediction) != selected.get(
+                "prediction_sha256"
             ):
                 raise ProductionRungFailure(
                     AttemptStatus.INVALID_ARTIFACT,
@@ -2185,9 +2637,7 @@ class ProductionScientificHooks(ProductionHooks):
                         next_index += 1
                     stop_scheduling = False
                     while futures:
-                        completed, _pending = wait(
-                            tuple(futures), return_when=FIRST_COMPLETED
-                        )
+                        completed, _pending = wait(tuple(futures), return_when=FIRST_COMPLETED)
                         for future in sorted(completed, key=lambda item: futures[item]):
                             index = futures.pop(future)
                             if future.cancelled():
@@ -2209,7 +2659,9 @@ class ProductionScientificHooks(ProductionHooks):
         except ProductionRungFailure:
             raise
         except (ArtifactError, EvaluationError, ValueError) as error:
-            status = AttemptStatus.NAN if "nan" in str(error).lower() else AttemptStatus.INVALID_ARTIFACT
+            status = (
+                AttemptStatus.NAN if "nan" in str(error).lower() else AttemptStatus.INVALID_ARTIFACT
+            )
             raise ProductionRungFailure(status, str(error)[-1000:]) from error
         except TimeoutError as error:
             raise ProductionRungFailure(AttemptStatus.TIMEOUT, str(error)) from error
@@ -2219,8 +2671,7 @@ class ProductionScientificHooks(ProductionHooks):
         observations = [item[0] for item in ordered]
         refs = [ref for item in ordered for ref in item[1]]
         diagnostics_by_fold = {
-            partition.name: ordered[index][2]
-            for index, partition in enumerate(partitions)
+            partition.name: ordered[index][2] for index, partition in enumerate(partitions)
         }
         diagnostics = self._summarize_diagnostics(diagnostics_by_fold)
         cache_path = (
@@ -2297,7 +2748,9 @@ class ProductionScientificHooks(ProductionHooks):
             "delta": mean_delta,
             "prediction_correlation": float(np.mean(correlations)) if correlations else 0.0,
             "segment_primary_deltas": segment_deltas,
-            "segment_wins": sorted(name for name, value in segment_deltas.items() if value >= 0.002),
+            "segment_wins": sorted(
+                name for name, value in segment_deltas.items() if value >= 0.002
+            ),
             "segment_regressions": sorted(
                 name for name, value in segment_deltas.items() if value <= -0.002
             ),
@@ -2366,18 +2819,16 @@ class ProductionScientificHooks(ProductionHooks):
             )
         ):
             config_value.update(
-                {
-                    key: value
-                    for key, value in update.items()
-                    if key != "quarantined_attempt"
-                }
+                {key: value for key, value in update.items() if key != "quarantined_attempt"}
             )
             config_value["repair_provenance"] = {
                 "repair_number": request.plan.repair_number,
                 "phase": request.phase,
                 "action": request.plan.action.value,
             }
-            repaired_config = directory / f"effective-config-repair-{request.plan.repair_number}.yaml"
+            repaired_config = (
+                directory / f"effective-config-repair-{request.plan.repair_number}.yaml"
+            )
             repaired_config.write_text(
                 yaml.safe_dump(config_value, sort_keys=True), encoding="utf-8"
             )
@@ -2441,7 +2892,9 @@ class ProductionScientificHooks(ProductionHooks):
             artifact_path = Path(ref.path)
             if not artifact_path.is_file() or sha256_file(artifact_path) != ref.sha256:
                 raise RuntimeError(f"repair replay artifact is missing or corrupt: {ref.kind}")
-        if payload.get("live_patch") or any(item.kind == "repair_candidate_update" for item in refs):
+        if payload.get("live_patch") or any(
+            item.kind == "repair_candidate_update" for item in refs
+        ):
             update_ref = next(
                 (item for item in refs if item.kind == "repair_candidate_update"), None
             )
@@ -2481,9 +2934,7 @@ class ProductionScientificHooks(ProductionHooks):
             if len(quarantines) != 1 or not (quarantines[0] / "QUARANTINED.json").is_file():
                 raise RuntimeError("partial quarantine repair evidence is ambiguous")
             source = self._config_for_repair(request)
-            marker_ref = artifact_ref(
-                quarantines[0] / "QUARANTINED.json", "quarantine_evidence"
-            )
+            marker_ref = artifact_ref(quarantines[0] / "QUARANTINED.json", "quarantine_evidence")
             self._write_fixed_repair_manifest(
                 request,
                 evidence_path,
@@ -2570,9 +3021,7 @@ class ProductionScientificHooks(ProductionHooks):
         commit_sha = subprocess_run(["git", "rev-parse", "HEAD"], workspace)
         if commit_sha == request.experiment["commit_sha"]:
             raise RuntimeError("partial live repair config has no repaired worktree commit")
-        if subprocess_run(
-            ["git", "status", "--porcelain", "--untracked-files=normal"], workspace
-        ):
+        if subprocess_run(["git", "status", "--porcelain", "--untracked-files=normal"], workspace):
             raise RuntimeError("partial live repair worktree is dirty")
         number = request.plan.repair_number
         directory = update_path.parent
@@ -2676,9 +3125,7 @@ class ProductionScientificHooks(ProductionHooks):
         workspace = Path(str(update.get("workspace_path", ""))).resolve()
         if subprocess_run(["git", "rev-parse", "HEAD"], workspace) != update.get("commit_sha"):
             raise RuntimeError("live repair replay worktree HEAD drifted")
-        if subprocess_run(
-            ["git", "status", "--porcelain", "--untracked-files=normal"], workspace
-        ):
+        if subprocess_run(["git", "status", "--porcelain", "--untracked-files=normal"], workspace):
             raise RuntimeError("live repair replay worktree is dirty")
 
     def _record_replayed_live_repair(
@@ -2696,8 +3143,7 @@ class ProductionScientificHooks(ProductionHooks):
             )
         repository.record_llm_call(
             call_id=(
-                f"{request.experiment['experiment_id']}:repair:"
-                f"{request.plan.repair_number}:patch"
+                f"{request.experiment['experiment_id']}:repair:{request.plan.repair_number}:patch"
             ),
             run_id=request.context.run_id,
             experiment_id=str(request.experiment["experiment_id"]),
@@ -2758,9 +3204,7 @@ class ProductionScientificHooks(ProductionHooks):
         if "lr" in config:
             update["lr"] = max(1e-5, float(config["lr"]) * 0.5)
         if "learning_rate" in config:
-            update["learning_rate"] = max(
-                1e-4, float(config["learning_rate"]) * 0.5
-            )
+            update["learning_rate"] = max(1e-4, float(config["learning_rate"]) * 0.5)
         if "l2" in config:
             update["l2"] = max(1e-6, float(config["l2"]) * 10.0)
         if "reg_lambda" in config:
@@ -2780,11 +3224,7 @@ class ProductionScientificHooks(ProductionHooks):
         return AttemptStatus(row["failure_status"]) if row else AttemptStatus.CONTRACT
 
     def _quarantine_failed_attempt(self, request: RepairRequest) -> Path | None:
-        root = (
-            request.context.run_dir
-            / "attempts"
-            / str(request.experiment["experiment_id"])
-        )
+        root = request.context.run_dir / "attempts" / str(request.experiment["experiment_id"])
         candidates = sorted(
             (path for path in root.glob(f"{request.phase}-*") if path.is_dir()),
             key=lambda path: path.stat().st_mtime,
@@ -2906,10 +3346,13 @@ class ProductionScientificHooks(ProductionHooks):
             worktree_config = workspace.root / relative_config
         except ValueError:
             worktree_config = binding.config_path
-        source_config = worktree_config if worktree_config.is_file() else self._config_for_repair(request)
+        source_config = (
+            worktree_config if worktree_config.is_file() else self._config_for_repair(request)
+        )
         repaired_config = _copy_atomic(
             source_config,
-            directory / f"effective-config-repair-{request.plan.repair_number}{source_config.suffix}",
+            directory
+            / f"effective-config-repair-{request.plan.repair_number}{source_config.suffix}",
         )
         request_path = atomic_write_json(
             directory / f"repair-{request.plan.repair_number}-llm-request.json",

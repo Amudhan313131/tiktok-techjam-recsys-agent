@@ -577,6 +577,51 @@ def validate_baseline_cache(
         return _validate_baseline_cache_unlocked(entry, expected_identity, seeds=seeds)
 
 
+def quarantine_baseline_cache(
+    entry_path: str | Path,
+    expected_identity: BaselineCacheIdentity,
+    error: BaseException,
+) -> BaselineCacheQuarantine | None:
+    """Atomically isolate a corrupt entry and preserve the rejection reason."""
+
+    entry = Path(entry_path)
+    if not entry.exists() and not entry.is_symlink():
+        return None
+    version = _cache_version_directory(entry)
+    key = expected_identity.key
+    with _key_lock(version, key, exclusive=True):
+        if not entry.exists() and not entry.is_symlink():
+            return None
+        quarantine_root = version / CACHE_QUARANTINE_DIRECTORY
+        if quarantine_root.is_symlink():
+            raise BaselineCacheError("baseline cache quarantine directory is unsafe")
+        quarantine_root.mkdir(exist_ok=True)
+        suffix = f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}-{uuid.uuid4().hex}"
+        destination = quarantine_root / f"{key}-{suffix}"
+        os.replace(entry, destination)
+        evidence_path = atomic_write_json(
+            quarantine_root / f"{key}-{suffix}.json",
+            {
+                "schema_version": CACHE_SCHEMA_VERSION,
+                "kind": "baseline_cache_quarantine",
+                "cache_key_sha256": key,
+                "quarantined_path": str(destination.resolve()),
+                "error_type": type(error).__name__,
+                "error": str(error)[-2000:],
+                "quarantined_at": _utc_now(),
+                "test_scored": False,
+            },
+        )
+        _fsync_directory(quarantine_root)
+        _fsync_directory(version)
+        return BaselineCacheQuarantine(
+            key=key,
+            quarantine_path=destination.resolve(),
+            evidence_path=evidence_path.resolve(),
+            detected_error=f"{type(error).__name__}: {str(error)[-2000:]}",
+        )
+
+
 def _copy_regular(source: Path, destination: Path) -> None:
     try:
         before = source.lstat()

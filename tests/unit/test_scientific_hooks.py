@@ -97,9 +97,7 @@ def _config(tmp_path: Path) -> tuple[ProductionRunConfig, MethodCardBinding, Pat
     train_features, train_targets = _write_view(
         tmp_path / "views/train", list(range(20220408, 20220422))
     )
-    valid_features, valid_targets = _write_view(
-        tmp_path / "views/valid", [20220422, 20220423]
-    )
+    valid_features, valid_targets = _write_view(tmp_path / "views/valid", [20220422, 20220423])
     test_features, _ = _write_view(tmp_path / "views/test-source", [20220501])
     manifest = tmp_path / "manifest.json"
     manifest.write_text(
@@ -164,14 +162,20 @@ class _FakeWorker:
         output.mkdir(parents=True, exist_ok=True)
         artifacts: list[ArtifactRef]
         if request.effective_operation == "fit":
-            bundle = output / "model_bundle.json"
-            bundle.write_text(
-                json.dumps({"attempt": request.attempt_id}), encoding="utf-8"
+            primary = output / "model.bin"
+            primary.write_bytes(request.attempt_id.encode("utf-8"))
+            bundle = create_model_bundle(
+                output,
+                primary,
+                plugin=request.plugin,
+                seed=request.seed,
+                commit_sha=request.commit_sha,
+                config_sha256=request.config_sha256,
+                data_view_sha256=request.data_view_sha256,
+                features=load_feature_view(request.feature_view_path),
             )
             artifacts = [artifact_ref(bundle, "model_bundle")]
         else:
-            from rex.data.views import load_feature_view
-
             view = load_feature_view(request.feature_view_path)
             if "candidate" in request.attempt_id:
                 scores = np.asarray(
@@ -195,6 +199,15 @@ class _FakeWorker:
             artifacts=artifacts,
             wall_seconds=0.01,
         )
+
+
+class _CountingFakeWorker(_FakeWorker):
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, request, attempt_dir, **kwargs):
+        self.calls.append(request)
+        return super().__call__(request, attempt_dir, **kwargs)
 
 
 class _ConcurrentFakeWorker(_FakeWorker):
@@ -369,7 +382,10 @@ def test_fixed_scientific_hook_runs_cheap_full_and_valid_with_durable_attempts(t
     assert len(cheap.observations) == 1
     assert len(full.observations) == 3
     assert len(valid.observations) == 1
-    assert all(item.primary_delta > 0 for item in (*cheap.observations, *full.observations, *valid.observations))
+    assert all(
+        item.primary_delta > 0
+        for item in (*cheap.observations, *full.observations, *valid.observations)
+    )
     assert "prediction_correlation" in cheap.diagnostics
     assert any(item.kind == "model_bundle" for item in valid.artifacts)
     assert any(item.kind == "valid_predictions" for item in valid.artifacts)
@@ -384,7 +400,9 @@ def test_fixed_scientific_hook_runs_cheap_full_and_valid_with_durable_attempts(t
             (experiment["experiment_id"],),
         ).fetchone()[0]
     assert attempts and {row["status"] for row in attempts} == {"success"}
-    assert not any("official_valid" in row["rung"] and "reference" in row["rung"] for row in attempts)
+    assert not any(
+        "official_valid" in row["rung"] and "reference" in row["rung"] for row in attempts
+    )
     assert resources == len(attempts)
 
 
@@ -396,6 +414,27 @@ def test_scientific_rung_cache_replays_without_new_worker_calls(tmp_path: Path):
     assert second.observations == first.observations
     with repository.database.connect() as connection:
         assert connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 4
+
+
+def test_control_cache_skips_equivalent_reference_workers(tmp_path: Path):
+    hooks, context, experiment, card, binding, _repository = _request(tmp_path)
+    worker = _CountingFakeWorker()
+    hooks.execute = worker
+    hooks.config = replace(hooks.config, control_cache_dir=tmp_path / "shared-control-cache")
+    request = RungRequest(context, experiment, card, binding, "cheap")
+
+    first = hooks.run_rung(request)
+    assert len(worker.calls) == 4
+    rung_cache = context.run_dir / "scientific-cache" / experiment["experiment_id"] / "cheap.json"
+    rung_cache.unlink()
+
+    second = hooks.run_rung(request)
+
+    assert second.observations == first.observations
+    assert len(worker.calls) == 6
+    assert [call.operation for call in worker.calls[-2:]] == ["fit", "predict"]
+    assert all("candidate" in call.attempt_id for call in worker.calls[-2:])
+    assert any(item.kind == "control_cache_hit" for item in second.artifacts)
 
 
 def test_candidate_and_reference_execute_concurrently_within_bound(tmp_path: Path):
@@ -421,7 +460,7 @@ def test_full_rung_parallelism_is_bounded_and_results_are_canonical(tmp_path: Pa
     hooks.execute = worker
     hooks.settings = replace(
         hooks.settings,
-        max_parallel_workers=4,
+        max_parallel_workers=6,
         max_parallel_folds=3,
         parallel_candidate_control=True,
     )
@@ -429,7 +468,7 @@ def test_full_rung_parallelism_is_bounded_and_results_are_canonical(tmp_path: Pa
     result = hooks.run_rung(RungRequest(context, experiment, card, binding, "full"))
 
     assert [item.candidate.fold for item in result.observations] == ["A", "B", "C"]
-    assert worker.peak == 4
+    assert worker.peak == 6
     assert worker.completed[0].split(":full-", 1)[1][0] == "B"
     with repository.database.connect() as connection:
         assert connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 12
@@ -455,18 +494,19 @@ def test_parallel_failure_drains_started_work_and_cancels_queued_folds(tmp_path:
         context.run_dir / "scientific-cache" / experiment["experiment_id"] / "full.json"
     ).exists()
     with repository.database.connect() as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM attempts WHERE status='reserved'"
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT COUNT(*) FROM attempts WHERE status='reserved'").fetchone()[
+                0
+            ]
+            == 0
+        )
 
 
 def test_e10_derives_weights_only_from_complete_full_shadow_artifacts(tmp_path: Path):
     hooks, context, _, _, _, repository = _request(tmp_path)
     project_configs = hooks.config.project_root / "configs/experiments"
     tree_config = project_configs / "e02_tree_ranker.yaml"
-    tree_config.write_text(
-        "plugin: fake:Tree\nn_estimators: 5\n", encoding="utf-8"
-    )
+    tree_config.write_text("plugin: fake:Tree\nn_estimators: 5\n", encoding="utf-8")
     train_features, train_targets = hooks._split_paths("train")
     assert train_targets is not None
     folds = materialize_shadow_folds(
@@ -524,9 +564,7 @@ def test_e10_derives_weights_only_from_complete_full_shadow_artifacts(tmp_path: 
                 / "effective-config-repair-1.yaml"
             )
             repaired_config.parent.mkdir(parents=True, exist_ok=True)
-            repaired_value = __import__("yaml").safe_load(
-                config_path.read_text(encoding="utf-8")
-            )
+            repaired_value = __import__("yaml").safe_load(config_path.read_text(encoding="utf-8"))
             repaired_value["epochs"] = repaired_epochs
             repaired_config.write_text(
                 __import__("yaml").safe_dump(repaired_value, sort_keys=True),
@@ -579,7 +617,11 @@ def test_e10_derives_weights_only_from_complete_full_shadow_artifacts(tmp_path: 
                 {
                     "candidate": metric.model_dump(mode="json", by_alias=True),
                     "reference": metric.model_copy(
-                        update={"GAUC": primary - 0.01, "ndcg5": primary - 0.01, "primary": primary - 0.01}
+                        update={
+                            "GAUC": primary - 0.01,
+                            "ndcg5": primary - 0.01,
+                            "primary": primary - 0.01,
+                        }
                     ).model_dump(mode="json", by_alias=True),
                 }
             )
@@ -802,9 +844,7 @@ def test_timeout_repair_changes_effective_workload_config_before_retry(tmp_path:
         },
         maximum=2,
     )
-    refs = hooks.repair_candidate(
-        RepairRequest(context, experiment, "cheap", plan)
-    )
+    refs = hooks.repair_candidate(RepairRequest(context, experiment, "cheap", plan))
     repaired_ref = next(item for item in refs if item.kind == "repaired_experiment_config")
     repaired = __import__("yaml").safe_load(Path(repaired_ref.path).read_text(encoding="utf-8"))
     original = __import__("yaml").safe_load(binding.config_path.read_text(encoding="utf-8"))
@@ -829,9 +869,7 @@ def test_timeout_repair_changes_effective_workload_config_before_retry(tmp_path:
         effective_config_artifact_id=repaired_ref.artifact_id,
     )
     experiment = repository.get_experiment(experiment["experiment_id"])
-    selected = hooks._effective_config(
-        RungRequest(context, experiment, card, binding, "cheap")
-    )
+    selected = hooks._effective_config(RungRequest(context, experiment, card, binding, "cheap"))
     assert selected == Path(repaired_ref.path)
     assert sha256_file(selected) == repaired_ref.sha256
     repaired_control = hooks._reference_config(
@@ -855,10 +893,7 @@ def test_corrupt_bundle_repair_quarantines_only_outputs_and_preserves_runner_evi
 ):
     hooks, context, experiment, _, _, repository = _request(tmp_path)
     attempt = (
-        context.run_dir
-        / "attempts"
-        / experiment["experiment_id"]
-        / "cheap-A-candidate-repair-0"
+        context.run_dir / "attempts" / experiment["experiment_id"] / "cheap-A-candidate-repair-0"
     )
     (attempt / "fit-output").mkdir(parents=True)
     (attempt / "fit-output/model_bundle.json").write_text("corrupt", encoding="utf-8")

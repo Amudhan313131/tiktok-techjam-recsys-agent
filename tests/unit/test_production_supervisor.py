@@ -21,10 +21,13 @@ def test_shipped_production_config_is_runnable_and_excludes_unsupported_cards() 
     assert config.method_cards["E07"].feature_recipe == "author_duration_affinity"
     assert config.method_cards["E08"].feature_recipe == "recency_history"
     assert config.scientific_execution == {
-        "max_parallel_workers": 2,
+        "max_parallel_workers": 6,
         "max_parallel_folds": 3,
         "parallel_candidate_control": True,
+        "max_memory_mb": 2048,
     }
+    assert config.baseline_cache_dir is None
+    assert config.control_cache_dir is None
 
 
 def test_proposal_context_contains_versioned_method_card_and_only_evidence_ids() -> None:

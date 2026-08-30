@@ -5,9 +5,10 @@ execution_mode: production
 # test prediction, and final submission remain explicitly disabled in code.
 scientific_execution_enabled: true
 scientific_execution:
-  max_parallel_workers: 2
+  max_parallel_workers: 6
   max_parallel_folds: 3
   parallel_candidate_control: true
+  max_memory_mb: 2048
 
 project_root: .
 runs_dir: runs

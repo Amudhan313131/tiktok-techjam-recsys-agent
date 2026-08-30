@@ -18,6 +18,7 @@ from rex.evaluation.baseline_cache import (
     baseline_cache_entry_path,
     materialize_baseline_cache,
     publish_baseline_cache,
+    quarantine_baseline_cache,
     validate_baseline_cache,
 )
 
@@ -384,6 +385,29 @@ def test_validate_rejects_tamper_extra_member_and_entry_symlink(tmp_path: Path) 
     entry.symlink_to(evidence_link, target_is_directory=True)
     with pytest.raises(BaselineCacheCorrupt, match="unsafe"):
         validate_baseline_cache(entry, identity_link)
+
+
+def test_corrupt_entry_is_quarantined_with_failure_evidence(tmp_path: Path) -> None:
+    identity = _identity()
+    evidence = _evidence(tmp_path / "evidence", identity)
+    entry = publish_baseline_cache(
+        tmp_path / "cache",
+        evidence,
+        identity,
+        origin_run_id="run",
+        origin_source_commit=SOURCE_COMMIT,
+    ).cache.entry_path
+    (entry / "payload/seed-3/stderr.log").write_text("corrupt\n", encoding="utf-8")
+    error = BaselineCacheCorrupt("controlled corruption")
+
+    quarantined = quarantine_baseline_cache(entry, identity, error)
+
+    assert quarantined is not None
+    assert not entry.exists()
+    assert quarantined.quarantine_path.is_dir()
+    event = json.loads(quarantined.evidence_path.read_text(encoding="utf-8"))
+    assert event["cache_key_sha256"] == identity.key
+    assert event["test_scored"] is False
 
 
 def test_interrupted_publish_leaves_no_visible_entry_or_staging(
