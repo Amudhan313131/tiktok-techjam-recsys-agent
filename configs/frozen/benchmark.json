@@ -5,6 +5,26 @@
   "label": "long_view",
   "metrics": ["GAUC", "nDCG@5"],
   "primary_formula": "(GAUC + nDCG@5) / 2",
+  "raw_files": {
+    "log_standard_4_08_to_4_21_pure.csv": {
+      "sha256": "5bb6eb0b3d9f47e5436cb5dc82ee1899b845ebf9750a5560b801e929e18bd41c",
+      "size_bytes": 83961282,
+      "data_rows": 1141112,
+      "header": ["user_id", "video_id", "date", "hourmin", "time_ms", "is_click", "is_like", "is_follow", "is_comment", "is_forward", "is_hate", "long_view", "play_time_ms", "duration_ms", "profile_stay_time", "comment_stay_time", "is_profile_enter", "is_rand", "tab"]
+    },
+    "log_standard_4_22_to_5_08_pure.csv": {
+      "sha256": "429e3b948828942e572f2c3a5be5a25799ffe75591d22d18cf417b9b534d31fd",
+      "size_bytes": 21765075,
+      "data_rows": 295497,
+      "header": ["user_id", "video_id", "date", "hourmin", "time_ms", "is_click", "is_like", "is_follow", "is_comment", "is_forward", "is_hate", "long_view", "play_time_ms", "duration_ms", "profile_stay_time", "comment_stay_time", "is_profile_enter", "is_rand", "tab"]
+    },
+    "video_features_basic_pure.csv": {
+      "sha256": "a6f7ee02684c5777422306cdc416e170302288aa89aca9dfea995edbd625bcc2",
+      "size_bytes": 626669,
+      "data_rows": 7583,
+      "header": ["video_id", "author_id", "video_type", "upload_dt", "upload_type", "visible_status", "video_duration", "server_width", "server_height", "music_id", "music_type", "tag"]
+    }
+  },
   "splits": {
     "train": {"split_start": 20220408, "split_end": 20220421, "observed_date_min": 20220409, "observed_date_max": 20220421, "rows": 1141112},
     "valid": {"split_start": 20220422, "split_end": 20220428, "observed_date_min": 20220422, "observed_date_max": 20220428, "rows": 124909},

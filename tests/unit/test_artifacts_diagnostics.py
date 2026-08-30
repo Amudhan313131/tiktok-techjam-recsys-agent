@@ -3,7 +3,14 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from rex.evaluation.diagnostics import aggregate_user_metrics, per_user_metrics, prediction_correlation, user_bootstrap_ci
+from rex.evaluation.diagnostics import (
+    aggregate_user_metrics,
+    compare_diagnostics,
+    per_user_metrics,
+    prediction_correlation,
+    user_bootstrap_ci,
+    user_bootstrap_delta_ci,
+)
 from rex.execution.artifacts import ArtifactError, load_prediction_artifact, write_prediction_artifact
 
 
@@ -39,3 +46,28 @@ def test_bootstrap_is_deterministic() -> None:
 
 def test_prediction_correlation_handles_constant_arrays() -> None:
     assert prediction_correlation(np.ones(3), np.ones(3)) == 0.0
+
+
+def test_paired_bootstrap_and_comparison_detect_improvement(feature_target_paths) -> None:
+    features, targets = feature_target_paths
+    from rex.data.views import load_feature_view, load_target_view
+
+    view = load_feature_view(features)
+    labels = load_target_view(targets).labels
+    candidate = labels.copy()
+    reference = 1.0 - labels
+    interval = user_bootstrap_delta_ci(
+        view.arrays["user_id"], labels, candidate, reference, samples=20, seed=3
+    )
+    assert interval["low"] > 0
+    comparison = compare_diagnostics(
+        view,
+        labels,
+        candidate,
+        reference,
+        history=view,
+        bootstrap_samples=20,
+        seed=3,
+    )
+    assert comparison["delta"]["primary"] > 0
+    assert comparison["primary_delta_ci"]["probability_positive"] == 1.0

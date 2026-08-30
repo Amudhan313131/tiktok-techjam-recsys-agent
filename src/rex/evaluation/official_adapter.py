@@ -1,10 +1,15 @@
-"""Protected adapter around the frozen organizer evaluator."""
+"""Protected subprocess adapter around the frozen organizer evaluator."""
 
 from __future__ import annotations
 
-import importlib.util
+import json
+import os
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
-from types import ModuleType
+
+import numpy as np
 
 from rex.contracts import Metrics
 from rex.data.manifest import verify_starter_manifest
@@ -16,15 +21,81 @@ class EvaluationError(RuntimeError):
     pass
 
 
-def _load_evaluator() -> tuple[ModuleType, str]:
+def official_evaluator_command(input_path: str | Path = "<private-input.npz>") -> list[str]:
     starter = verify_starter_manifest()
-    path = starter.root / "evaluate.py"
-    spec = importlib.util.spec_from_file_location("rex_frozen_evaluator", path)
-    if spec is None or spec.loader is None:
-        raise EvaluationError(f"cannot load evaluator: {path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module, starter.hashes["evaluate.py"]
+    process = Path(__file__).with_name("evaluator_process.py").resolve()
+    return [
+        sys.executable,
+        "-I",
+        str(process),
+        "--evaluator",
+        str(starter.root / "evaluate.py"),
+        "--input",
+        str(input_path),
+    ]
+
+
+def evaluate_arrays(
+    user_ids: np.ndarray,
+    labels: np.ndarray,
+    scores: np.ndarray,
+    *,
+    split: str,
+    fold: str | None = None,
+    seed: int | None = None,
+    timeout_seconds: int = 120,
+) -> Metrics:
+    if split not in {"train", "valid", "shadow"}:
+        raise EvaluationError(f"scoring split {split!r} is disabled in development")
+    users = np.asarray(user_ids, dtype=str)
+    targets = np.asarray(labels, dtype=np.float32)
+    predictions = np.asarray(scores, dtype=np.float64)
+    if not (len(users) == len(targets) == len(predictions)):
+        raise EvaluationError("evaluator inputs have different lengths")
+    if not np.isfinite(predictions).all():
+        raise EvaluationError("evaluator predictions contain NaN or Inf")
+    starter = verify_starter_manifest()
+    with tempfile.TemporaryDirectory(prefix="rex-evaluator-") as temporary:
+        input_path = Path(temporary) / "input.npz"
+        np.savez_compressed(
+            input_path, user_id=users, long_view=targets, score=predictions
+        )
+        command = official_evaluator_command(input_path)
+        environment = {
+            "PATH": os.environ.get("PATH", ""),
+            "LANG": os.environ.get("LANG", "C.UTF-8"),
+            "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
+            "PYTHONHASHSEED": "0",
+        }
+        completed = subprocess.run(
+            command,
+            cwd=temporary,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    if completed.returncode != 0:
+        summary = (completed.stderr or completed.stdout).strip()[-1000:]
+        raise EvaluationError(
+            f"official evaluator failed with exit {completed.returncode}: {summary}"
+        )
+    try:
+        raw = json.loads(completed.stdout)
+    except json.JSONDecodeError as error:
+        raise EvaluationError("official evaluator emitted invalid JSON") from error
+    return Metrics(
+        GAUC=float(raw["GAUC"]),
+        **{"nDCG@5": float(raw["nDCG@5"])},
+        primary=float(raw["primary"]),
+        users=int(raw["users"]),
+        rows=int(raw["rows"]),
+        evaluator_sha256=starter.hashes["evaluate.py"],
+        split=split,
+        fold=fold,
+        seed=seed,
+    )
 
 
 def evaluate_predictions(
@@ -36,26 +107,17 @@ def evaluate_predictions(
     fold: str | None = None,
     seed: int | None = None,
 ) -> Metrics:
-    if split == "test":
-        raise EvaluationError("hidden-test scoring is disabled in development")
+    if split not in {"train", "valid", "shadow"}:
+        raise EvaluationError(f"scoring split {split!r} is disabled in development")
     features = load_feature_view(feature_view_path)
     targets = load_target_view(target_view_path)
     predictions = load_prediction_artifact(prediction_path, features)
     if features.rows != len(targets.labels):
         raise EvaluationError("feature/target row mismatch")
-    module, evaluator_hash = _load_evaluator()
-    raw = module.evaluate(
+    return evaluate_arrays(
         features.arrays["user_id"].tolist(),
-        targets.labels.tolist(),
-        predictions["score"].tolist(),
-    )
-    return Metrics(
-        GAUC=float(raw["GAUC"]),
-        **{"nDCG@5": float(raw["nDCG@5"])},
-        primary=float(raw["primary"]),
-        users=int(raw["users"]),
-        rows=int(raw["rows"]),
-        evaluator_sha256=evaluator_hash,
+        targets.labels,
+        predictions["score"],
         split=split,
         fold=fold,
         seed=seed,

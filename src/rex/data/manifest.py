@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import csv
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +49,26 @@ class VerifiedStarter:
     manifest_sha256: str
 
 
+@dataclass(frozen=True)
+class VerifiedRawFile:
+    """Observed identity and schema for one immutable benchmark source file."""
+
+    path: Path
+    sha256: str
+    size_bytes: int
+    data_rows: int
+    header: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class VerifiedRawDataset:
+    """Complete, content-addressed raw dataset verification result."""
+
+    root: Path
+    files: dict[str, VerifiedRawFile]
+    identity_sha256: str
+
+
 def verify_starter_manifest(
     manifest_path: str | Path | None = None,
     root: str | Path | None = None,
@@ -89,3 +110,64 @@ def load_benchmark_manifest(path: str | Path | None = None) -> dict[str, Any]:
     if manifest.get("metrics") != ["GAUC", "nDCG@5"]:
         raise ManifestError("benchmark metric contract drifted")
     return manifest
+
+
+def verify_raw_dataset(
+    data_dir: str | Path,
+    *,
+    benchmark_path: str | Path | None = None,
+) -> VerifiedRawDataset:
+    """Verify byte identity, header, and record count for all required raw files.
+
+    This intentionally reads raw files without importing organizer code. It is the
+    independent gate that runs before trusted views are materialized.
+    """
+
+    root = Path(data_dir).resolve()
+    if not root.is_dir():
+        raise ManifestError(f"raw dataset root missing: {root}")
+    benchmark = load_benchmark_manifest(benchmark_path)
+    required = benchmark.get("raw_files")
+    if not isinstance(required, dict) or not required:
+        raise ManifestError("benchmark manifest has no raw_files contract")
+
+    observed: dict[str, VerifiedRawFile] = {}
+    errors: list[str] = []
+    for name, contract in sorted(required.items()):
+        path = root / name
+        if not path.is_file():
+            errors.append(f"missing {name}")
+            continue
+        size = path.stat().st_size
+        digest = sha256_file(path)
+        with path.open(newline="", encoding="utf-8") as handle:
+            reader = csv.reader(handle)
+            header = tuple(next(reader, ()))
+            rows = sum(1 for _ in reader)
+        expected_header = tuple(str(value) for value in contract["header"])
+        if digest != contract["sha256"]:
+            errors.append(f"{name} sha256 expected {contract['sha256']}, observed {digest}")
+        if size != int(contract["size_bytes"]):
+            errors.append(f"{name} size expected {contract['size_bytes']}, observed {size}")
+        if rows != int(contract["data_rows"]):
+            errors.append(f"{name} rows expected {contract['data_rows']}, observed {rows}")
+        if header != expected_header:
+            errors.append(f"{name} header expected {expected_header}, observed {header}")
+        observed[name] = VerifiedRawFile(path, digest, size, rows, header)
+    if errors:
+        raise ManifestError("raw dataset verification failed: " + "; ".join(errors))
+
+    identity = {
+        name: {
+            "sha256": item.sha256,
+            "size_bytes": item.size_bytes,
+            "data_rows": item.data_rows,
+            "header": list(item.header),
+        }
+        for name, item in sorted(observed.items())
+    }
+    return VerifiedRawDataset(
+        root=root,
+        files=observed,
+        identity_sha256=sha256_bytes(canonical_json_bytes(identity)),
+    )
