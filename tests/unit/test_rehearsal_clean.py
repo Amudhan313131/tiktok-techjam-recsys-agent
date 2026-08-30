@@ -416,6 +416,19 @@ def test_pre_injection_recovery_accepts_fixture_valid_progress_and_rejects_loops
             previous_progress_token=str(first["progress_token"]),
         )
 
+    with sqlite3.connect(main_database) as connection:
+        connection.execute(
+            "INSERT INTO artifacts(artifact_id,kind,path,sha256,size_bytes,schema_version,created_at) "
+            "VALUES(?,?,?,?,?,?,?)",
+            ("recovery-artifact", "recovery", "/evidence", "f" * 64, 1, "1.0", "now"),
+        )
+    main_progress = envelope._pre_injection_recovery(
+        ExitedProcess(),  # type: ignore[arg-type]
+        restart_number=2,
+        previous_progress_token=str(first["progress_token"]),
+    )
+    assert main_progress["progress_token"] != first["progress_token"]
+
     with sqlite3.connect(transaction_database) as connection:
         connection.execute(
             "UPDATE experiments SET commit_sha=? WHERE experiment_id=?",
@@ -423,11 +436,11 @@ def test_pre_injection_recovery_accepts_fixture_valid_progress_and_rejects_loops
         )
     second = envelope._pre_injection_recovery(
         ExitedProcess(),  # type: ignore[arg-type]
-        restart_number=2,
-        previous_progress_token=str(first["progress_token"]),
+        restart_number=3,
+        previous_progress_token=str(main_progress["progress_token"]),
     )
     assert second["decision"] == "resume-same-run"
-    assert second["progress_token"] != first["progress_token"]
+    assert second["progress_token"] != main_progress["progress_token"]
 
 
 def _artifact(path: Path, kind: str) -> dict[str, object]:

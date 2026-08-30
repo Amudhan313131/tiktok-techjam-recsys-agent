@@ -899,6 +899,35 @@ class R3Envelope:
                         (self.run_id,),
                     ).fetchone()[0]
                 ),
+                "artifacts": int(
+                    connection.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0]
+                ),
+                "llm_calls": int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM llm_calls WHERE run_id=?", (self.run_id,)
+                    ).fetchone()[0]
+                ),
+                "repairs": int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM experiment_repairs repair JOIN experiments experiment "
+                        "ON experiment.experiment_id=repair.experiment_id WHERE experiment.run_id=?",
+                        (self.run_id,),
+                    ).fetchone()[0]
+                ),
+                "completed_repairs": int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM experiment_repairs repair JOIN experiments experiment "
+                        "ON experiment.experiment_id=repair.experiment_id WHERE experiment.run_id=? "
+                        "AND repair.completed_at IS NOT NULL",
+                        (self.run_id,),
+                    ).fetchone()[0]
+                ),
+                "event_high_water": int(
+                    connection.execute(
+                        "SELECT COALESCE(MAX(sequence),0) FROM event_outbox WHERE run_id=?",
+                        (self.run_id,),
+                    ).fetchone()[0]
+                ),
             }
         finally:
             connection.close()
