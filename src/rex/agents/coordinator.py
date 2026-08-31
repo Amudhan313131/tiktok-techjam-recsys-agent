@@ -12,7 +12,7 @@ from typing import Any, Callable
 
 import yaml
 
-from rex.agents.patch_guard import PatchPolicy, validate_patch
+from rex.agents.patch_guard import PatchPolicy, PatchRejected, validate_patch
 from rex.agents.provider import ProviderResponse
 from rex.agents.services import AgentDecision, CodingService, PatchResponse, ProposalService
 from rex.agents.static_audit import (
@@ -404,7 +404,12 @@ class PatchTransactionCoordinator:
                     "fixture",
                     self.fixture_command,
                 )
-            except (PatchApplicationRejected, StaticAuditRejected, CandidateGateRejected) as error:
+            except (
+                PatchApplicationRejected,
+                PatchRejected,
+                StaticAuditRejected,
+                CandidateGateRejected,
+            ) as error:
                 if isinstance(error, StaticAuditRejected) and not self._repairable_static_failure(
                     error
                 ):
@@ -504,9 +509,15 @@ class PatchTransactionCoordinator:
         ):
             raise CandidateGateRejected("bound config must name the exact model plugin")
         executed_plugin_path = plugin_source_path(str(config_value["plugin"]))
-        if relative_config not in paths and executed_plugin_path not in paths:
+        executed_code_paths = context.get("executed_code_paths", ())
+        if not isinstance(executed_code_paths, (list, tuple)) or not all(
+            isinstance(path, str) and path for path in executed_code_paths
+        ):
+            raise CandidateGateRejected("executed code path contract is malformed")
+        executable_paths = {relative_config, executed_plugin_path, *executed_code_paths}
+        if not executable_paths.intersection(paths):
             raise CandidateGateRejected(
-                "live patch does not change the bound config or the plugin it executes"
+                "live patch does not change the bound config or declared executed code"
             )
         allowed_namespace = str(context.get("allowed_model_namespace") or "").strip()
         if allowed_namespace:

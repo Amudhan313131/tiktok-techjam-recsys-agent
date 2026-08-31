@@ -52,6 +52,7 @@ from rex.control.control_cache import (
     stable_environment_sha256,
 )
 from rex.control.production_supervisor import (
+    CARD_CODE_PATHS,
     CARD_READONLY_CONTEXT_PATHS,
     BaselineGateResult,
     CandidatePreparation,
@@ -1353,6 +1354,7 @@ class ProductionScientificHooks(ProductionHooks):
                 "bound_config": relative_config,
                 "require_executed_change": True,
                 "allowed_model_namespace": "src/rex/models/experimental/**",
+                "executed_code_paths": list(CARD_CODE_PATHS.get(card.card_id, ())),
             },
         }
         allowed_file_snapshots = self._allowed_file_snapshots(proposal_context)
@@ -1394,6 +1396,7 @@ class ProductionScientificHooks(ProductionHooks):
                     },
                     "require_executed_change": True,
                     "allowed_model_namespace": "src/rex/models/experimental/**",
+                    "executed_code_paths": list(CARD_CODE_PATHS.get(card.card_id, ())),
                     "test_scored": False,
                 },
                 external_parent=True,
@@ -1415,9 +1418,14 @@ class ProductionScientificHooks(ProductionHooks):
             ):
                 raise RuntimeError("live candidate config must name the exact model plugin")
             plugin_path = plugin_source_path(str(config_value["plugin"]))
-            if relative_config not in paths and plugin_path not in paths:
+            executable_paths = {
+                relative_config,
+                plugin_path,
+                *CARD_CODE_PATHS.get(card.card_id, ()),
+            }
+            if not executable_paths.intersection(paths):
                 raise RuntimeError(
-                    "live patch does not change the bound config or the plugin it executes"
+                    "live patch does not change the bound config or declared executed code"
                 )
             if plugin_path in paths and not plugin_path.startswith("src/rex/models/experimental/"):
                 raise RuntimeError("live plugin patch is outside the experimental allowlist")

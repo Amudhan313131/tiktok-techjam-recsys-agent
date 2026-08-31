@@ -156,6 +156,144 @@ def test_executed_plugin_only_patch_is_accepted_after_unrelated_patch_repair(
     ) == "VALUE = 2"
 
 
+def test_declared_executed_feature_path_satisfies_candidate_contract(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    config = project / "configs/experiments/e17.yaml"
+    feature = project / "src/rex/features/categorical_crosses.py"
+    config.parent.mkdir(parents=True)
+    feature.parent.mkdir(parents=True)
+    config.write_text(
+        "plugin: rex.models.experimental.context_fm:ExperimentalContextEnsembleFMPlugin\n",
+        encoding="utf-8",
+    )
+    feature.write_text("RARE_INDEX = 1\n", encoding="utf-8")
+
+    PatchTransactionCoordinator._validate_executed_change(
+        project,
+        ("src/rex/features/categorical_crosses.py",),
+        {
+            "bound_config": "configs/experiments/e17.yaml",
+            "require_executed_change": True,
+            "allowed_model_namespace": "src/rex/models/experimental/**",
+            "executed_code_paths": ["src/rex/features/categorical_crosses.py"],
+        },
+    )
+
+
+def test_patch_policy_rejection_enters_bounded_repair_loop(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    model = project / "src/rex/models/experimental/model.py"
+    forbidden = project / "src/rex/features/not_declared_safe.py"
+    config = project / "configs/experiments/model.yaml"
+    fixture = project / "tests/fixture/test_smoke.py"
+    model.parent.mkdir(parents=True)
+    forbidden.parent.mkdir(parents=True)
+    config.parent.mkdir(parents=True)
+    fixture.parent.mkdir(parents=True)
+    model.write_text("VALUE = 1\n", encoding="utf-8")
+    forbidden.write_text("VALUE = 1\n", encoding="utf-8")
+    config.write_text(
+        "plugin: rex.models.experimental.model:Plugin\n",
+        encoding="utf-8",
+    )
+    fixture.write_text("def test_smoke():\n    assert True\n", encoding="utf-8")
+    git(project, "init")
+    git(project, "config", "user.email", "rex@example.invalid")
+    git(project, "config", "user.name", "REX Patch Policy Regression")
+    git(project, "add", "--all")
+    git(project, "commit", "-m", "root")
+    parent = git(project, "rev-parse", "HEAD")
+    database = Database(tmp_path / "state.sqlite3")
+    database.initialize()
+    repository = ExperimentRepository(database)
+    repository.create_run(
+        run_id="run",
+        deadline_epoch_ms=deadline_epoch_ms(300),
+        root_commit=parent,
+        environment_sha256=HASH,
+        data_manifest_sha256=HASH,
+        evaluator_sha256=HASH,
+    )
+    proposal = {
+        "experiment_id": "policy-repair",
+        "parent_id": None,
+        "operator": "FEATURE",
+        "hypothesis": "A bounded repair should recover from an out-of-policy patch.",
+        "mechanism": "The second patch changes the executed plugin only.",
+        "primary_change": "controlled model constant",
+        "files_to_change": [
+            "src/rex/features/not_declared_safe.py",
+            "src/rex/models/experimental/model.py",
+        ],
+        "expected_metric_effects": {"primary": "increase"},
+        "falsifier": "fixture rejection",
+        "leakage_analysis": "No labels are accessed.",
+        "estimated_seconds": 1,
+        "cheap_rung": {"fold": "A"},
+        "full_rung": {"folds": ["A", "B", "C"]},
+    }
+    forbidden_patch = {
+        "patch": (
+            "--- a/src/rex/features/not_declared_safe.py\n"
+            "+++ b/src/rex/features/not_declared_safe.py\n"
+            "@@ -1 +1 @@\n-VALUE = 1\n+VALUE = 2\n"
+        ),
+        "rationale": "This path is deliberately outside policy.",
+        "tests": ["fixture"],
+    }
+    accepted_patch = {
+        "patch": (
+            "--- a/src/rex/models/experimental/model.py\n"
+            "+++ b/src/rex/models/experimental/model.py\n"
+            "@@ -1 +1 @@\n-VALUE = 1\n+VALUE = 2\n"
+        ),
+        "rationale": "Repair the exact executed plugin within policy.",
+        "tests": ["fixture"],
+    }
+    provider = FakeProvider([proposal, forbidden_patch, accepted_patch])
+    coordinator = PatchTransactionCoordinator(
+        repository=repository,
+        proposal_service=ProposalService(provider),
+        coding_service=CodingService(provider),
+        project_root=project,
+        worktree_root=tmp_path / "worktrees",
+        patch_policy=PatchPolicy(
+            allowed=("src/rex/models/experimental/**",),
+            denied=(),
+        ),
+        max_patch_repairs=1,
+    )
+
+    prepared = coordinator.prepare(
+        run_id="run",
+        parent_commit=parent,
+        proposal_context={"experiment_id": "policy-repair", "artifact_ids": []},
+        coding_context={
+            "bound_config": "configs/experiments/model.yaml",
+            "require_executed_change": True,
+            "allowed_model_namespace": "src/rex/models/experimental/**",
+            "executed_code_paths": [],
+            "allowed_file_snapshots": {
+                "src/rex/features/not_declared_safe.py": "VALUE = 1\n",
+                "src/rex/models/experimental/model.py": "VALUE = 1\n",
+            },
+        },
+    )
+
+    rejection = json.loads(
+        (
+            tmp_path
+            / "worktrees/_artifacts/policy-repair/patch-attempt-1-rejection.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert rejection["failure_stage"] == "application"
+    assert "outside the patch allowlist" in rejection["error"]
+    assert repository.experiment_repairs_used("policy-repair") == 1
+    assert git(prepared.workspace.root, "show", "HEAD:src/rex/models/experimental/model.py") == (
+        "VALUE = 2"
+    )
+
+
 def test_agent_patch_transaction_commits_in_isolated_worktree(tmp_path: Path) -> None:
     project = tmp_path / "project"
     model = project / "src/rex/models/experimental/model.py"

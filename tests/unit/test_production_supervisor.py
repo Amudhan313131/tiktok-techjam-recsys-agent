@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from rex.agents.recovery import RepairAction, plan_repair
+from rex.agents.patch_guard import PatchPolicy, validate_patch
 from rex.agents.search_policy import METHOD_CARD_VERSION, SearchPolicy
 from rex.contracts import AttemptStatus
 from rex.control.production_supervisor import ProductionRunConfig
@@ -134,6 +135,20 @@ def test_e16_is_a_config_only_one_to_five_isolation() -> None:
     assert candidate["ensemble_members"] == control["ensemble_members"] == 1
     assert candidate["aggregation"] == control["aggregation"] == "mean"
     assert candidate["plugin"] == control["plugin"]
+
+
+def test_every_method_card_code_surface_is_in_the_production_patch_policy() -> None:
+    config = ProductionRunConfig.load(repo_root() / "configs/run/production.yaml")
+    policy = PatchPolicy.from_yaml(config.protected_paths)
+    for path in sorted({path for paths in CARD_CODE_PATHS.values() for path in paths}):
+        patch = (
+            f"--- a/{path}\n"
+            f"+++ b/{path}\n"
+            "@@ -1 +1 @@\n"
+            "-OLD\n"
+            "+NEW\n"
+        )
+        assert validate_patch(patch, policy, declared_files=[path]) == (path,)
 
 
 def test_blend_requires_promoted_pairwise_and_distinct_tree_history_branch() -> None:

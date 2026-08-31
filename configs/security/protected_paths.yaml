@@ -2,6 +2,13 @@ schema_version: "1.0"
 allow:
   - src/rex/models/experimental/**
   - src/rex/features/experimental/**
+  # Explicit protected feature surfaces bound by production method cards.
+  # Keeping these paths exact avoids granting the researcher the whole feature
+  # package while allowing the declared feature experiments to execute.
+  - src/rex/features/categorical_crosses.py
+  - src/rex/features/candidate_recency.py
+  - src/rex/features/multifeedback_history.py
+  - src/rex/features/quantile_buckets.py
   - src/rex/losses/experimental/**
   - configs/experiments/**
   - tests/experiments/**
