@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
 
@@ -906,6 +907,37 @@ def test_timeout_repair_changes_effective_workload_config_before_retry(tmp_path:
         (item.kind, item.sha256) for item in refs
     ]
     assert __import__("yaml").safe_load(selected.read_text(encoding="utf-8")) == repaired
+
+
+def test_repaired_reference_config_is_safe_under_parallel_folds(tmp_path: Path):
+    hooks, context, experiment, card, binding, repository = _request(tmp_path)
+    candidate = binding.config_path.parent / "repaired-parallel.yaml"
+    value = __import__("yaml").safe_load(binding.config_path.read_text(encoding="utf-8"))
+    value["n_jobs"] = 1
+    candidate.write_text(
+        __import__("yaml").safe_dump(value, sort_keys=True), encoding="utf-8"
+    )
+    repaired_ref = artifact_ref(candidate, "repaired_experiment_config")
+    repository.register_artifact(repaired_ref, experiment_id=experiment["experiment_id"])
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        paths = list(
+            executor.map(
+                lambda _index: hooks._reference_config(
+                    context,
+                    experiment["experiment_id"],
+                    card.card_id,
+                    candidate,
+                ),
+                range(24),
+            )
+        )
+
+    assert len(set(paths)) == 1
+    reference = __import__("yaml").safe_load(paths[0].read_text(encoding="utf-8"))
+    assert reference["n_jobs"] == 1
+    assert reference["repair_provenance"]["candidate_config_sha256"] == sha256_file(candidate)
+    assert not list(paths[0].parent.glob("*.tmp"))
 
 
 def test_corrupt_bundle_repair_quarantines_only_outputs_and_preserves_runner_evidence(

@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import uuid
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -2080,9 +2081,16 @@ class ProductionScientificHooks(ProductionHooks):
             / f"reference-effective-{candidate_hash[:16]}.yaml"
         )
         destination.parent.mkdir(parents=True, exist_ok=True)
-        temporary = destination.with_suffix(destination.suffix + ".tmp")
-        temporary.write_text(yaml.safe_dump(reference_value, sort_keys=True), encoding="utf-8")
-        temporary.replace(destination)
+        temporary = destination.with_suffix(
+            destination.suffix + f".{uuid.uuid4().hex}.tmp"
+        )
+        try:
+            temporary.write_text(
+                yaml.safe_dump(reference_value, sort_keys=True), encoding="utf-8"
+            )
+            os.replace(temporary, destination)
+        finally:
+            temporary.unlink(missing_ok=True)
         return destination
 
     @staticmethod
