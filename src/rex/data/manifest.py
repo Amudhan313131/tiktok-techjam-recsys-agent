@@ -113,6 +113,18 @@ def load_benchmark_manifest(path: str | Path | None = None) -> dict[str, Any]:
         raise ManifestError("benchmark label must be long_view")
     if manifest.get("metrics") != ["GAUC", "nDCG@5"]:
         raise ManifestError("benchmark metric contract drifted")
+    static = manifest.get("static_metadata")
+    if static is not None:
+        if not isinstance(static, dict) or static.get("schema_version") != "1.0":
+            raise ManifestError("static metadata contract drifted")
+        if static.get("user_source") != "user_features_pure.csv":
+            raise ManifestError("static metadata user source is not allow-listed")
+        if static.get("video_source") != "video_features_basic_pure.csv":
+            raise ManifestError("static metadata video source is not allow-listed")
+        if static.get("forbidden_source") != "video_features_statistic_pure.csv":
+            raise ManifestError("static metadata forbidden-source contract drifted")
+        if "video_features_statistic_pure.csv" in manifest.get("raw_files", {}):
+            raise ManifestError("outcome-derived video statistics may not enter raw feature identity")
     return manifest
 
 

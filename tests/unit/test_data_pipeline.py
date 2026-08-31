@@ -228,6 +228,9 @@ def test_shadow_and_cheap_views_are_cached_and_keep_complete_users(tmp_path: Pat
     replay = materialize_shadow_folds(feature, target, tmp_path / "folds")
     assert [fold.identity_sha256 for fold in replay] == [fold.identity_sha256 for fold in folds]
     cheap = materialize_cheap_view(folds[0], tmp_path / "cheap", fraction=0.5, seed=4)
+    cheap_replay = materialize_cheap_view(folds[0], tmp_path / "cheap", fraction=0.5, seed=4)
+    assert cheap_replay.identity_sha256 == cheap.identity_sha256
+    assert cheap.sample_row_ids is not None and cheap.sample_row_ids.is_file()
     valid = load_feature_view(cheap.valid_features)
     train = load_feature_view(cheap.train_features)
     selected = set(valid.arrays["user_id"])
@@ -237,6 +240,19 @@ def test_shadow_and_cheap_views_are_cached_and_keep_complete_users(tmp_path: Pat
         assert int(np.sum(valid.arrays["user_id"] == user)) == int(
             np.sum(parent_valid.arrays["user_id"] == user)
         )
+    persisted = np.load(cheap.sample_row_ids)
+    assert np.array_equal(
+        persisted["valid_source_row_id"],
+        valid.arrays.get("fx__source_row_id", valid.arrays["row_id"]),
+    )
+    manifest = json.loads(cheap.manifest.read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == "2.0"
+    assert manifest["stratification"]["dimensions"] == [
+        "train_history",
+        "dominant_tab",
+        "duration_quartile",
+        "repeat",
+    ]
 
 
 @pytest.mark.parametrize(

@@ -21,7 +21,12 @@ pytestmark = [
 
 def test_real_raw_data_and_sanitized_split_contract(tmp_path) -> None:
     verified = verify_raw_dataset(default_data_dir())
-    assert len(verified.files) == 3
+    assert set(verified.files) == {
+        "log_standard_4_08_to_4_21_pure.csv",
+        "log_standard_4_22_to_5_08_pure.csv",
+        "user_features_pure.csv",
+        "video_features_basic_pure.csv",
+    }
     manifest = bootstrap_views(default_data_dir(), tmp_path / "views")
     assert [manifest["splits"][name]["row_count"] for name in ("train", "valid", "test")] == [
         1_141_112,
@@ -29,6 +34,8 @@ def test_real_raw_data_and_sanitized_split_contract(tmp_path) -> None:
         170_588,
     ]
     assert manifest["splits"]["test"]["target_path"] is None
+    assert manifest["splits"]["test"]["feedback_target_path"] is None
+    assert manifest["static_metadata"]["identity_sha256"]
     assert_no_test_target_artifact(tmp_path / "views")
 
 

@@ -9,7 +9,15 @@ import numpy as np
 
 from rex.contracts import RunRequest
 from rex.data.manifest import load_benchmark_manifest
-from rex.data.views import ENGINEERED_PREFIX, FEATURE_COLUMNS, load_feature_view
+from rex.data.views import (
+    ENGINEERED_PREFIX,
+    FEATURE_COLUMNS,
+    STATIC_METADATA_COLUMNS,
+    TEMPORAL_ORDER_COLUMNS,
+    load_feature_view,
+    load_feedback_target_view,
+)
+from rex.features.static_metadata import FORBIDDEN_STATISTIC_FIELDS
 
 
 class CapabilityViolation(PermissionError):
@@ -44,14 +52,28 @@ def _resolve_regular_file(path: str | Path, *, kind: str) -> Path:
 
 def assert_sanitized_feature_view(arrays: dict[str, np.ndarray]) -> None:
     forbidden = set(load_benchmark_manifest()["forbidden_inference_columns"])
-    overlap = forbidden.intersection(arrays)
+    normalized = {
+        name: name.removeprefix(ENGINEERED_PREFIX)
+        .removeprefix("meta__")
+        .removeprefix("meta_num__")
+        .removeprefix("identity__")
+        for name in arrays
+    }
+    overlap = forbidden.intersection(normalized.values())
     if overlap:
         raise CapabilityViolation(f"feature view contains forbidden outcomes: {sorted(overlap)}")
+    statistics = FORBIDDEN_STATISTIC_FIELDS.intersection(normalized.values())
+    if statistics:
+        raise CapabilityViolation(
+            "feature view contains forbidden month-level statistics: "
+            f"{sorted(statistics)}"
+        )
     missing = set(FEATURE_COLUMNS) - set(arrays)
+    allowed = set(FEATURE_COLUMNS) | set(TEMPORAL_ORDER_COLUMNS) | set(STATIC_METADATA_COLUMNS)
     invalid = {
         name
         for name in arrays
-        if name not in FEATURE_COLUMNS and not name.startswith(ENGINEERED_PREFIX)
+        if name not in allowed and not name.startswith(ENGINEERED_PREFIX)
     }
     if missing or invalid:
         raise CapabilityViolation(
@@ -63,6 +85,17 @@ def validate_sanitized_feature_view(path: str | Path) -> None:
     _resolve_regular_file(path, kind="feature")
     view = load_feature_view(path)
     assert_sanitized_feature_view(view.arrays)
+
+
+def validate_feedback_target_view(path: str | Path, *, split: str) -> None:
+    """Validate an auxiliary feedback capability without granting it to test."""
+
+    candidate = _resolve_regular_file(path, kind="feedback target")
+    if split not in {"train", "valid"}:
+        raise CapabilityViolation("feedback targets are restricted to train and valid")
+    if "test" in candidate.name.lower():
+        raise CapabilityViolation("test feedback targets are never an authorized capability")
+    load_feedback_target_view(candidate)
 
 
 def validate_worker_request(
@@ -110,6 +143,21 @@ def assert_no_test_target_artifact(view_root: str | Path) -> None:
     )
     if offenders:
         raise CapabilityViolation(f"forbidden test target artifacts: {offenders}")
+
+
+def assert_no_test_feedback_target_artifact(view_root: str | Path) -> None:
+    """Fail closed for any auxiliary-feedback artifact associated with test."""
+
+    root = Path(view_root)
+    offenders = sorted(
+        str(path)
+        for path in root.rglob("*")
+        if path.is_file()
+        and "test" in path.name.lower()
+        and ("feedback" in path.name.lower() or "target" in path.name.lower())
+    )
+    if offenders:
+        raise CapabilityViolation(f"forbidden test feedback artifacts: {offenders}")
 
 
 def assert_outcome_poison_invariant(

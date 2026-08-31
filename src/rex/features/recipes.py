@@ -6,7 +6,7 @@ import json
 import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeAlias
 
 import numpy as np
 
@@ -17,6 +17,25 @@ from rex.features.history_summaries import (
     apply_candidate_history_state,
     candidate_history_summaries,
     fit_candidate_history_state,
+)
+from rex.features.candidate_recency import (
+    apply_candidate_recency_state,
+    candidate_recency_features,
+    fit_candidate_recency_state,
+)
+from rex.features.categorical_crosses import (
+    CategoricalCrossSpec,
+    apply_categorical_crosses,
+    fit_categorical_crosses,
+)
+from rex.features.multifeedback_history import (
+    apply_multifeedback_state,
+    fit_multifeedback_state,
+    multifeedback_history_features,
+)
+from rex.features.quantile_buckets import (
+    apply_quantile_buckets,
+    fit_quantile_buckets,
 )
 from rex.features.repeat_exposure import (
     apply_repeat_exposure_state,
@@ -38,6 +57,10 @@ RecipeBuilder = Literal[
     "candidate_history",
     "repeat_exposure",
     "recency_history",
+    "candidate_recency",
+    "candidate_recency_buckets",
+    "multifeedback_history",
+    "categorical_cross",
 ]
 
 
@@ -63,6 +86,30 @@ class RecipeArtifact:
     apply_features: Path
     manifest: Path
     identity_sha256: str
+
+
+@dataclass(frozen=True)
+class CompositeFeatureRecipe:
+    """An ordered set of independently controlled feature mechanisms."""
+
+    name: str
+    version: str
+    components: tuple[FeatureRecipe, ...]
+
+    def __post_init__(self) -> None:
+        if not self.components:
+            raise ValueError("composite feature recipe requires at least one component")
+        output_names = [name for component in self.components for name in component.output_features]
+        duplicates = sorted({name for name in output_names if output_names.count(name) > 1})
+        if duplicates:
+            raise ValueError(f"composite recipe output collision: {duplicates}")
+
+    @property
+    def identity_sha256(self) -> str:
+        return sha256_bytes(canonical_json_bytes(asdict(self)))
+
+
+RecipeDefinition: TypeAlias = FeatureRecipe | CompositeFeatureRecipe
 
 
 VIDEO_STATISTICS = FeatureRecipe(
@@ -122,6 +169,107 @@ RECENCY_HISTORY = FeatureRecipe(
     cutoff="strictly earlier training date; frozen before evaluation",
     params={"half_life_days": 7.0, "prior_strength": 10.0},
 )
+POINT_IN_TIME_CANDIDATE_RECENCY = FeatureRecipe(
+    name="point_in_time_candidate_recency",
+    version="1.0",
+    builder="candidate_recency",
+    output_features=(
+        "pt_user_author_rate",
+        "pt_user_author_count",
+        "pt_user_author_days_since",
+        "pt_user_video_count",
+        "pt_user_video_positive",
+        "pt_user_video_last_outcome",
+        "pt_user_video_days_since",
+        "pt_user_rate_h1p0",
+        "pt_user_count_h1p0",
+        "pt_user_rate_h3p0",
+        "pt_user_count_h3p0",
+        "pt_user_rate_h7p0",
+        "pt_user_count_h7p0",
+        "pt_user_rate_h14p0",
+        "pt_user_count_h14p0",
+    ),
+    cutoff="strictly earlier timestamp group; frozen outcomes before evaluation",
+    params={
+        "half_lives_days": "1,3,7,14",
+        "candidate_half_life_days": 7.0,
+        "prior_strength": 10.0,
+    },
+)
+MULTIFEEDBACK_HISTORY = FeatureRecipe(
+    name="multifeedback_history",
+    version="1.0",
+    builder="multifeedback_history",
+    output_features=(
+        "pt_feedback_user_count",
+        "pt_feedback_user_click_rate",
+        "pt_feedback_user_like_rate",
+        "pt_feedback_user_follow_rate",
+        "pt_feedback_user_hate_rate",
+        "pt_feedback_user_long_view_rate",
+        "pt_feedback_user_author_count",
+        "pt_feedback_user_author_click_rate",
+        "pt_feedback_user_author_like_rate",
+        "pt_feedback_user_author_long_view_rate",
+        "pt_feedback_video_count",
+        "pt_feedback_video_click_rate",
+        "pt_feedback_video_long_view_rate",
+        "pt_feedback_author_count",
+        "pt_feedback_author_click_rate",
+        "pt_feedback_author_long_view_rate",
+    ),
+    cutoff="strictly earlier timestamp group; frozen outcomes before evaluation",
+    params={"prior_strength": 20.0},
+)
+RICH_TEMPORAL_HISTORY = CompositeFeatureRecipe(
+    name="rich_temporal_history",
+    version="1.0",
+    components=(POINT_IN_TIME_CANDIDATE_RECENCY, MULTIFEEDBACK_HISTORY),
+)
+CANDIDATE_RECENCY_BUCKET_FIELDS = (
+    "pt_user_author_rate",
+    "pt_user_author_count",
+    "pt_user_author_days_since",
+    "pt_user_video_count",
+    "pt_user_video_positive",
+    "pt_user_video_days_since",
+    "pt_user_rate_h1p0",
+    "pt_user_rate_h7p0",
+)
+CANDIDATE_RECENCY_BUCKETS = FeatureRecipe(
+    name="candidate_recency_buckets",
+    version="1.0",
+    builder="candidate_recency_buckets",
+    output_features=tuple(f"bucket__{name}" for name in CANDIDATE_RECENCY_BUCKET_FIELDS),
+    cutoff=(
+        "strictly earlier timestamp history; categorical boundaries fitted only on the "
+        "training partition and frozen before evaluation"
+    ),
+    params={
+        "half_lives_days": "1,3,7,14",
+        "candidate_half_life_days": 7.0,
+        "prior_strength": 10.0,
+        "quantile_bins": 8,
+        "count_cap": 64,
+    },
+)
+USER_TAB_CROSS = FeatureRecipe(
+    name="user_tab_cross",
+    version="1.0",
+    builder="categorical_cross",
+    output_features=("user_tab_cross",),
+    cutoff="train-fitted support vocabulary; no targets",
+    params={"left": "user_id", "right": "tab", "min_count": 3},
+)
+VIDEO_TAB_CROSS = FeatureRecipe(
+    name="video_tab_cross",
+    version="1.0",
+    builder="categorical_cross",
+    output_features=("video_tab_cross",),
+    cutoff="train-fitted support vocabulary; no targets",
+    params={"left": "video_id", "right": "tab", "min_count": 3},
+)
 
 
 def control_recipe(recipe: FeatureRecipe) -> FeatureRecipe:
@@ -166,6 +314,27 @@ def _recipe_provenance(bundle: FeatureBundle, recipe: FeatureRecipe) -> FeatureB
     )
 
 
+def _definition_provenance(
+    bundle: FeatureBundle, recipe: RecipeDefinition
+) -> FeatureBundle:
+    if isinstance(recipe, FeatureRecipe):
+        return _recipe_provenance(bundle, recipe)
+    return FeatureBundle(
+        arrays=bundle.arrays,
+        provenance={
+            name: {
+                **details,
+                "composite_recipe": recipe.name,
+                "composite_recipe_version": recipe.version,
+                "component_identities": [
+                    component.identity_sha256 for component in recipe.components
+                ],
+            }
+            for name, details in bundle.provenance.items()
+        },
+    )
+
+
 def _zero_bundles(recipe: FeatureRecipe, train_rows: int, apply_rows: int) -> tuple[FeatureBundle, FeatureBundle]:
     provenance = {
         name: {"cutoff": recipe.cutoff, "control": True, "recipe": recipe.name}
@@ -183,7 +352,38 @@ def _zero_bundles(recipe: FeatureRecipe, train_rows: int, apply_rows: int) -> tu
     )
 
 
-def _build(recipe: FeatureRecipe, train_path: Path, target_path: Path, apply_path: Path) -> tuple[FeatureBundle, FeatureBundle]:
+def _temporal_array(view, name: str) -> np.ndarray:
+    aliases = {
+        "source_row_key": ("source_row_key", "source_global_row_key", "fx__source_row_key"),
+        "time_ms": ("time_ms", "fx__time_ms"),
+    }
+    for candidate in aliases[name]:
+        if candidate in view.arrays:
+            return view.arrays[candidate]
+    raise ValueError(f"feature view is missing required temporal column {name}")
+
+
+def _load_auxiliary_targets(path: Path | None, expected_rows: int) -> dict[str, np.ndarray]:
+    if path is None:
+        raise ValueError("multifeedback_history requires an auxiliary target view")
+    with np.load(path, allow_pickle=False) as saved:
+        required = ("is_click", "is_like", "is_follow", "is_hate", "long_view")
+        missing = [name for name in required if name not in saved.files]
+        if missing:
+            raise ValueError(f"auxiliary target view is missing: {missing}")
+        result = {name: np.asarray(saved[name], dtype=np.float32) for name in required}
+    if any(value.shape != (expected_rows,) for value in result.values()):
+        raise ValueError("auxiliary target view rows differ from training features")
+    return result
+
+
+def _build(
+    recipe: FeatureRecipe,
+    train_path: Path,
+    target_path: Path,
+    apply_path: Path,
+    auxiliary_target_path: Path | None = None,
+) -> tuple[FeatureBundle, FeatureBundle]:
     train = load_feature_view(train_path)
     targets = load_target_view(target_path)
     apply = load_feature_view(apply_path)
@@ -317,7 +517,174 @@ def _build(recipe: FeatureRecipe, train_path: Path, target_path: Path, apply_pat
             apply.arrays["user_id"], apply.arrays["date"], state
         )
         return train_bundle, apply_bundle
+    if recipe.builder == "candidate_recency":
+        half_lives = tuple(
+            float(value)
+            for value in str(recipe.params.get("half_lives_days", "1,3,7,14")).split(",")
+        )
+        prior = float(recipe.params.get("prior_strength", 10.0))
+        candidate_half_life = float(recipe.params.get("candidate_half_life_days", 7.0))
+        train_bundle = candidate_recency_features(
+            train.arrays["user_id"],
+            train.arrays["video_id"],
+            train.arrays["author_id"],
+            _temporal_array(train, "time_ms"),
+            _temporal_array(train, "source_row_key"),
+            targets.labels,
+            half_lives_days=half_lives,
+            prior_strength=prior,
+            candidate_half_life_days=candidate_half_life,
+        )
+        state = fit_candidate_recency_state(
+            train.arrays["user_id"],
+            train.arrays["video_id"],
+            train.arrays["author_id"],
+            _temporal_array(train, "time_ms"),
+            _temporal_array(train, "source_row_key"),
+            targets.labels,
+            half_lives_days=half_lives,
+            prior_strength=prior,
+            candidate_half_life_days=candidate_half_life,
+        )
+        apply_bundle = apply_candidate_recency_state(
+            apply.arrays["user_id"],
+            apply.arrays["video_id"],
+            apply.arrays["author_id"],
+            _temporal_array(apply, "time_ms"),
+            state,
+        )
+        return train_bundle, apply_bundle
+    if recipe.builder == "candidate_recency_buckets":
+        half_lives = tuple(
+            float(value)
+            for value in str(recipe.params.get("half_lives_days", "1,3,7,14")).split(",")
+        )
+        prior = float(recipe.params.get("prior_strength", 10.0))
+        candidate_half_life = float(recipe.params.get("candidate_half_life_days", 7.0))
+        train_history = candidate_recency_features(
+            train.arrays["user_id"],
+            train.arrays["video_id"],
+            train.arrays["author_id"],
+            _temporal_array(train, "time_ms"),
+            _temporal_array(train, "source_row_key"),
+            targets.labels,
+            half_lives_days=half_lives,
+            prior_strength=prior,
+            candidate_half_life_days=candidate_half_life,
+        )
+        history_state = fit_candidate_recency_state(
+            train.arrays["user_id"],
+            train.arrays["video_id"],
+            train.arrays["author_id"],
+            _temporal_array(train, "time_ms"),
+            _temporal_array(train, "source_row_key"),
+            targets.labels,
+            half_lives_days=half_lives,
+            prior_strength=prior,
+            candidate_half_life_days=candidate_half_life,
+        )
+        apply_history = apply_candidate_recency_state(
+            apply.arrays["user_id"],
+            apply.arrays["video_id"],
+            apply.arrays["author_id"],
+            _temporal_array(apply, "time_ms"),
+            history_state,
+        )
+        bucket_state = fit_quantile_buckets(
+            train_history,
+            CANDIDATE_RECENCY_BUCKET_FIELDS,
+            quantile_bins=int(recipe.params.get("quantile_bins", 8)),
+            count_cap=int(recipe.params.get("count_cap", 64)),
+        )
+        return (
+            apply_quantile_buckets(train_history, bucket_state),
+            apply_quantile_buckets(apply_history, bucket_state),
+        )
+    if recipe.builder == "multifeedback_history":
+        prior = float(recipe.params.get("prior_strength", 20.0))
+        feedback = _load_auxiliary_targets(auxiliary_target_path, train.rows)
+        train_bundle = multifeedback_history_features(
+            train.arrays["user_id"],
+            train.arrays["video_id"],
+            train.arrays["author_id"],
+            _temporal_array(train, "time_ms"),
+            _temporal_array(train, "source_row_key"),
+            feedback,
+            prior_strength=prior,
+        )
+        state = fit_multifeedback_state(
+            train.arrays["user_id"],
+            train.arrays["video_id"],
+            train.arrays["author_id"],
+            _temporal_array(train, "time_ms"),
+            _temporal_array(train, "source_row_key"),
+            feedback,
+            prior_strength=prior,
+        )
+        apply_bundle = apply_multifeedback_state(
+            apply.arrays["user_id"],
+            apply.arrays["video_id"],
+            apply.arrays["author_id"],
+            state,
+        )
+        return train_bundle, apply_bundle
+    if recipe.builder == "categorical_cross":
+        if len(recipe.output_features) != 1:
+            raise ValueError("categorical_cross recipes must declare exactly one output")
+        spec = CategoricalCrossSpec(
+            name=recipe.output_features[0],
+            left=str(recipe.params["left"]),
+            right=str(recipe.params["right"]),
+            min_count=int(recipe.params.get("min_count", 2)),
+        )
+        state = fit_categorical_crosses(train, (spec,))
+        return (
+            apply_categorical_crosses(train, state),
+            apply_categorical_crosses(apply, state),
+        )
     raise ValueError(f"unknown feature recipe builder: {recipe.builder}")
+
+
+def _merge_bundles(bundles: list[FeatureBundle]) -> FeatureBundle:
+    arrays: dict[str, np.ndarray] = {}
+    provenance: dict[str, dict[str, object]] = {}
+    for bundle in bundles:
+        overlap = arrays.keys() & bundle.arrays.keys()
+        if overlap:
+            raise ValueError(f"composite recipe output collision: {sorted(overlap)}")
+        arrays.update(bundle.arrays)
+        provenance.update(bundle.provenance)
+    return FeatureBundle(arrays, provenance)
+
+
+def _build_definition(
+    recipe: RecipeDefinition,
+    train_path: Path,
+    target_path: Path,
+    apply_path: Path,
+    auxiliary_target_path: Path | None,
+) -> tuple[FeatureBundle, FeatureBundle]:
+    if isinstance(recipe, FeatureRecipe):
+        return _build(
+            recipe,
+            train_path,
+            target_path,
+            apply_path,
+            auxiliary_target_path,
+        )
+    train_bundles: list[FeatureBundle] = []
+    apply_bundles: list[FeatureBundle] = []
+    for component in recipe.components:
+        train_bundle, apply_bundle = _build(
+            component,
+            train_path,
+            target_path,
+            apply_path,
+            auxiliary_target_path,
+        )
+        train_bundles.append(_recipe_provenance(train_bundle, component))
+        apply_bundles.append(_recipe_provenance(apply_bundle, component))
+    return _merge_bundles(train_bundles), _merge_bundles(apply_bundles)
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
@@ -331,17 +698,20 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
 
 
 def materialize_feature_recipe(
-    recipe: FeatureRecipe,
+    recipe: RecipeDefinition,
     train_feature_path: str | Path,
     train_target_path: str | Path,
     apply_feature_path: str | Path,
     cache_dir: str | Path,
+    *,
+    auxiliary_target_path: str | Path | None = None,
 ) -> RecipeArtifact:
     """Build or reuse one hash-addressed train/apply feature recipe."""
 
     train_path = Path(train_feature_path)
     target_path = Path(train_target_path)
     apply_path = Path(apply_feature_path)
+    auxiliary_path = Path(auxiliary_target_path) if auxiliary_target_path is not None else None
     identity_value = {
         "schema_version": "1.0",
         "recipe": asdict(recipe),
@@ -354,11 +724,17 @@ def materialize_feature_recipe(
                 Path(__file__).with_name("recency.py"),
                 Path(__file__).with_name("repeat_exposure.py"),
                 Path(__file__).with_name("temporal_aggregates.py"),
+                Path(__file__).with_name("temporal_order.py"),
+                Path(__file__).with_name("candidate_recency.py"),
+                Path(__file__).with_name("multifeedback_history.py"),
+                Path(__file__).with_name("categorical_crosses.py"),
+                Path(__file__).with_name("quantile_buckets.py"),
             )
         },
         "train_feature_sha256": sha256_file(train_path),
         "train_target_sha256": sha256_file(target_path),
         "apply_feature_sha256": sha256_file(apply_path),
+        "auxiliary_target_sha256": sha256_file(auxiliary_path) if auxiliary_path else None,
     }
     identity = sha256_bytes(canonical_json_bytes(identity_value))
     root = Path(cache_dir) / f"{recipe.name}-{identity[:16]}"
@@ -380,9 +756,11 @@ def materialize_feature_recipe(
         ):
             return RecipeArtifact(root, train_output, apply_output, manifest_path, identity)
     root.mkdir(parents=True, exist_ok=True)
-    train_bundle, apply_bundle = _build(recipe, train_path, target_path, apply_path)
-    train_bundle = _recipe_provenance(train_bundle, recipe)
-    apply_bundle = _recipe_provenance(apply_bundle, recipe)
+    train_bundle, apply_bundle = _build_definition(
+        recipe, train_path, target_path, apply_path, auxiliary_path
+    )
+    train_bundle = _definition_provenance(train_bundle, recipe)
+    apply_bundle = _definition_provenance(apply_bundle, recipe)
     attach_feature_bundles(train_path, [train_bundle], train_output)
     attach_feature_bundles(apply_path, [apply_bundle], apply_output)
     manifest = {
