@@ -1755,7 +1755,9 @@ class ProductionAutopilot:
                     experiment_id,
                     ExperimentState.DIAGNOSED,
                     ExperimentState.ABANDONED,
-                    reason="shadow candidate was not the atomically locked finalist",
+                    payload={
+                        "reason": "shadow candidate was not the atomically locked finalist"
+                    },
                     idempotency_key=f"{experiment_id}:non-finalist-abandoned",
                 )
                 self._cleanup_worktree(repository, context, experiment_id)
@@ -1991,7 +1993,7 @@ class ProductionAutopilot:
                         experiment_id,
                         state,
                         ExperimentState.ABANDONED,
-                        reason="candidate is not the locked official finalist",
+                        payload={"reason": "candidate is not the locked official finalist"},
                         idempotency_key=f"{experiment_id}:not-locked-finalist",
                     )
                     self._cleanup_worktree(repository, context, experiment_id)

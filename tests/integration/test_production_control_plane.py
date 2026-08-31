@@ -25,7 +25,7 @@ from rex.control.production_supervisor import (
     environment_provenance_sha256,
 )
 from rex.control.budget import deadline_epoch_ms
-from rex.contracts import ExperimentState, RunState
+from rex.contracts import ExperimentState, RunState, ValidationPhase
 from rex.data.manifest import sha256_file
 from rex.execution.artifacts import artifact_ref
 from rex.store.db import Database
@@ -712,3 +712,153 @@ def test_fixed_provider_uses_truthful_method_card_operators() -> None:
             schema={},
         )
         assert response.value["operator"] == operator
+
+
+def test_finalist_resume_abandons_other_diagnosed_candidates_with_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    run_id = "finalist-resume"
+    run_dir = config.runs_dir / run_id
+    database = Database(run_dir / "state.sqlite3")
+    database.initialize()
+    repository = ExperimentRepository(database)
+    repository.create_run(
+        run_id=run_id,
+        deadline_epoch_ms=deadline_epoch_ms(300),
+        root_commit="root",
+        environment_sha256=HASH,
+        data_manifest_sha256=HASH,
+        evaluator_sha256=HASH,
+    )
+    nonfinalist_id = "diagnosed-nonfinalist"
+    finalist_id = "diagnosed-finalist"
+    for experiment_id in (nonfinalist_id, finalist_id):
+        repository.create_experiment(run_id, _proposal(experiment_id), "root")
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE experiments SET state=? WHERE experiment_id IN (?,?)",
+            (ExperimentState.DIAGNOSED, nonfinalist_id, finalist_id),
+        )
+        connection.execute(
+            "UPDATE runs SET validation_phase=?,finalist_experiment_id=? WHERE run_id=?",
+            (ValidationPhase.FINALIST_LOCKED, finalist_id, run_id),
+        )
+
+    autopilot = ProductionAutopilot(config, DiagnosisProvider(), ScriptedHooks())
+    resumed: list[str] = []
+    cleaned: list[str] = []
+    monkeypatch.setattr(
+        autopilot,
+        "_run_candidate",
+        lambda _repository, _context, experiment_id: resumed.append(experiment_id),
+    )
+    monkeypatch.setattr(
+        autopilot,
+        "_cleanup_worktree",
+        lambda _repository, _context, experiment_id: cleaned.append(experiment_id),
+    )
+    context = ProductionContext(
+        run_id,
+        run_dir,
+        config.project_root,
+        "root",
+        deadline_epoch_ms(300),
+    )
+
+    autopilot._resume_active(repository, context)
+
+    nonfinalist = repository.get_experiment(nonfinalist_id)
+    assert nonfinalist["state"] == ExperimentState.ABANDONED
+    assert nonfinalist["terminal_reason"] == (
+        "shadow candidate was not the atomically locked finalist"
+    )
+    assert cleaned == [nonfinalist_id]
+    assert resumed == [finalist_id]
+
+
+def test_diagnosed_nonfinalist_uses_payload_when_finalist_is_locked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config = _config(tmp_path)
+    experiment_id = "diagnosed-nonfinalist"
+    experiment = {
+        "experiment_id": experiment_id,
+        "state": ExperimentState.DIAGNOSED,
+        "method_card_id": "E01",
+    }
+    transitions: list[dict[str, Any]] = []
+
+    class Repository:
+        def get_experiment(self, selected_id: str) -> dict[str, Any]:
+            assert selected_id == experiment_id
+            return experiment
+
+        def record_shadow_evaluation(self, **kwargs: Any) -> None:
+            assert kwargs["experiment_id"] == experiment_id
+
+        def get_run(self, run_id: str) -> dict[str, Any]:
+            assert run_id == "locked-run"
+            return {
+                "validation_phase": ValidationPhase.FINALIST_LOCKED,
+                "finalist_experiment_id": "different-finalist",
+            }
+
+        def transition_experiment(
+            self,
+            selected_id: str,
+            expected: ExperimentState,
+            next_state: ExperimentState,
+            *,
+            payload: dict[str, Any] | None = None,
+            idempotency_key: str,
+        ) -> None:
+            transitions.append(
+                {
+                    "experiment_id": selected_id,
+                    "expected": expected,
+                    "next_state": next_state,
+                    "payload": payload,
+                    "idempotency_key": idempotency_key,
+                }
+            )
+
+    autopilot = ProductionAutopilot(config, DiagnosisProvider(), ScriptedHooks())
+    observation = ComparisonObservation(
+        _metric(0.51, split="shadow", fold="A"),
+        _metric(0.50, split="shadow", fold="A"),
+    )
+    monkeypatch.setattr(
+        autopilot,
+        "_stored_rung",
+        lambda _repository, _experiment_id, _rung: ProductionRungResult((observation,)),
+    )
+    monkeypatch.setattr(autopilot, "_full_gate", lambda _experiment, _result: True)
+    monkeypatch.setattr(autopilot, "_experiment_evidence", lambda *_args: ())
+    monkeypatch.setattr(autopilot, "_valid_family_count", lambda *_args: 1)
+    cleaned: list[str] = []
+    monkeypatch.setattr(
+        autopilot,
+        "_cleanup_worktree",
+        lambda _repository, _context, selected_id: cleaned.append(selected_id),
+    )
+    context = ProductionContext(
+        "locked-run",
+        tmp_path / "locked-run",
+        config.project_root,
+        "root",
+        deadline_epoch_ms(300),
+    )
+
+    autopilot._run_candidate(Repository(), context, experiment_id)  # type: ignore[arg-type]
+
+    assert transitions == [
+        {
+            "experiment_id": experiment_id,
+            "expected": ExperimentState.DIAGNOSED,
+            "next_state": ExperimentState.ABANDONED,
+            "payload": {"reason": "candidate is not the locked official finalist"},
+            "idempotency_key": f"{experiment_id}:not-locked-finalist",
+        }
+    ]
+    assert cleaned == [experiment_id]
