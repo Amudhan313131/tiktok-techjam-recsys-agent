@@ -13,6 +13,7 @@ from rex.models.context_fm import (
     load_member_predictions,
     reconstruct_member_predictions,
 )
+from rex.models.experimental.context_fm import ExperimentalContextEnsembleFMPlugin
 from rex.models.bundle import create_model_bundle, validate_model_bundle
 
 
@@ -112,6 +113,34 @@ def test_context_ensemble_rejects_unbounded_member_count(tmp_path: Path) -> None
             0,
             tmp_path,
         )
+
+
+def test_e16_five_member_treatment_and_one_member_control_both_fit(tmp_path: Path) -> None:
+    features, targets = _views()
+    base = {
+        "k": 4,
+        "lr": 0.001,
+        "epochs": 1,
+        "batch_size": 4,
+        "aggregation": "mean",
+    }
+    plugin = ExperimentalContextEnsembleFMPlugin()
+    treatment = plugin.fit(
+        features,
+        targets,
+        {**base, "ensemble_members": 5},
+        0,
+        tmp_path / "treatment",
+    )
+    control = plugin.fit(
+        features,
+        targets,
+        {**base, "ensemble_members": 1},
+        0,
+        tmp_path / "control",
+    )
+    assert treatment.is_file()
+    assert control.is_file()
 
 
 def test_context_encoder_audits_constant_and_unknown_fields(tmp_path: Path) -> None:

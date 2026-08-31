@@ -4,5 +4,5 @@ lr: 0.001
 l2: 0.000001
 epochs: 7
 batch_size: 8192
-ensemble_members: 5
+ensemble_members: 1
 aggregation: mean

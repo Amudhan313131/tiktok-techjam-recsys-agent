@@ -958,3 +958,47 @@ def test_corrupt_bundle_repair_quarantines_only_outputs_and_preserves_runner_evi
     assert [(item.kind, item.sha256) for item in replayed] == [
         (item.kind, item.sha256) for item in refs
     ]
+
+
+def test_contract_repair_uses_live_patch_instead_of_unchanged_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    hooks, context, experiment, _, _, repository = _request(tmp_path)
+    hooks.config.llm["mode"] = "codex_cli"
+    plan = TypedRepairPlan(
+        repair=True,
+        consumes_budget=True,
+        repair_number=1,
+        action=RepairAction.PATCH,
+        reason="repair the model contract",
+        overrides={"allowed_scope": "declared_model_files_only"},
+    )
+    repository.reserve_experiment_repair(
+        experiment_id=experiment["experiment_id"],
+        phase="cheap",
+        failure_status=AttemptStatus.CONTRACT,
+        plan={
+            "repair": plan.repair,
+            "consumes_budget": plan.consumes_budget,
+            "repair_number": plan.repair_number,
+            "action": plan.action.value,
+            "reason": plan.reason,
+            "overrides": plan.overrides,
+        },
+        maximum=2,
+    )
+    marker = context.run_dir / "contract-live-patch.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{}", encoding="utf-8")
+    observed: list[AttemptStatus] = []
+
+    def live_patch(request, failure_status, evidence_path):
+        del request, evidence_path
+        observed.append(failure_status)
+        return (artifact_ref(marker, "repair_patch"),)
+
+    monkeypatch.setattr(hooks, "_live_patch_repair", live_patch)
+    refs = hooks.repair_candidate(RepairRequest(context, experiment, "cheap", plan))
+
+    assert observed == [AttemptStatus.CONTRACT]
+    assert [item.kind for item in refs] == ["repair_patch"]

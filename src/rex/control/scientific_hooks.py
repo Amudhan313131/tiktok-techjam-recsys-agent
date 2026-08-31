@@ -3162,16 +3162,19 @@ class ProductionScientificHooks(ProductionHooks):
             update = self._workload_repair(config_value)
         elif request.plan.action.value == "request_constrained_patch":
             failure_status = self._latest_repair_failure_status(request)
-            if failure_status in {
-                AttemptStatus.INVALID_ARTIFACT,
-                AttemptStatus.CONTRACT,
-            }:
+            if failure_status == AttemptStatus.INVALID_ARTIFACT:
                 quarantined = self._quarantine_failed_attempt(request)
                 update = {"quarantined_attempt": str(quarantined) if quarantined else None}
                 if quarantined is not None:
                     artifacts.append(
                         artifact_ref(quarantined / "QUARANTINED.json", "quarantine_evidence")
                     )
+            elif failure_status == AttemptStatus.CONTRACT:
+                if self.config.llm.get("mode") == "fixed":
+                    raise RuntimeError(
+                        "fixed config mode cannot safely patch a contract failure; terminalizing"
+                    )
+                return self._live_patch_repair(request, failure_status, path)
             elif self.config.llm.get("mode") == "fixed":
                 if failure_status == AttemptStatus.NAN:
                     update = self._numeric_stabilization(config_value)

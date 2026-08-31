@@ -114,6 +114,12 @@ METHOD_CARD_REFERENCES: dict[str, dict[str, Any]] = {
     "E16": {
         "primary_change": "increase ensemble membership from one to five with mean aggregation fixed",
         "falsifier": "five-member mean does not beat the matched one-member mean",
+        "implementation_hint": (
+            "In the bound YAML only, change ensemble_members from 1 to 5. Preserve mean "
+            "aggregation, epochs=7, the plugin, and every other setting. Do not edit the "
+            "shared experimental wrapper because the matched one-member control executes "
+            "from the same candidate snapshot."
+        ),
         "citation_ids": ["bagging", "factorization_machines"],
     },
     "E17": {

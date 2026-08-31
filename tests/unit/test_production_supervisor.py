@@ -8,6 +8,10 @@ from rex.agents.recovery import RepairAction, plan_repair
 from rex.agents.search_policy import METHOD_CARD_VERSION, SearchPolicy
 from rex.contracts import AttemptStatus
 from rex.control.production_supervisor import ProductionRunConfig
+from rex.control.production_supervisor import (
+    CARD_CODE_PATHS,
+    _canonical_proposal_parent_id,
+)
 from rex.control.budget import BudgetConfig
 from rex.data.manifest import repo_root
 
@@ -89,6 +93,47 @@ def test_proposal_context_contains_versioned_method_card_and_only_evidence_ids()
     assert context["evidence_artifact_ids"] == ["evidence-a", "evidence-b"]
     assert set(context["evidence_artifact_ids"]) == {"evidence-a", "evidence-b"}
     assert "evidence_payloads" not in context
+
+
+def test_coordinator_owns_durable_parent_identity() -> None:
+    assert (
+        _canonical_proposal_parent_id(
+            "E15",
+            coordinator_parent_id="baseline",
+            conceptual_parent_id="E15",
+        )
+        is None
+    )
+    assert (
+        _canonical_proposal_parent_id(
+            "E15",
+            coordinator_parent_id="run-e19-incumbent",
+            conceptual_parent_id="E15",
+        )
+        == "run-e19-incumbent"
+    )
+    with pytest.raises(RuntimeError, match="coordinator-selected parent"):
+        _canonical_proposal_parent_id(
+            "unrelated-experiment",
+            coordinator_parent_id="run-e19-incumbent",
+            conceptual_parent_id="E15",
+        )
+
+
+def test_e16_is_a_config_only_one_to_five_isolation() -> None:
+    config = ProductionRunConfig.load(repo_root() / "configs/run/production.yaml")
+    candidate = __import__("yaml").safe_load(
+        config.method_cards["E16"].config_path.read_text(encoding="utf-8")
+    )
+    control = __import__("yaml").safe_load(
+        (repo_root() / "configs/experiments/e15_context_control.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert CARD_CODE_PATHS["E16"] == ()
+    assert candidate["ensemble_members"] == control["ensemble_members"] == 1
+    assert candidate["aggregation"] == control["aggregation"] == "mean"
+    assert candidate["plugin"] == control["plugin"]
 
 
 def test_blend_requires_promoted_pairwise_and_distinct_tree_history_branch() -> None:

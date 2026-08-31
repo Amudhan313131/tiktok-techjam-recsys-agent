@@ -69,7 +69,10 @@ CARD_CODE_PATHS: dict[str, tuple[str, ...]] = {
     "E07": ("src/rex/models/experimental/tree_history.py",),
     "E08": ("src/rex/models/experimental/tree_history.py",),
     "E10": (),
-    "E16": ("src/rex/models/experimental/context_fm.py",),
+    # E16 is deliberately config-only.  Allowing the researcher to edit the
+    # shared wrapper also changes the one-member control loaded from the same
+    # worktree, which destroys the ensemble-size isolation.
+    "E16": (),
     "E17": ("src/rex/features/categorical_crosses.py",),
     "E18": ("src/rex/features/categorical_crosses.py",),
     "E19": (),
@@ -395,6 +398,30 @@ class ComparisonObservation:
     def ndcg_delta(self) -> float:
         return self.candidate.ndcg5 - self.reference.ndcg5
 
+
+def _canonical_proposal_parent_id(
+    proposed_parent_id: str | None,
+    *,
+    coordinator_parent_id: str | None,
+    conceptual_parent_id: str | None,
+) -> str | None:
+    """Return the durable parent selected by the coordinator.
+
+    Method cards describe conceptual ancestry (for example E19 follows the E15
+    family), while the run database stores concrete experiment identities.  A
+    researcher may echo either the conceptual label or omit the field, but it
+    must never be able to redirect lineage to an unrelated experiment.
+    """
+
+    if proposed_parent_id not in {
+        None,
+        coordinator_parent_id,
+        conceptual_parent_id,
+    }:
+        raise RuntimeError("candidate proposal changed the coordinator-selected parent")
+    if coordinator_parent_id in {None, "baseline"}:
+        return None
+    return coordinator_parent_id
 
 @dataclass(frozen=True)
 class ProductionRungResult:
@@ -1197,6 +1224,15 @@ class ProductionAutopilot:
             "experiment_config": str(binding.config_path),
             "feature_recipe": binding.feature_recipe,
         }
+        constraints = proposal.get("constraints")
+        if not isinstance(constraints, dict):
+            raise RuntimeError("proposal context constraints are malformed")
+        constraints.update(
+            {
+                "parent_id_is_coordinator_owned": True,
+                "coordinator_selected_parent_id": run["search_champion_experiment_id"],
+            }
+        )
         research = self._research_context_summary(
             repository,
             context,
@@ -1627,11 +1663,16 @@ class ProductionAutopilot:
                 "candidate proposal requested files outside the card allowlist: "
                 + ", ".join(unexpected_files)
             )
-        if prepared.proposal.parent_id not in {None, parent_id}:
-            raise RuntimeError("candidate proposal changed the coordinator-selected parent")
-        if prepared.proposal.parent_id == "baseline":
+        canonical_parent_id = _canonical_proposal_parent_id(
+            prepared.proposal.parent_id,
+            coordinator_parent_id=parent_id,
+            conceptual_parent_id=card.parent,
+        )
+        if prepared.proposal.parent_id != canonical_parent_id:
             prepared = CandidatePreparation(
-                proposal=prepared.proposal.model_copy(update={"parent_id": None}),
+                proposal=prepared.proposal.model_copy(
+                    update={"parent_id": canonical_parent_id}
+                ),
                 commit_sha=prepared.commit_sha,
                 workspace_path=prepared.workspace_path,
                 branch_name=prepared.branch_name,
