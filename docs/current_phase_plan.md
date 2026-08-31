@@ -1,16 +1,16 @@
 # Current Phase: Larger-Margin Research and Release Path
 
-Date: 2026-08-31
+Date: 2026-09-01
 
 Status: the validation search, clean Docker R3 envelope, final-submission state
-machine, and larger-margin E16-E30 research block are implemented. The earlier
-three-card production run remains valid historical evidence, but it is not a
-description of the current queue. Direct shadow research now identifies E19
-inference-safe item metadata as the strongest new treatment: seed-0 mean primary
-delta `+0.001281`, positive on A/B/C. This is discovery evidence from an
-in-progress source tree, not a new official-validation champion. A clean
-committed Docker run, multi-seed confirmation, the single locked official
-validation, and any authorized test prediction remain separate runtime actions.
+machine, and larger-margin E16-E30 research block are implemented. The clean
+immutable V15 run completed, recovered from its controlled controller failure,
+and selected E15 at GAUC `0.6702043`, nDCG@5 `0.5371096`, primary `0.6036570`.
+The finalizer predicted 170,588 test rows once, passed the organizer checker
+twice, sealed the complete result with `test_scored: false`, and completed its
+one-time filesystem handoff. Later exploratory runs did not produce a completed
+eligible replacement, so V15 remains the truthful final submission. Technical
+results and artifact identities are recorded under [`../submission/`](../submission/).
 
 ## Scope boundary
 

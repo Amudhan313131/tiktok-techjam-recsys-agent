@@ -8,6 +8,8 @@ tests. Docker is the supported production runtime on Windows, macOS, and Linux.
 New users should start with the copy-and-paste
 [`docs/how-to-run.md`](docs/how-to-run.md) guide. Security design and advanced
 runtime details are in [`docs/docker-production.md`](docs/docker-production.md).
+The final technical results, iteration log, and artifact identities are under
+[`submission/`](submission/).
 
 The benchmark contract is in [`docs/task_contract.md`](docs/task_contract.md).
 The exact implemented scope and exclusions are in
@@ -93,27 +95,28 @@ The audit bundle is under
 the current queue includes the larger-margin E16-E30 block and family-aware
 plateau guard described above. No hidden-test prediction or scoring was run.
 
-## Current larger-margin development evidence
+## Final verified submission
 
-The E15 implementation was checked
-on the authorized validation split with the frozen organizer evaluator. The
-five-member mean ensemble reached GAUC `0.6702043`, nDCG@5 `0.5371096`, and
-primary `0.6036570`. That is `+0.0016198` over the strongest reproduced baseline
-seed (`0.6020372`) and `+0.0020570` over the supplied `0.6016` reference. A
-500-sample user bootstrap estimated a 99.6% probability of a positive delta
-over the strongest reproduced seed. These numbers are preflight evidence, not
-a substitute for a clean autonomous Docker run.
+The clean immutable Docker run `r3-docker-20260831-codex-v15` completed and
+selected E15 as its validation champion. The five-member mean context-FM
+ensemble reached GAUC `0.6702043`, nDCG@5 `0.5371096`, and primary `0.6036570`.
+That is `+0.0016198` over the strongest reproduced baseline seed (`0.6020372`)
+and `+0.0020570` over the supplied `0.6016` reference. The run stopped through
+its recorded epsilon-plateau rule after 3 of 50 iterations, used 310,811 LLM
+tokens and 1,484.2 seconds of agent wall-clock time, and recorded 0 manual
+interventions and 0 GPU-hours.
 
-The current direct shadow runner subsequently found its strongest transferable
-signal in E19: inference-safe item metadata improved seed-0 primary by a mean
-`+0.001281` over its matched context-FM control and was positive on all three
-temporal folds. E20 user metadata was nearly flat (`+0.000073`) with one
-negative fold; the cross, FwFM, candidate-recency, and multi-feedback treatments
-were weak or rejected in their current forms. These runs did not open official
-validation, were produced from an in-progress source tree, and do not establish
-a new sealed champion or a `0.613` score. See
-[`docs/larger_margin_research.md`](docs/larger_margin_research.md) for the full
-table and interpretation.
+The Docker envelope deliberately terminated one active controller and recovered
+the same run automatically. The separately authorized finalizer then predicted
+exactly 170,588 test rows, passed the organizer's format/alignment checker
+twice, sealed the model, predictions, CSV, reports, and hashes, and completed a
+one-time filesystem handoff. The seal records `test_scored: false`; no hidden
+test metric is claimed. The final technical evidence is under [`submission/`](submission/).
+
+Later larger-margin shadow research remains documented in
+[`docs/larger_margin_research.md`](docs/larger_margin_research.md), but it did
+not produce a completed eligible run that supersedes V15 and is not part of the
+final submission.
 
 ## Development setup
 
