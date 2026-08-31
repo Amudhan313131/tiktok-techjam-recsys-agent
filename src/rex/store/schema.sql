@@ -17,6 +17,11 @@ CREATE TABLE IF NOT EXISTS runs (
     best_primary_units INTEGER,
     best_ever_experiment_id TEXT,
     search_champion_experiment_id TEXT,
+    shadow_best_primary_units INTEGER,
+    shadow_champion_experiment_id TEXT,
+    validation_phase TEXT NOT NULL DEFAULT 'DISCOVERY',
+    finalist_experiment_id TEXT,
+    official_evaluated_at TEXT,
     stop_reason TEXT
 );
 
@@ -38,6 +43,28 @@ CREATE TABLE IF NOT EXISTS baseline_gates (
     primary_units INTEGER NOT NULL,
     gauc REAL NOT NULL,
     ndcg5 REAL NOT NULL,
+    evidence_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS validation_phase_transitions (
+    run_id TEXT NOT NULL REFERENCES runs(run_id),
+    from_phase TEXT NOT NULL,
+    to_phase TEXT NOT NULL,
+    finalist_experiment_id TEXT REFERENCES experiments(experiment_id),
+    evidence_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    PRIMARY KEY(run_id, to_phase)
+);
+
+CREATE TABLE IF NOT EXISTS shadow_evaluations (
+    experiment_id TEXT PRIMARY KEY REFERENCES experiments(experiment_id),
+    run_id TEXT NOT NULL REFERENCES runs(run_id),
+    family TEXT NOT NULL,
+    primary_units INTEGER NOT NULL,
+    supported INTEGER NOT NULL,
+    delta_units INTEGER,
     evidence_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );

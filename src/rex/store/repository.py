@@ -17,6 +17,7 @@ from rex.contracts import (
     Metrics,
     RunResult,
     RunState,
+    ValidationPhase,
 )
 from rex.control.budget import metric_units, update_metric_trackers
 from rex.control.state_machine import require_experiment_transition, require_run_transition
@@ -178,6 +179,140 @@ class ExperimentRepository:
                 aggregate_id=run_id,
                 payload={"from": expected, "to": next_state, "reason": reason},
             )
+
+    def lock_validation_finalist(
+        self,
+        *,
+        run_id: str,
+        experiment_id: str,
+        evidence_artifact_ids: list[str],
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        """Atomically close discovery and bind the run's sole official finalist."""
+
+        evidence = sorted(set(evidence_artifact_ids))
+        evidence_json = _canonical_json(evidence)
+        with self.database.transaction() as connection:
+            duplicate = connection.execute(
+                "SELECT * FROM validation_phase_transitions WHERE idempotency_key=?",
+                (idempotency_key,),
+            ).fetchone()
+            if duplicate is not None:
+                _require_identical(
+                    duplicate,
+                    {
+                        "run_id": run_id,
+                        "from_phase": ValidationPhase.DISCOVERY,
+                        "to_phase": ValidationPhase.FINALIST_LOCKED,
+                        "finalist_experiment_id": experiment_id,
+                        "evidence_json": evidence_json,
+                    },
+                    entity=f"validation finalist lock {idempotency_key}",
+                )
+                return {"idempotent": True, "phase": ValidationPhase.FINALIST_LOCKED}
+            run = connection.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            experiment = connection.execute(
+                "SELECT state,experiment_kind FROM experiments WHERE run_id=? AND experiment_id=?",
+                (run_id, experiment_id),
+            ).fetchone()
+            if run is None or experiment is None:
+                raise RepositoryError("run or validation finalist is missing")
+            phase = ValidationPhase(run["validation_phase"])
+            if phase != ValidationPhase.DISCOVERY:
+                raise RepositoryError(f"cannot lock a finalist from validation phase {phase}")
+            if ExperimentState(experiment["state"]) != ExperimentState.DIAGNOSED:
+                raise RepositoryError("validation finalist must have completed shadow diagnosis")
+            shadow = connection.execute(
+                "SELECT supported FROM shadow_evaluations WHERE experiment_id=?",
+                (experiment_id,),
+            ).fetchone()
+            if experiment["experiment_kind"] == "production_search" and (
+                shadow is None or not bool(shadow["supported"])
+            ):
+                raise RepositoryError("validation finalist lacks supported full-shadow evidence")
+            if int(run["official_evaluation_count"]) != 0:
+                raise RepositoryError("official validation was already consumed")
+            if evidence:
+                placeholders = ",".join("?" for _ in evidence)
+                linked = connection.execute(
+                    f"SELECT COUNT(DISTINCT artifact_id) AS n FROM artifact_links "
+                    f"WHERE experiment_id=? AND artifact_id IN ({placeholders})",
+                    (experiment_id, *evidence),
+                ).fetchone()["n"]
+                if int(linked) != len(evidence):
+                    raise RepositoryError("finalist lock cites missing experiment evidence")
+            now = utc_now()
+            connection.execute(
+                "INSERT INTO validation_phase_transitions(run_id,from_phase,to_phase,"
+                "finalist_experiment_id,evidence_json,created_at,idempotency_key) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (
+                    run_id,
+                    ValidationPhase.DISCOVERY,
+                    ValidationPhase.FINALIST_LOCKED,
+                    experiment_id,
+                    evidence_json,
+                    now,
+                    idempotency_key,
+                ),
+            )
+            connection.execute(
+                "UPDATE runs SET validation_phase=?,finalist_experiment_id=?,updated_at=? "
+                "WHERE run_id=?",
+                (ValidationPhase.FINALIST_LOCKED, experiment_id, now, run_id),
+            )
+            self._event(
+                connection,
+                run_id=run_id,
+                event_type="validation.finalist_locked",
+                aggregate_id=experiment_id,
+                payload={"evidence_artifact_ids": evidence},
+            )
+            return {"idempotent": False, "phase": ValidationPhase.FINALIST_LOCKED}
+
+    def _mark_official_evaluated(
+        self,
+        connection,
+        *,
+        run_id: str,
+        experiment_id: str,
+        evidence_json: str,
+        idempotency_key: str,
+    ) -> None:
+        """Complete the one-way phase transition inside a result transaction."""
+
+        run = connection.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+        if run is None:
+            raise RepositoryError(f"unknown run: {run_id}")
+        phase = ValidationPhase(run["validation_phase"])
+        if phase == ValidationPhase.OFFICIAL_EVALUATED:
+            if run["finalist_experiment_id"] != experiment_id:
+                raise RepositoryError("official evaluation finalist identity changed")
+            return
+        if (
+            phase != ValidationPhase.FINALIST_LOCKED
+            or run["finalist_experiment_id"] != experiment_id
+        ):
+            raise RepositoryError("official evaluation is not bound to the locked finalist")
+        now = utc_now()
+        connection.execute(
+            "INSERT INTO validation_phase_transitions(run_id,from_phase,to_phase,"
+            "finalist_experiment_id,evidence_json,created_at,idempotency_key) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (
+                run_id,
+                ValidationPhase.FINALIST_LOCKED,
+                ValidationPhase.OFFICIAL_EVALUATED,
+                experiment_id,
+                evidence_json,
+                now,
+                idempotency_key,
+            ),
+        )
+        connection.execute(
+            "UPDATE runs SET validation_phase=?,official_evaluated_at=?,updated_at=? WHERE run_id=?",
+            (ValidationPhase.OFFICIAL_EVALUATED, now, now, run_id),
+        )
 
     def establish_baseline(
         self,
@@ -1163,7 +1298,8 @@ class ExperimentRepository:
     ) -> None:
         with self.database.transaction() as connection:
             row = connection.execute(
-                "SELECT e.run_id,r.official_evaluation_count FROM experiments e JOIN runs r "
+                "SELECT e.run_id,e.experiment_kind,r.official_evaluation_count,"
+                "r.validation_phase,r.finalist_experiment_id FROM experiments e JOIN runs r "
                 "ON e.run_id=r.run_id WHERE e.experiment_id=?",
                 (experiment_id,),
             ).fetchone()
@@ -1199,6 +1335,14 @@ class ExperimentRepository:
                 raise RepositoryError(
                     f"official evaluation cap reached: {max_official_evaluations}"
                 )
+            if metrics.split == "valid" and row["experiment_kind"] == "production_search":
+                if (
+                    ValidationPhase(row["validation_phase"]) != ValidationPhase.FINALIST_LOCKED
+                    or row["finalist_experiment_id"] != experiment_id
+                ):
+                    raise RepositoryError(
+                        "official validation is reserved for the atomically locked finalist"
+                    )
             connection.execute(
                 "INSERT INTO metrics(experiment_id,attempt_id,split,fold,seed,evaluator_sha256,gauc,ndcg5,"
                 "primary_score,primary_units,rows,users) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -1324,6 +1468,8 @@ class ExperimentRepository:
         reason: str,
         patience: int,
         idempotency_key: str,
+        plateau_eligible: bool = True,
+        convergence_counted: bool = True,
     ) -> dict[str, Any]:
         """Reject a cheap/full candidate and count the hypothesis exactly once."""
 
@@ -1357,13 +1503,14 @@ class ExperimentRepository:
                 raise RepositoryError("candidate is not in the expected rejection state")
             now = utc_now()
             run = connection.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
-            streak = int(run["non_improvement_streak"]) + 1
-            converged = streak >= patience
+            streak = int(run["non_improvement_streak"]) + int(convergence_counted)
+            converged = plateau_eligible and streak >= patience
             payload = _canonical_json(
                 {
                     "reason": reason,
-                    "convergence_counted": True,
+                    "convergence_counted": convergence_counted,
                     "convergence_streak": streak,
+                    "plateau_eligible": plateau_eligible,
                 }
             )
             connection.execute(
@@ -1382,11 +1529,12 @@ class ExperimentRepository:
                     idempotency_key,
                 ),
             )
-            connection.execute(
-                "INSERT INTO convergence_transactions(experiment_id,run_id,outcome,delta_units,created_at) "
-                "VALUES(?,?,?,?,?)",
-                (experiment_id, run_id, "rejected_before_official", None, now),
-            )
+            if convergence_counted:
+                connection.execute(
+                    "INSERT INTO convergence_transactions(experiment_id,run_id,outcome,delta_units,"
+                    "created_at) VALUES(?,?,?,?,?)",
+                    (experiment_id, run_id, "rejected_before_official", None, now),
+                )
             connection.execute(
                 "UPDATE runs SET non_improvement_streak=?,updated_at=?,stop_reason=CASE WHEN ? "
                 "THEN 'epsilon_plateau' ELSE stop_reason END WHERE run_id=?",
@@ -1399,12 +1547,135 @@ class ExperimentRepository:
                 aggregate_id=experiment_id,
                 payload={
                     "reason": reason,
-                    "convergence_counted": True,
+                    "convergence_counted": convergence_counted,
                     "convergence_streak": streak,
+                    "plateau_eligible": plateau_eligible,
                 },
             )
             return {
                 "idempotent": False,
+                "non_improvement_streak": streak,
+                "converged": converged,
+            }
+
+    def record_shadow_evaluation(
+        self,
+        *,
+        run_id: str,
+        experiment_id: str,
+        family: str,
+        primary: float,
+        supported: bool,
+        evidence_artifact_ids: list[str],
+        epsilon: float,
+        patience: int,
+        valid_family_count: int,
+        minimum_valid_families: int,
+    ) -> dict[str, Any]:
+        """Track valid full-shadow science independently from official validation."""
+
+        evidence = sorted(set(evidence_artifact_ids))
+        evidence_json = _canonical_json(evidence)
+        primary_units = metric_units(primary)
+        with self.database.transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM shadow_evaluations WHERE experiment_id=?", (experiment_id,)
+            ).fetchone()
+            run = connection.execute("SELECT * FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            experiment = connection.execute(
+                "SELECT state FROM experiments WHERE run_id=? AND experiment_id=?",
+                (run_id, experiment_id),
+            ).fetchone()
+            if run is None or experiment is None:
+                raise RepositoryError("run or shadow experiment is missing")
+            if existing is not None:
+                _require_identical(
+                    existing,
+                    {
+                        "run_id": run_id,
+                        "family": family,
+                        "primary_units": primary_units,
+                        "supported": int(supported),
+                    },
+                    entity=f"shadow evaluation {experiment_id}",
+                )
+                return {
+                    "idempotent": True,
+                    "is_new_best": run["shadow_champion_experiment_id"] == experiment_id,
+                    "non_improvement_streak": int(run["non_improvement_streak"]),
+                    "converged": run["stop_reason"] == "epsilon_plateau",
+                }
+            if ExperimentState(experiment["state"]) != ExperimentState.DIAGNOSED:
+                raise RepositoryError("shadow evaluation requires a diagnosed experiment")
+            if ValidationPhase(run["validation_phase"]) != ValidationPhase.DISCOVERY:
+                raise RepositoryError("shadow evaluation cannot be recorded after discovery closes")
+            if evidence:
+                placeholders = ",".join("?" for _ in evidence)
+                linked = connection.execute(
+                    f"SELECT COUNT(DISTINCT artifact_id) AS n FROM artifact_links "
+                    f"WHERE experiment_id=? AND artifact_id IN ({placeholders})",
+                    (experiment_id, *evidence),
+                ).fetchone()["n"]
+                if int(linked) != len(evidence):
+                    raise RepositoryError("shadow evaluation cites missing experiment evidence")
+            previous_best = run["shadow_best_primary_units"]
+            delta_units = None if previous_best is None else primary_units - int(previous_best)
+            is_new_best = bool(supported and (previous_best is None or delta_units > 0))
+            meaningful = bool(
+                is_new_best and (delta_units is None or delta_units > metric_units(epsilon))
+            )
+            streak = 0 if meaningful else int(run["non_improvement_streak"]) + 1
+            converged = streak >= patience and valid_family_count >= minimum_valid_families
+            now = utc_now()
+            connection.execute(
+                "INSERT INTO shadow_evaluations(experiment_id,run_id,family,primary_units,supported,"
+                "delta_units,evidence_json,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    experiment_id,
+                    run_id,
+                    family,
+                    primary_units,
+                    int(supported),
+                    delta_units,
+                    evidence_json,
+                    now,
+                ),
+            )
+            connection.execute(
+                "UPDATE runs SET shadow_best_primary_units=CASE WHEN ? THEN ? ELSE "
+                "shadow_best_primary_units END,shadow_champion_experiment_id=CASE WHEN ? THEN ? "
+                "ELSE shadow_champion_experiment_id END,non_improvement_streak=?,updated_at=?,"
+                "stop_reason=CASE WHEN ? THEN 'epsilon_plateau' ELSE stop_reason END WHERE run_id=?",
+                (
+                    int(is_new_best),
+                    primary_units,
+                    int(is_new_best),
+                    experiment_id,
+                    streak,
+                    now,
+                    int(converged),
+                    run_id,
+                ),
+            )
+            self._event(
+                connection,
+                run_id=run_id,
+                event_type="shadow.evaluated",
+                aggregate_id=experiment_id,
+                payload={
+                    "family": family,
+                    "primary_units": primary_units,
+                    "supported": supported,
+                    "delta_units": delta_units,
+                    "is_new_best": is_new_best,
+                    "non_improvement_streak": streak,
+                    "converged": converged,
+                    "valid_family_count": valid_family_count,
+                },
+            )
+            return {
+                "idempotent": False,
+                "is_new_best": is_new_best,
                 "non_improvement_streak": streak,
                 "converged": converged,
             }
@@ -1417,7 +1688,7 @@ class ExperimentRepository:
         reason: str,
         patience: int,
     ) -> dict[str, Any]:
-        """Count a terminal failure once without changing the incumbent."""
+        """Record a terminal invalid attempt without advancing scientific convergence."""
 
         with self.database.transaction() as connection:
             experiment = connection.execute(
@@ -1439,21 +1710,17 @@ class ExperimentRepository:
                 return {
                     "idempotent": True,
                     "non_improvement_streak": int(run["non_improvement_streak"]),
-                    "converged": run["stop_reason"] == "epsilon_plateau",
+                    "converged": False,
                 }
-            streak = int(run["non_improvement_streak"]) + 1
-            converged = streak >= patience
+            del patience  # failures are operational evidence, not scientific evidence
+            streak = int(run["non_improvement_streak"])
             now = utc_now()
             connection.execute(
                 "INSERT INTO convergence_transactions(experiment_id,run_id,outcome,delta_units,created_at) "
                 "VALUES(?,?,?,?,?)",
-                (experiment_id, run_id, "failed_final", None, now),
+                (experiment_id, run_id, "invalid_failure", None, now),
             )
-            connection.execute(
-                "UPDATE runs SET non_improvement_streak=?,updated_at=?,stop_reason=CASE WHEN ? "
-                "THEN 'epsilon_plateau' ELSE stop_reason END WHERE run_id=?",
-                (streak, now, int(converged), run_id),
-            )
+            connection.execute("UPDATE runs SET updated_at=? WHERE run_id=?", (now, run_id))
             self._event(
                 connection,
                 run_id=run_id,
@@ -1462,13 +1729,14 @@ class ExperimentRepository:
                 payload={
                     "reason": reason,
                     "convergence_streak": streak,
-                    "converged": converged,
+                    "convergence_counted": False,
+                    "converged": False,
                 },
             )
             return {
                 "idempotent": False,
                 "non_improvement_streak": streak,
-                "converged": converged,
+                "converged": False,
             }
 
     def promote_search_candidate(
@@ -1601,6 +1869,13 @@ class ExperimentRepository:
                     int(update.converged),
                     run_id,
                 ),
+            )
+            self._mark_official_evaluated(
+                connection,
+                run_id=run_id,
+                experiment_id=experiment_id,
+                evidence_json=evidence_json,
+                idempotency_key=f"{idempotency_key}:validation-phase",
             )
             self._event(
                 connection,

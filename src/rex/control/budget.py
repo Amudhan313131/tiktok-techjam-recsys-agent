@@ -27,12 +27,15 @@ class BudgetConfig:
     convergence_patience: int
     max_repairs_per_experiment: int
     default_attempt_timeout_seconds: int
+    min_valid_families_before_plateau: int = 3
+    cheap_min_probability_positive: float = 0.70
+    full_min_pooled_probability_positive: float = 0.90
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "BudgetConfig":
         with Path(path).open(encoding="utf-8") as handle:
             raw = yaml.safe_load(handle)
-        return cls(
+        config = cls(
             max_hypotheses=int(raw["max_hypotheses"]),
             max_official_evaluations=int(raw["max_official_evaluations"]),
             wall_clock_seconds=int(raw["wall_clock_seconds"]),
@@ -41,7 +44,24 @@ class BudgetConfig:
             convergence_patience=int(raw["convergence_patience"]),
             max_repairs_per_experiment=int(raw["max_repairs_per_experiment"]),
             default_attempt_timeout_seconds=int(raw["default_attempt_timeout_seconds"]),
+            min_valid_families_before_plateau=int(raw.get("min_valid_families_before_plateau", 3)),
+            cheap_min_probability_positive=float(raw.get("cheap_min_probability_positive", 0.70)),
+            full_min_pooled_probability_positive=float(
+                raw.get("full_min_pooled_probability_positive", 0.90)
+            ),
         )
+        if config.min_valid_families_before_plateau < 1:
+            raise ValueError("min_valid_families_before_plateau must be positive")
+        for name, value in (
+            ("cheap_min_probability_positive", config.cheap_min_probability_positive),
+            (
+                "full_min_pooled_probability_positive",
+                config.full_min_pooled_probability_positive,
+            ),
+        ):
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be between zero and one")
+        return config
 
 
 @dataclass(frozen=True)
@@ -86,3 +106,14 @@ def seconds_remaining(deadline_ms: int, now: float | None = None) -> float:
 
 def should_finalize(deadline_ms: int, reserve_seconds: int, now: float | None = None) -> bool:
     return seconds_remaining(deadline_ms, now) <= reserve_seconds
+
+
+def scientific_plateau_reached(
+    *,
+    stop_reason: str | None,
+    valid_family_count: int,
+    minimum_valid_families: int,
+) -> bool:
+    """A plateau is meaningful only after diverse valid scientific evidence."""
+
+    return stop_reason == "epsilon_plateau" and valid_family_count >= minimum_valid_families

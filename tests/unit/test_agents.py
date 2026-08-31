@@ -59,6 +59,28 @@ def test_repair_is_bounded_to_two_attempts() -> None:
 
 def test_search_policy_enforces_evidence_gate() -> None:
     policy = SearchPolicy()
-    attempted = {"E00", "E01", "E02", "E03", "E15"}
+    attempted = {
+        card.card_id
+        for card in policy.cards
+        if card.stage == "search" and card.prerequisite is None and not card.dependencies
+    }
     assert policy.next_card(attempted, set()) is None
     assert policy.next_card(attempted, {"E01_supported"}).card_id == "E04"
+
+
+def test_every_search_card_carries_resource_dependency_and_falsification_metadata() -> None:
+    cards = [card for card in SearchPolicy().cards if card.stage == "search"]
+    assert cards
+    for card in cards:
+        assert card.family
+        assert card.estimated_cost_seconds > 0
+        assert card.memory_mb > 0
+        assert card.falsifier
+        assert isinstance(card.dependencies, tuple)
+        assert isinstance(card.target_segments, tuple)
+
+
+def test_ensemble_isolation_precedes_expected_utility_search() -> None:
+    policy = SearchPolicy()
+    assert policy.next_card(set(), set()).card_id == "E16"
+    assert policy.next_card(set(), set()) == policy.next_card(set(), set())

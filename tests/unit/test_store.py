@@ -13,6 +13,7 @@ from rex.contracts import (
     Operator,
     RunResult,
     RunState,
+    ValidationPhase,
 )
 from rex.control.budget import deadline_epoch_ms
 from rex.execution.artifacts import artifact_ref
@@ -235,10 +236,192 @@ def test_failed_transaction_counts_once_and_preserves_baseline_incumbent(tmp_pat
     run = repo.get_run(run_id)
     assert first["idempotent"] is False
     assert second["idempotent"] is True
-    assert run["non_improvement_streak"] == 1
+    assert run["non_improvement_streak"] == 0
+    assert first["converged"] is False
     assert run["best_primary_units"] == 500_000_000
     assert run["best_ever_experiment_id"] == "baseline"
     assert run["search_champion_experiment_id"] == "baseline"
+
+
+def test_atomic_validation_phase_locks_one_finalist_and_never_reopens(tmp_path: Path) -> None:
+    repo, _, run_id = repository(tmp_path)
+    repo.transition_run(run_id, RunState.INITIALIZING, RunState.BASELINE_VERIFYING)
+    repo.establish_baseline(
+        run_id=run_id,
+        metrics=Metrics(
+            GAUC=0.5,
+            **{"nDCG@5": 0.5},
+            primary=0.5,
+            users=2,
+            rows=4,
+            evaluator_sha256=HASH,
+            split="valid",
+        ),
+        evidence_artifact_ids=[],
+    )
+    repo.transition_run(run_id, RunState.BASELINE_VERIFYING, RunState.SEARCHING)
+    repo.create_experiment(
+        run_id,
+        proposal("finalist"),
+        "root",
+        method_card_id="E21",
+        experiment_kind="production_search",
+    )
+    current = ExperimentState.PROPOSED
+    for index, target in enumerate(
+        (
+            ExperimentState.WORKTREE_READY,
+            ExperimentState.PATCHED,
+            ExperimentState.STATIC_VALID,
+            ExperimentState.FIXTURE_VALID,
+            ExperimentState.CHEAP_RUNNING,
+            ExperimentState.CHEAP_COMPLETE,
+            ExperimentState.FULL_RESERVED,
+            ExperimentState.FULL_RUNNING,
+            ExperimentState.FULL_COMPLETE,
+            ExperimentState.DIAGNOSED,
+        )
+    ):
+        repo.transition_experiment("finalist", current, target, idempotency_key=f"phase:{index}")
+        current = target
+    evidence_path = tmp_path / "full-shadow.json"
+    evidence_path.write_text("{}\n", encoding="utf-8")
+    evidence = artifact_ref(evidence_path, "production_full_result")
+    repo.register_artifact(evidence, experiment_id="finalist")
+    repo.record_shadow_evaluation(
+        run_id=run_id,
+        experiment_id="finalist",
+        family="field_weighted_fm",
+        primary=0.505,
+        supported=True,
+        evidence_artifact_ids=[evidence.artifact_id],
+        epsilon=0.002,
+        patience=3,
+        valid_family_count=1,
+        minimum_valid_families=3,
+    )
+
+    first = repo.lock_validation_finalist(
+        run_id=run_id,
+        experiment_id="finalist",
+        evidence_artifact_ids=[evidence.artifact_id],
+        idempotency_key="lock-finalist",
+    )
+    replay = repo.lock_validation_finalist(
+        run_id=run_id,
+        experiment_id="finalist",
+        evidence_artifact_ids=[evidence.artifact_id],
+        idempotency_key="lock-finalist",
+    )
+    assert first["idempotent"] is False
+    assert replay["idempotent"] is True
+    assert repo.get_run(run_id)["validation_phase"] == ValidationPhase.FINALIST_LOCKED
+
+    repo.transition_experiment(
+        "finalist",
+        ExperimentState.DIAGNOSED,
+        ExperimentState.OFFICIAL_VALID_RUNNING,
+        idempotency_key="official-running",
+    )
+    repo.record_metrics(
+        "finalist",
+        Metrics(
+            GAUC=0.51,
+            **{"nDCG@5": 0.51},
+            primary=0.51,
+            users=2,
+            rows=4,
+            evaluator_sha256=HASH,
+            split="valid",
+        ),
+        max_official_evaluations=1,
+    )
+    repo.transition_experiment(
+        "finalist",
+        ExperimentState.OFFICIAL_VALID_RUNNING,
+        ExperimentState.OFFICIAL_VALID_COMPLETE,
+        idempotency_key="official-complete",
+    )
+    repo.promote_search_candidate(
+        run_id=run_id,
+        experiment_id="finalist",
+        primary=0.51,
+        evidence_artifact_ids=[evidence.artifact_id],
+        epsilon=0.002,
+        patience=3,
+        idempotency_key="official-result",
+    )
+    run = repo.get_run(run_id)
+    assert run["validation_phase"] == ValidationPhase.OFFICIAL_EVALUATED
+    assert run["official_evaluation_count"] == 1
+    assert run["finalist_experiment_id"] == "finalist"
+    with pytest.raises(RepositoryError, match="cannot lock"):
+        repo.lock_validation_finalist(
+            run_id=run_id,
+            experiment_id="finalist",
+            evidence_artifact_ids=[evidence.artifact_id],
+            idempotency_key="reopen",
+        )
+
+
+def test_shadow_tracker_uses_epsilon_and_resets_on_meaningful_improvement(
+    tmp_path: Path,
+) -> None:
+    repo, _, run_id = repository(tmp_path)
+
+    def record(experiment_id: str, score: float, family: str) -> dict:
+        repo.create_experiment(
+            run_id,
+            proposal(experiment_id),
+            "root",
+            method_card_id=experiment_id,
+            experiment_kind="production_search",
+        )
+        current = ExperimentState.PROPOSED
+        for index, target in enumerate(
+            (
+                ExperimentState.WORKTREE_READY,
+                ExperimentState.PATCHED,
+                ExperimentState.STATIC_VALID,
+                ExperimentState.FIXTURE_VALID,
+                ExperimentState.CHEAP_RUNNING,
+                ExperimentState.CHEAP_COMPLETE,
+                ExperimentState.FULL_RESERVED,
+                ExperimentState.FULL_RUNNING,
+                ExperimentState.FULL_COMPLETE,
+                ExperimentState.DIAGNOSED,
+            )
+        ):
+            repo.transition_experiment(
+                experiment_id,
+                current,
+                target,
+                idempotency_key=f"{experiment_id}:shadow:{index}",
+            )
+            current = target
+        path = tmp_path / f"{experiment_id}.json"
+        path.write_text("{}\n", encoding="utf-8")
+        ref = artifact_ref(path, "production_full_result")
+        repo.register_artifact(ref, experiment_id=experiment_id)
+        return repo.record_shadow_evaluation(
+            run_id=run_id,
+            experiment_id=experiment_id,
+            family=family,
+            primary=score,
+            supported=True,
+            evidence_artifact_ids=[ref.artifact_id],
+            epsilon=0.002,
+            patience=3,
+            valid_family_count=3,
+            minimum_valid_families=3,
+        )
+
+    assert record("e1", 0.600, "fm")["non_improvement_streak"] == 0
+    assert record("e2", 0.601, "tree")["non_improvement_streak"] == 1
+    assert record("e3", 0.604, "history")["non_improvement_streak"] == 0
+    run = repo.get_run(run_id)
+    assert run["shadow_champion_experiment_id"] == "e3"
+    assert run["shadow_best_primary_units"] == 604_000_000
 
 
 def test_process_session_lease_heartbeat_stale_takeover_and_close(tmp_path: Path) -> None:
@@ -260,9 +443,12 @@ def test_process_session_lease_heartbeat_stale_takeover_and_close(tmp_path: Path
             stale_after_seconds=10,
             now=started + timedelta(seconds=6),
         )
-    assert repo.list_stale_process_sessions(
-        run_id, stale_after_seconds=10, now=started + timedelta(seconds=16)
-    )[0]["session_id"] == "s1"
+    assert (
+        repo.list_stale_process_sessions(
+            run_id, stale_after_seconds=10, now=started + timedelta(seconds=16)
+        )[0]["session_id"]
+        == "s1"
+    )
     takeover = repo.open_process_session(
         session_id="s2",
         run_id=run_id,
@@ -272,18 +458,21 @@ def test_process_session_lease_heartbeat_stale_takeover_and_close(tmp_path: Path
         now=started + timedelta(seconds=16),
     )
     assert takeover["stale_session_ids"] == ["s1"]
-    assert not repo.close_process_session(
-        "s2", exit_reason="complete", monotonic_seconds=20
-    )["idempotent"]
-    assert repo.close_process_session(
-        "s2", exit_reason="complete", monotonic_seconds=20
-    )["idempotent"]
+    assert not repo.close_process_session("s2", exit_reason="complete", monotonic_seconds=20)[
+        "idempotent"
+    ]
+    assert repo.close_process_session("s2", exit_reason="complete", monotonic_seconds=20)[
+        "idempotent"
+    ]
     with pytest.raises(RepositoryError, match="conflicting replay"):
         repo.close_process_session("s2", exit_reason="fatal", monotonic_seconds=20)
     with database.connect() as connection:
-        assert connection.execute(
-            "SELECT exit_reason FROM process_sessions WHERE session_id='s1'"
-        ).fetchone()["exit_reason"] == "stale_takeover"
+        assert (
+            connection.execute(
+                "SELECT exit_reason FROM process_sessions WHERE session_id='s1'"
+            ).fetchone()["exit_reason"]
+            == "stale_takeover"
+        )
 
 
 def _result(experiment_id: str = "e1", *, wall_seconds: float = 1.5) -> RunResult:
@@ -310,9 +499,12 @@ def test_attempt_replay_is_exactly_once_and_conflicts_fail(tmp_path: Path) -> No
     with database.connect() as connection:
         assert connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM resource_usage").fetchone()[0] == 1
-        assert connection.execute(
-            "SELECT COUNT(*) FROM event_outbox WHERE event_type='attempt.completed'"
-        ).fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM event_outbox WHERE event_type='attempt.completed'"
+            ).fetchone()[0]
+            == 1
+        )
     with pytest.raises(RepositoryError, match="conflicting replay"):
         repo.record_attempt(_result(wall_seconds=2.0), rung="fixture")
 
@@ -337,9 +529,12 @@ def test_reserved_attempt_completes_once(tmp_path: Path) -> None:
     repo.record_attempt(_result(), rung="fixture")
     repo.record_attempt(_result(), rung="fixture")
     with database.connect() as connection:
-        assert connection.execute(
-            "SELECT status FROM attempts WHERE attempt_id='attempt-e1'"
-        ).fetchone()["status"] == AttemptStatus.SUCCESS
+        assert (
+            connection.execute(
+                "SELECT status FROM attempts WHERE attempt_id='attempt-e1'"
+            ).fetchone()["status"]
+            == AttemptStatus.SUCCESS
+        )
         assert connection.execute("SELECT COUNT(*) FROM resource_usage").fetchone()[0] == 1
 
 
@@ -423,9 +618,12 @@ def test_artifact_content_can_link_to_multiple_experiments_safely(tmp_path: Path
     with database.connect() as connection:
         assert connection.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM artifact_links").fetchone()[0] == 2
-        assert connection.execute(
-            "SELECT COUNT(*) FROM event_outbox WHERE event_type='artifact.registered'"
-        ).fetchone()[0] == 2
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM event_outbox WHERE event_type='artifact.registered'"
+            ).fetchone()[0]
+            == 2
+        )
 
 
 def test_event_export_is_atomic_deterministic_rebuild(tmp_path: Path) -> None:
@@ -459,8 +657,8 @@ def test_schema_migration_and_workspace_provenance(tmp_path: Path) -> None:
     assert experiment["experiment_kind"] == "FIXTURE"
     assert experiment["workspace_path"] == "/tmp/worktree"
     with database.connect() as connection:
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
-        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+        assert connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 6
 
 
 def test_migration_adds_production_run_columns_to_old_database(tmp_path: Path) -> None:
@@ -483,9 +681,7 @@ def test_migration_adds_production_run_columns_to_old_database(tmp_path: Path) -
     database.initialize()
 
     with database.connect() as connection:
-        columns = {
-            row["name"] for row in connection.execute("PRAGMA table_info(runs)").fetchall()
-        }
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(runs)").fetchall()}
         run = connection.execute("SELECT * FROM runs WHERE run_id='legacy'").fetchone()
         assert {
             "hypothesis_count",
@@ -494,12 +690,18 @@ def test_migration_adds_production_run_columns_to_old_database(tmp_path: Path) -
             "best_primary_units",
             "best_ever_experiment_id",
             "search_champion_experiment_id",
+            "shadow_best_primary_units",
+            "shadow_champion_experiment_id",
+            "validation_phase",
+            "finalist_experiment_id",
+            "official_evaluated_at",
             "stop_reason",
         } <= columns
         assert run["hypothesis_count"] == 0
         assert run["official_evaluation_count"] == 0
         assert run["non_improvement_streak"] == 0
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert run["validation_phase"] == ValidationPhase.DISCOVERY
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
 
 
 def test_migration_adds_immutable_repair_revision_columns(tmp_path: Path) -> None:
@@ -530,7 +732,7 @@ def test_migration_adds_immutable_repair_revision_columns(tmp_path: Path) -> Non
             "repaired_config_sha256",
             "effective_config_artifact_id",
         } <= columns
-        assert connection.execute("PRAGMA user_version").fetchone()[0] == 4
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
 
 
 def test_repair_revision_atomically_supersedes_effective_commit_and_config(

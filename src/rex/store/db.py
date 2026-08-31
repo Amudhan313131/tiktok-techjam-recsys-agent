@@ -41,6 +41,11 @@ class Database:
             ("best_primary_units", "INTEGER"),
             ("best_ever_experiment_id", "TEXT"),
             ("search_champion_experiment_id", "TEXT"),
+            ("shadow_best_primary_units", "INTEGER"),
+            ("shadow_champion_experiment_id", "TEXT"),
+            ("validation_phase", "TEXT NOT NULL DEFAULT 'DISCOVERY'"),
+            ("finalist_experiment_id", "TEXT"),
+            ("official_evaluated_at", "TEXT"),
             ("stop_reason", "TEXT"),
         ):
             if name not in run_columns:
@@ -58,7 +63,8 @@ class Database:
                 connection.execute(f"ALTER TABLE experiments ADD COLUMN {name} {declaration}")
 
         resource_columns = {
-            row["name"] for row in connection.execute("PRAGMA table_info(resource_usage)").fetchall()
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(resource_usage)").fetchall()
         }
         if "resource_key" not in resource_columns:
             connection.execute("ALTER TABLE resource_usage ADD COLUMN resource_key TEXT")
@@ -67,7 +73,8 @@ class Database:
             "ON resource_usage(resource_key) WHERE resource_key IS NOT NULL"
         )
         link_columns = {
-            row["name"] for row in connection.execute("PRAGMA table_info(artifact_links)").fetchall()
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(artifact_links)").fetchall()
         }
         if "artifact_path" not in link_columns:
             connection.execute("ALTER TABLE artifact_links ADD COLUMN artifact_path TEXT")
@@ -152,6 +159,26 @@ class Database:
                 delta_units INTEGER,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS validation_phase_transitions (
+                run_id TEXT NOT NULL REFERENCES runs(run_id),
+                from_phase TEXT NOT NULL,
+                to_phase TEXT NOT NULL,
+                finalist_experiment_id TEXT REFERENCES experiments(experiment_id),
+                evidence_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                PRIMARY KEY(run_id, to_phase)
+            );
+            CREATE TABLE IF NOT EXISTS shadow_evaluations (
+                experiment_id TEXT PRIMARY KEY REFERENCES experiments(experiment_id),
+                run_id TEXT NOT NULL REFERENCES runs(run_id),
+                family TEXT NOT NULL,
+                primary_units INTEGER NOT NULL,
+                supported INTEGER NOT NULL,
+                delta_units INTEGER,
+                evidence_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
             """
         )
         repair_columns = {
@@ -177,7 +204,23 @@ class Database:
             "INSERT OR IGNORE INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)",
             (4, "repair_revision_provenance", now),
         )
-        connection.execute("PRAGMA user_version = 4")
+        # Earlier production builds evaluated every candidate on the official
+        # validation split.  Preserve those runs as terminal instead of
+        # accidentally reopening discovery after this additive migration.
+        connection.execute(
+            "UPDATE runs SET validation_phase='OFFICIAL_EVALUATED',official_evaluated_at="
+            "COALESCE(official_evaluated_at,updated_at) WHERE official_evaluation_count>0 "
+            "AND validation_phase='DISCOVERY'"
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)",
+            (5, "atomic_official_validation_phase", now),
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)",
+            (6, "shadow_discovery_tracker", now),
+        )
+        connection.execute("PRAGMA user_version = 6")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

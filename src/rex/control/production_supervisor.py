@@ -40,9 +40,17 @@ from rex.contracts import (
     ExperimentState,
     Metrics,
     RunState,
+    ValidationPhase,
 )
-from rex.control.budget import BudgetConfig, deadline_epoch_ms, seconds_remaining, should_finalize
+from rex.control.budget import (
+    BudgetConfig,
+    deadline_epoch_ms,
+    scientific_plateau_reached,
+    seconds_remaining,
+    should_finalize,
+)
 from rex.data.manifest import canonical_json_bytes, repo_root, sha256_file
+from rex.evaluation.diagnostics import passes_uncertainty_gate
 from rex.execution.artifacts import artifact_ref, atomic_write_json
 from rex.reporting.finalizer import create_best_valid_bundle
 from rex.reporting.report import build_report
@@ -61,6 +69,21 @@ CARD_CODE_PATHS: dict[str, tuple[str, ...]] = {
     "E07": ("src/rex/models/experimental/tree_history.py",),
     "E08": ("src/rex/models/experimental/tree_history.py",),
     "E10": (),
+    "E16": ("src/rex/models/experimental/context_fm.py",),
+    "E17": ("src/rex/features/categorical_crosses.py",),
+    "E18": ("src/rex/features/categorical_crosses.py",),
+    "E19": (),
+    "E20": (),
+    "E21": ("src/rex/models/experimental/field_weighted_fm.py",),
+    "E22": ("src/rex/features/candidate_recency.py",),
+    "E23": ("src/rex/features/multifeedback_history.py",),
+    "E24": ("src/rex/models/experimental/tree_history.py",),
+    "E25": (),
+    "E26": ("src/rex/models/experimental/tree_classifier.py",),
+    "E27": ("src/rex/models/experimental/tree_classifier.py",),
+    "E28": ("src/rex/features/quantile_buckets.py",),
+    "E29": ("src/rex/models/experimental/tree_classifier.py",),
+    "E30": ("src/rex/models/experimental/context_fm.py",),
 }
 CARD_READONLY_CONTEXT_PATHS: dict[str, tuple[str, ...]] = {
     "E15": (
@@ -116,6 +139,49 @@ CARD_READONLY_CONTEXT_PATHS: dict[str, tuple[str, ...]] = {
     "E10": (
         "src/rex/models/shadow_blend.py",
         "src/rex/models/ensemble.py",
+        "src/rex/data/views.py",
+    ),
+    "E16": (
+        "src/rex/models/context_fm.py",
+        "src/rex/models/ensemble.py",
+        "src/rex/data/views.py",
+    ),
+    "E17": ("src/rex/models/context_fm.py", "src/rex/features/recipes.py"),
+    "E18": ("src/rex/models/context_fm.py", "src/rex/features/recipes.py"),
+    "E19": (
+        "src/rex/models/context_fm.py",
+        "src/rex/features/static_metadata.py",
+        "src/rex/features/recipes.py",
+    ),
+    "E20": (
+        "src/rex/models/context_fm.py",
+        "src/rex/features/static_metadata.py",
+        "src/rex/features/recipes.py",
+    ),
+    "E21": ("src/rex/models/field_weighted_fm.py", "src/rex/models/context_fm.py"),
+    "E22": ("src/rex/features/recipes.py", "src/rex/data/views.py"),
+    "E23": ("src/rex/features/recipes.py", "src/rex/data/views.py"),
+    "E24": ("src/rex/models/tree_ranker.py", "src/rex/data/views.py"),
+    "E25": ("src/rex/models/shadow_blend.py", "src/rex/models/ensemble.py"),
+    "E26": ("src/rex/models/tree_classifier.py", "src/rex/data/views.py"),
+    "E27": (
+        "src/rex/models/tree_classifier.py",
+        "src/rex/features/static_metadata.py",
+        "src/rex/data/views.py",
+    ),
+    "E28": (
+        "src/rex/models/context_fm.py",
+        "src/rex/features/candidate_recency.py",
+        "src/rex/features/recipes.py",
+    ),
+    "E29": (
+        "src/rex/models/tree_classifier.py",
+        "src/rex/features/static_metadata.py",
+        "src/rex/data/views.py",
+    ),
+    "E30": (
+        "src/rex/models/context_fm.py",
+        "src/rex/features/static_metadata.py",
         "src/rex/data/views.py",
     ),
 }
@@ -187,6 +253,21 @@ class ProductionRunConfig:
                 "E08",
                 "E10",
                 "E15",
+                "E16",
+                "E17",
+                "E18",
+                "E19",
+                "E20",
+                "E21",
+                "E22",
+                "E23",
+                "E24",
+                "E25",
+                "E26",
+                "E27",
+                "E28",
+                "E29",
+                "E30",
             }
             if card_id not in supported_cards:
                 raise ValueError(
@@ -401,6 +482,21 @@ class ProductionFixedProvider:
                 "E07": "FEATURE",
                 "E08": "FEATURE",
                 "E10": "ENSEMBLE",
+                "E16": "ENSEMBLE",
+                "E17": "FEATURE",
+                "E18": "FEATURE",
+                "E19": "FEATURE",
+                "E20": "FEATURE",
+                "E21": "MODEL_BLOCK",
+                "E22": "FEATURE",
+                "E23": "FEATURE",
+                "E24": "HYPERPARAMETER",
+                "E25": "ENSEMBLE",
+                "E26": "MODEL_BLOCK",
+                "E27": "FEATURE",
+                "E28": "FEATURE",
+                "E29": "FEATURE",
+                "E30": "HYPERPARAMETER",
             }[card_id]
             value = {
                 "experiment_id": str(context.get("experiment_id", f"fixed-{card_id.lower()}")),
@@ -651,19 +747,54 @@ class ProductionAutopilot:
             self._resume_active(repository, context)
             while True:
                 run = repository.get_run(identifier)
-                stop_reason = self._stop_reason(run)
+                phase = ValidationPhase(run["validation_phase"])
+                if phase == ValidationPhase.OFFICIAL_EVALUATED:
+                    repository.transition_run(
+                        identifier,
+                        RunState.SEARCHING,
+                        RunState.FINALIZING,
+                        run["stop_reason"] or "official_finalist_evaluated",
+                    )
+                    break
+                if phase == ValidationPhase.FINALIST_LOCKED:
+                    self._resume_active(repository, context)
+                    refreshed = repository.get_run(identifier)
+                    if (
+                        ValidationPhase(refreshed["validation_phase"])
+                        == ValidationPhase.OFFICIAL_EVALUATED
+                    ):
+                        continue
+                    finalist_id = str(refreshed["finalist_experiment_id"] or "")
+                    finalist = repository.get_experiment(finalist_id) if finalist_id else None
+                    if (
+                        finalist
+                        and ExperimentState(finalist["state"]) == ExperimentState.FAILED_FINAL
+                    ):
+                        repository.transition_run(
+                            identifier,
+                            RunState.SEARCHING,
+                            RunState.FINALIZING,
+                            "locked_official_finalist_failed",
+                        )
+                        break
+                    return self.status(identifier)
+                stop_reason = self._stop_reason(repository, run)
                 if stop_reason is not None:
+                    if self._lock_shadow_finalist(repository, context, stop_reason):
+                        self._resume_active(repository, context)
+                        continue
                     repository.transition_run(
                         identifier, RunState.SEARCHING, RunState.FINALIZING, stop_reason
                     )
                     break
                 card = self._next_card(repository, identifier)
                 if card is None:
+                    reason = "eligible_method_queue_exhausted"
+                    if self._lock_shadow_finalist(repository, context, reason):
+                        self._resume_active(repository, context)
+                        continue
                     repository.transition_run(
-                        identifier,
-                        RunState.SEARCHING,
-                        RunState.FINALIZING,
-                        "eligible_method_queue_exhausted",
+                        identifier, RunState.SEARCHING, RunState.FINALIZING, reason
                     )
                     break
                 try:
@@ -747,8 +878,13 @@ class ProductionAutopilot:
             "deadline_epoch_ms": run["deadline_epoch_ms"],
             "hypothesis_count": run["hypothesis_count"],
             "official_evaluation_count": run["official_evaluation_count"],
+            "validation_phase": run["validation_phase"],
+            "finalist_experiment_id": run["finalist_experiment_id"],
+            "official_evaluated_at": run["official_evaluated_at"],
             "non_improvement_streak": run["non_improvement_streak"],
             "search_champion_experiment_id": run["search_champion_experiment_id"],
+            "shadow_champion_experiment_id": run["shadow_champion_experiment_id"],
+            "shadow_best_primary_units": run["shadow_best_primary_units"],
             "experiments": [dict(row) for row in experiments],
             "repairs": [dict(row) for row in repairs],
             "sessions": [dict(row) for row in sessions],
@@ -784,8 +920,11 @@ class ProductionAutopilot:
             "stop_reason": status["stop_reason"],
             "hypotheses": status["hypothesis_count"],
             "official_evaluations": status["official_evaluation_count"],
+            "validation_phase": status["validation_phase"],
+            "finalist": status["finalist_experiment_id"],
             "non_improvement_streak": status["non_improvement_streak"],
             "champion": status["search_champion_experiment_id"],
+            "shadow_champion": status["shadow_champion_experiment_id"],
             "active_experiment": active[-1] if active else None,
             "latest_session": last_session,
             "deadline_epoch_ms": int(status["deadline_epoch_ms"]),
@@ -890,8 +1029,12 @@ class ProductionAutopilot:
                 proven.add(str(row["session_id"]))
         return frozenset(proven)
 
-    def _stop_reason(self, run: dict[str, Any]) -> str | None:
-        if run["stop_reason"] == "epsilon_plateau":
+    def _stop_reason(self, repository: ExperimentRepository, run: dict[str, Any]) -> str | None:
+        if scientific_plateau_reached(
+            stop_reason=run["stop_reason"],
+            valid_family_count=self._valid_family_count(repository, str(run["run_id"])),
+            minimum_valid_families=self.budget.min_valid_families_before_plateau,
+        ):
             return "epsilon_plateau"
         if int(run["hypothesis_count"]) >= self.budget.max_hypotheses:
             return "hypothesis_cap"
@@ -904,6 +1047,99 @@ class ProductionAutopilot:
         ):
             return "finalization_reserve_reached"
         return None
+
+    def _valid_family_count(self, repository: ExperimentRepository, run_id: str) -> int:
+        """Count families with a durable, successfully completed full-shadow result."""
+
+        with repository.database.connect() as connection:
+            recorded = connection.execute(
+                "SELECT DISTINCT family FROM shadow_evaluations WHERE run_id=?",
+                (run_id,),
+            ).fetchall()
+            rows = connection.execute(
+                "SELECT DISTINCT experiment.method_card_id FROM experiments experiment "
+                "JOIN artifact_links link ON link.experiment_id=experiment.experiment_id "
+                "JOIN artifacts artifact ON artifact.artifact_id=link.artifact_id "
+                "WHERE experiment.run_id=? AND artifact.kind='production_full_result'",
+                (run_id,),
+            ).fetchall()
+        families = {str(row["family"]) for row in recorded}
+        families.update(
+            {
+                card.family
+                for row in rows
+                for card in self.search_policy.cards
+                if card.card_id == row["method_card_id"]
+            }
+        )
+        return len(families)
+
+    def _plateau_eligible(self, repository: ExperimentRepository, run_id: str) -> bool:
+        return (
+            self._valid_family_count(repository, run_id)
+            >= self.budget.min_valid_families_before_plateau
+        )
+
+    def _lock_shadow_finalist(
+        self,
+        repository: ExperimentRepository,
+        context: ProductionContext,
+        reason: str,
+    ) -> bool:
+        """Select the strongest full-shadow candidate and irreversibly close discovery."""
+
+        run = repository.get_run(context.run_id)
+        if ValidationPhase(run["validation_phase"]) != ValidationPhase.DISCOVERY:
+            return ValidationPhase(run["validation_phase"]) == ValidationPhase.FINALIST_LOCKED
+        with repository.database.connect() as connection:
+            rows = connection.execute(
+                "SELECT experiment_id FROM experiments WHERE run_id=? AND state=? "
+                "ORDER BY iteration_number",
+                (context.run_id, ExperimentState.DIAGNOSED),
+            ).fetchall()
+        candidates: list[tuple[float, str]] = []
+        for row in rows:
+            experiment_id = str(row["experiment_id"])
+            result = self._stored_rung(repository, experiment_id, "full", required=False)
+            if result is None:
+                continue
+            mean_primary = sum(item.candidate.primary for item in result.observations) / len(
+                result.observations
+            )
+            candidates.append((mean_primary, experiment_id))
+        if not candidates:
+            return False
+        durable_champion = str(run["shadow_champion_experiment_id"] or "")
+        by_id = {experiment_id: score for score, experiment_id in candidates}
+        if durable_champion in by_id:
+            finalist_id = durable_champion
+            _score = by_id[durable_champion]
+        else:
+            _score, finalist_id = max(candidates, key=lambda item: (item[0], item[1]))
+        evidence = self._experiment_evidence(repository, finalist_id)
+        repository.lock_validation_finalist(
+            run_id=context.run_id,
+            experiment_id=finalist_id,
+            evidence_artifact_ids=evidence,
+            idempotency_key=f"{context.run_id}:finalist-locked",
+        )
+        path = context.run_dir / "evidence" / "validation-phase-finalist-locked.json"
+        atomic_write_json(
+            path,
+            {
+                "schema_version": "rex.validation-phase.v1",
+                "phase": ValidationPhase.FINALIST_LOCKED,
+                "finalist_experiment_id": finalist_id,
+                "selection_reason": reason,
+                "full_shadow_mean_primary": _score,
+                "valid_family_count": self._valid_family_count(repository, context.run_id),
+                "official_evaluations_before_lock": int(run["official_evaluation_count"]),
+            },
+        )
+        repository.register_artifact(
+            artifact_ref(path, "validation_phase"), experiment_id=finalist_id
+        )
+        return True
 
     def _next_card(self, repository: ExperimentRepository, run_id: str) -> ExperimentCard | None:
         with repository.database.connect() as connection:
@@ -1201,8 +1437,12 @@ class ProductionAutopilot:
             "primary_delta_ci",
             "prediction_correlation",
             "segment_primary_deltas",
+            "segment_support",
             "segment_wins",
             "segment_regressions",
+            "pooled_primary_delta",
+            "candidate_control_rows_identical",
+            "evaluation_source_row_ids_sha256",
         }
 
         def bounded(item: Any, depth: int = 0) -> Any:
@@ -1450,6 +1690,9 @@ class ProductionAutopilot:
         return prepared
 
     def _resume_active(self, repository: ExperimentRepository, context: ProductionContext) -> None:
+        run = repository.get_run(context.run_id)
+        phase = ValidationPhase(run["validation_phase"])
+        finalist_id = str(run["finalist_experiment_id"] or "")
         with repository.database.connect() as connection:
             rows = connection.execute(
                 "SELECT experiment_id,state,workspace_path,commit_sha FROM experiments WHERE run_id=? "
@@ -1459,6 +1702,23 @@ class ProductionAutopilot:
             ).fetchall()
         for row in rows:
             state = ExperimentState(row["state"])
+            experiment_id = str(row["experiment_id"])
+            if phase == ValidationPhase.OFFICIAL_EVALUATED:
+                return
+            if (
+                phase == ValidationPhase.FINALIST_LOCKED
+                and state == ExperimentState.DIAGNOSED
+                and experiment_id != finalist_id
+            ):
+                repository.transition_experiment(
+                    experiment_id,
+                    ExperimentState.DIAGNOSED,
+                    ExperimentState.ABANDONED,
+                    reason="shadow candidate was not the atomically locked finalist",
+                    idempotency_key=f"{experiment_id}:non-finalist-abandoned",
+                )
+                self._cleanup_worktree(repository, context, experiment_id)
+                continue
             if state in {
                 ExperimentState.PROPOSED,
                 ExperimentState.WORKTREE_READY,
@@ -1466,10 +1726,10 @@ class ProductionAutopilot:
                 ExperimentState.STATIC_VALID,
             }:
                 try:
-                    self._resume_preparation(repository, context, str(row["experiment_id"]))
+                    self._resume_preparation(repository, context, experiment_id)
                 except ProductionPreparationRejected:
                     continue
-            self._run_candidate(repository, context, str(row["experiment_id"]))
+            self._run_candidate(repository, context, experiment_id)
 
     def _resume_preparation(
         self,
@@ -1608,6 +1868,7 @@ class ProductionAutopilot:
                         reason="cheap evidence gate rejected the candidate",
                         patience=self.budget.convergence_patience,
                         idempotency_key=f"{experiment_id}:cheap-rejected",
+                        plateau_eligible=self._plateau_eligible(repository, context.run_id),
                     )
                     self._cleanup_worktree(repository, context, experiment_id)
                     return
@@ -1642,7 +1903,28 @@ class ProductionAutopilot:
                 continue
             if state == ExperimentState.DIAGNOSED:
                 result = self._stored_rung(repository, experiment_id, "full")
-                if not self._full_gate(experiment, result):
+                supported = self._full_gate(experiment, result)
+                card = next(
+                    item
+                    for item in self.search_policy.cards
+                    if item.card_id == experiment["method_card_id"]
+                )
+                mean_primary = sum(item.candidate.primary for item in result.observations) / len(
+                    result.observations
+                )
+                repository.record_shadow_evaluation(
+                    run_id=context.run_id,
+                    experiment_id=experiment_id,
+                    family=card.family,
+                    primary=mean_primary,
+                    supported=supported,
+                    evidence_artifact_ids=self._experiment_evidence(repository, experiment_id),
+                    epsilon=self.budget.convergence_epsilon_units / 1_000_000_000,
+                    patience=self.budget.convergence_patience,
+                    valid_family_count=self._valid_family_count(repository, context.run_id),
+                    minimum_valid_families=self.budget.min_valid_families_before_plateau,
+                )
+                if not supported:
                     repository.reject_candidate(
                         run_id=context.run_id,
                         experiment_id=experiment_id,
@@ -1650,6 +1932,26 @@ class ProductionAutopilot:
                         reason="full temporal evidence gate rejected the candidate",
                         patience=self.budget.convergence_patience,
                         idempotency_key=f"{experiment_id}:full-rejected",
+                        plateau_eligible=self._plateau_eligible(repository, context.run_id),
+                        convergence_counted=False,
+                    )
+                    self._cleanup_worktree(repository, context, experiment_id)
+                    return
+                run = repository.get_run(context.run_id)
+                phase = ValidationPhase(run["validation_phase"])
+                if phase == ValidationPhase.DISCOVERY:
+                    # A successful shadow candidate remains immutable and
+                    # eligible while other independent families are explored.
+                    return
+                if phase == ValidationPhase.OFFICIAL_EVALUATED:
+                    return
+                if str(run["finalist_experiment_id"] or "") != experiment_id:
+                    repository.transition_experiment(
+                        experiment_id,
+                        state,
+                        ExperimentState.ABANDONED,
+                        reason="candidate is not the locked official finalist",
+                        idempotency_key=f"{experiment_id}:not-locked-finalist",
                     )
                     self._cleanup_worktree(repository, context, experiment_id)
                     return
@@ -1700,6 +2002,26 @@ class ProductionAutopilot:
                         patience=self.budget.convergence_patience,
                         idempotency_key=f"{experiment_id}:search-promotion",
                     )
+                phase_path = (
+                    context.run_dir / "evidence" / "validation-phase-official-evaluated.json"
+                )
+                atomic_write_json(
+                    phase_path,
+                    {
+                        "schema_version": "rex.validation-phase.v1",
+                        "phase": ValidationPhase.OFFICIAL_EVALUATED,
+                        "finalist_experiment_id": experiment_id,
+                        "official_evaluation_count": int(
+                            repository.get_run(context.run_id)["official_evaluation_count"]
+                        ),
+                        "promoted": observation.primary_delta > 0
+                        and observation.gauc_delta >= -rule.max_gauc_regression
+                        and observation.ndcg_delta >= -rule.max_ndcg5_regression,
+                    },
+                )
+                repository.register_artifact(
+                    artifact_ref(phase_path, "validation_phase"), experiment_id=experiment_id
+                )
                 self._cleanup_worktree(repository, context, experiment_id)
                 return
             if state in {
@@ -1820,29 +2142,43 @@ class ProductionAutopilot:
             diagnostics=self._safe_diagnostics(payload.get("diagnostics", {})),
         )
 
-    @staticmethod
-    def _cheap_gate(experiment: dict[str, Any], result: ProductionRungResult) -> bool:
+    def _cheap_gate(self, experiment: dict[str, Any], result: ProductionRungResult) -> bool:
         rule = ExperimentProposal.model_validate_json(experiment["proposal_json"]).promotion_rule
         observation = result.observations[0]
-        return (
+        point_gate = (
             observation.primary_delta >= rule.min_primary_delta
             and observation.gauc_delta >= -rule.max_gauc_regression
             and observation.ndcg_delta >= -rule.max_ndcg5_regression
         )
+        uncertainty = result.diagnostics.get("primary_delta_ci")
+        return point_gate and (
+            uncertainty is None
+            or passes_uncertainty_gate(
+                uncertainty,
+                minimum_probability_positive=self.budget.cheap_min_probability_positive,
+            )
+        )
 
-    @staticmethod
-    def _full_gate(experiment: dict[str, Any], result: ProductionRungResult) -> bool:
+    def _full_gate(self, experiment: dict[str, Any], result: ProductionRungResult) -> bool:
         rule = ExperimentProposal.model_validate_json(experiment["proposal_json"]).promotion_rule
         observations = result.observations
         positive = sum(item.primary_delta > 0 for item in observations)
         mean_primary = sum(item.primary_delta for item in observations) / len(observations)
         mean_gauc = sum(item.gauc_delta for item in observations) / len(observations)
         mean_ndcg = sum(item.ndcg_delta for item in observations) / len(observations)
-        return (
+        point_gate = (
             positive >= rule.min_positive_shadow_folds
             and mean_primary > 0
             and mean_gauc >= -rule.max_gauc_regression
             and mean_ndcg >= -rule.max_ndcg5_regression
+        )
+        uncertainty = result.diagnostics.get("pooled_primary_delta")
+        return point_gate and (
+            uncertainty is None
+            or passes_uncertainty_gate(
+                uncertainty,
+                minimum_probability_positive=self.budget.full_min_pooled_probability_positive,
+            )
         )
 
     def _diagnose(

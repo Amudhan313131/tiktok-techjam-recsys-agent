@@ -5,9 +5,10 @@ from pathlib import Path
 import pytest
 
 from rex.agents.recovery import RepairAction, plan_repair
-from rex.agents.search_policy import SearchPolicy
+from rex.agents.search_policy import METHOD_CARD_VERSION, SearchPolicy
 from rex.contracts import AttemptStatus
 from rex.control.production_supervisor import ProductionRunConfig
+from rex.control.budget import BudgetConfig
 from rex.data.manifest import repo_root
 
 
@@ -21,6 +22,8 @@ def test_shipped_production_config_is_runnable_and_excludes_unsupported_cards() 
     assert config.method_cards["E03"].feature_recipe == "history_length"
     assert config.method_cards["E07"].feature_recipe == "author_duration_affinity"
     assert config.method_cards["E08"].feature_recipe == "recency_history"
+    assert config.method_cards["E26"].config_path.name == "e26_pointwise_tree_item_metadata.yaml"
+    assert config.method_cards["E28"].feature_recipe == "candidate_recency_buckets"
     assert config.scientific_execution == {
         "max_parallel_workers": 4,
         "max_parallel_folds": 3,
@@ -29,6 +32,11 @@ def test_shipped_production_config_is_runnable_and_excludes_unsupported_cards() 
     }
     assert config.baseline_cache_dir is None
     assert config.control_cache_dir is None
+    budget = BudgetConfig.from_yaml(config.budget_config)
+    assert budget.max_official_evaluations == 1
+    assert budget.finalization_reserve_seconds == 3600
+    assert budget.min_valid_families_before_plateau == 6
+    assert budget.full_min_pooled_probability_positive == pytest.approx(0.90)
 
 
 def test_production_loader_honors_docker_capability_roots(
@@ -67,7 +75,11 @@ def test_proposal_context_contains_versioned_method_card_and_only_evidence_ids()
         hypotheses_remaining=49,
         seconds_remaining=100,
     )
-    assert context["method_card"]["citation_id"] == "method-card:1.0:E01"
+    assert context["method_card"]["citation_id"] == f"method-card:{METHOD_CARD_VERSION}:E01"
+    assert context["method_card"]["family"] == "pairwise_fm"
+    assert context["method_card"]["estimated_cost_seconds"] > 0
+    assert context["method_card"]["memory_mb"] > 0
+    assert context["method_card"]["diversity_target"]
     assert context["method_card"]["primary_change"]
     assert context["method_card"]["falsifier"]
     assert {item["source_id"] for item in context["method_sources"]} == {

@@ -91,7 +91,7 @@ from rex.evaluation.baseline_cache import (
     publish_baseline_cache,
     quarantine_baseline_cache,
 )
-from rex.evaluation.diagnostics import compare_diagnostics
+from rex.evaluation.diagnostics import compare_diagnostics, pool_bootstrap_delta_evidence
 from rex.evaluation.official_adapter import EvaluationError, evaluate_predictions
 from rex.execution.artifacts import (
     ArtifactError,
@@ -104,17 +104,29 @@ from rex.execution.sandbox import SandboxMode
 from rex.execution.gate import execute_gate
 from rex.features.recipes import (
     AUTHOR_DURATION_AFFINITY,
+    CANDIDATE_RECENCY_BUCKETS,
     HISTORY_LENGTH,
+    MULTIFEEDBACK_HISTORY,
+    POINT_IN_TIME_CANDIDATE_RECENCY,
     RECENCY_HISTORY,
     REPEAT_EXPOSURE,
+    USER_TAB_CROSS,
+    VIDEO_TAB_CROSS,
     VIDEO_STATISTICS,
     FeatureRecipe,
     RecipeArtifact,
     control_recipe,
     materialize_feature_recipe,
 )
-from rex.models.ensemble import blend_scores
+from rex.models.ensemble import (
+    PredictionVector,
+    ShadowBlendFold,
+    blend_scores,
+    save_blend_selection,
+    select_shadow_blend,
+)
 from rex.models.bundle import create_model_bundle
+from rex.models.context_fm import load_member_predictions
 from rex.store.db import Database
 from rex.store.repository import ExperimentRepository, RepositoryError
 
@@ -172,6 +184,7 @@ class _ModelExecution:
     artifacts: tuple[ArtifactRef, ...]
     component_scores: tuple[np.ndarray, np.ndarray] | None = None
     fit_result: RunResult | None = None
+    member_scores: tuple[np.ndarray, ...] | None = None
 
 
 RECIPE_BY_NAME: dict[str, FeatureRecipe] = {
@@ -184,6 +197,11 @@ RECIPE_BY_NAME: dict[str, FeatureRecipe] = {
     "recency": RECENCY_HISTORY,
     "recency_history": RECENCY_HISTORY,
     "shadow_blend": HISTORY_LENGTH,
+    "user_tab_cross": USER_TAB_CROSS,
+    "video_tab_cross": VIDEO_TAB_CROSS,
+    "point_in_time_candidate_recency": POINT_IN_TIME_CANDIDATE_RECENCY,
+    "multifeedback_history": MULTIFEEDBACK_HISTORY,
+    "candidate_recency_buckets": CANDIDATE_RECENCY_BUCKETS,
 }
 
 
@@ -197,6 +215,20 @@ REFERENCE_CONFIG_BY_CARD = {
     "E06": "configs/experiments/e06_repeat_exposure.yaml",
     "E07": "configs/experiments/e07_affinity.yaml",
     "E08": "configs/experiments/e08_recency.yaml",
+    "E16": "configs/experiments/e15_context_control.yaml",
+    "E17": "configs/experiments/e17_user_tab_cross.yaml",
+    "E18": "configs/experiments/e18_video_tab_cross.yaml",
+    "E19": "configs/experiments/e19_context_control.yaml",
+    "E20": "configs/experiments/e19_item_metadata.yaml",
+    "E21": "configs/experiments/e21_fm_control.yaml",
+    "E22": "configs/experiments/e24_regularized_tree.yaml",
+    "E23": "configs/experiments/e24_regularized_tree.yaml",
+    "E24": "configs/experiments/e02_tree_ranker_control.yaml",
+    "E26": "configs/experiments/e26_pointwise_tree_control.yaml",
+    "E27": "configs/experiments/e26_pointwise_tree_control.yaml",
+    "E28": "configs/experiments/e19_item_metadata.yaml",
+    "E29": "configs/experiments/e26_pointwise_tree_control.yaml",
+    "E30": "configs/experiments/e19_item_metadata.yaml",
 }
 
 REPAIR_MIRROR_KEYS = frozenset(
@@ -304,13 +336,25 @@ class ProductionScientificHooks(ProductionHooks):
             if not feature.is_file() or sha256_file(feature) != detail.get("feature_sha256"):
                 raise RuntimeError(f"data manifest {split} feature capability drifted")
             target_raw = detail.get("target_path")
+            feedback_raw = detail.get("feedback_target_path")
             if split == "test":
                 if target_raw is not None or detail.get("target_sha256") is not None:
                     raise RuntimeError("data manifest must not contain a test target capability")
+                if feedback_raw is not None or detail.get("feedback_target_sha256") is not None:
+                    raise RuntimeError("data manifest must not contain a test feedback capability")
             else:
                 target = Path(str(target_raw)).resolve()
                 if not target.is_file() or sha256_file(target) != detail.get("target_sha256"):
                     raise RuntimeError(f"data manifest {split} target capability drifted")
+                if feedback_raw is not None:
+                    feedback = Path(str(feedback_raw)).resolve()
+                    if (
+                        not feedback.is_file()
+                        or sha256_file(feedback) != detail.get("feedback_target_sha256")
+                    ):
+                        raise RuntimeError(
+                            f"data manifest {split} feedback capability drifted"
+                        )
         return payload
 
     def _split_paths(self, split: str) -> tuple[Path, Path | None]:
@@ -768,6 +812,11 @@ class ProductionScientificHooks(ProductionHooks):
                 context, proposal.experiment_id
             )
             refs.extend(selection_refs)
+        elif card.card_id == "E25":
+            effective_config, selection_refs = self._derive_e25_config(
+                context, proposal.experiment_id
+            )
+            refs.extend(selection_refs)
         transaction_path = (
             context.run_dir / "evidence" / proposal.experiment_id / "fixed-config.json"
         )
@@ -921,11 +970,127 @@ class ProductionScientificHooks(ProductionHooks):
             artifact_ref(derived_path, "derived_experiment_config"),
         )
 
+    def _derive_e25_config(
+        self,
+        context: ProductionContext,
+        experiment_id: str,
+    ) -> tuple[Path, tuple[ArtifactRef, ...]]:
+        """Select a diverse two-family blend from aligned shadow predictions only."""
+
+        repository = self._main_repository(context)
+        factor_id = self._best_branch(
+            repository,
+            context.run_id,
+            {"E15", "E16", "E19", "E20", "E21", "E28", "E30"},
+            require_supported=True,
+        )
+        tree_id = self._best_branch(
+            repository,
+            context.run_id,
+            {"E24", "E26", "E27", "E29"},
+            require_supported=True,
+        )
+        folds = materialize_shadow_folds(
+            self._split_paths("train")[0],
+            self._split_paths("train")[1],  # type: ignore[arg-type]
+            context.run_dir / "cache" / "shadow-folds",
+        )
+        factor_predictions = self._full_shadow_predictions(repository, factor_id)
+        tree_predictions = self._full_shadow_predictions(repository, tree_id)
+        if set(factor_predictions) != {"A", "B", "C"} or set(tree_predictions) != {
+            "A",
+            "B",
+            "C",
+        }:
+            raise RuntimeError("E25 requires complete A/B/C prediction evidence")
+        selection_folds: list[ShadowBlendFold] = []
+        for fold in folds:
+            features = load_feature_view(fold.valid_features)
+            labels = load_target_view(fold.valid_targets).labels
+            row_ids = np.asarray(
+                features.arrays.get("fx__source_row_id", features.arrays["row_id"]),
+                dtype=np.int64,
+            )
+            users = np.asarray(features.arrays["user_id"])
+            factor_scores = load_prediction_artifact(
+                factor_predictions[fold.name], features
+            )["score"]
+            tree_scores = load_prediction_artifact(tree_predictions[fold.name], features)[
+                "score"
+            ]
+            selection_folds.append(
+                ShadowBlendFold(
+                    name=fold.name,
+                    row_ids=row_ids,
+                    user_ids=users,
+                    labels=labels,
+                    left=PredictionVector(factor_id, row_ids, users, factor_scores),
+                    right=PredictionVector(tree_id, row_ids, users, tree_scores),
+                )
+            )
+        selection = select_shadow_blend(
+            selection_folds,
+            normalization="percentile",
+            grid_size=21,
+            regularization_strength=0.00025,
+        )
+        factor_config = self._experiment_config(repository, factor_id)
+        tree_config = self._experiment_config(repository, tree_id)
+        factor_plugin = str(factor_config.pop("plugin"))
+        tree_plugin = str(tree_config.pop("plugin"))
+        output = context.run_dir / "evidence" / experiment_id
+        selection_path = save_blend_selection(output / "shadow-blend-selection.json", selection)
+        provenance_path = atomic_write_json(
+            output / "shadow-blend-provenance.json",
+            {
+                "schema_version": "1.0",
+                "selection_split": "shadow_only",
+                "test_scored": False,
+                "factor_experiment_id": factor_id,
+                "tree_experiment_id": tree_id,
+                "selection_state_sha256": sha256_file(selection_path),
+                "prediction_sha256": {
+                    "factor": {
+                        name: sha256_file(path) for name, path in factor_predictions.items()
+                    },
+                    "tree": {
+                        name: sha256_file(path) for name, path in tree_predictions.items()
+                    },
+                },
+            },
+        )
+        derived_path = output / "derived-e25.yaml"
+        derived_path.parent.mkdir(parents=True, exist_ok=True)
+        derived_path.write_text(
+            yaml.safe_dump(
+                {
+                    "plugin": "rex.models.shadow_blend:ShadowBlendPlugin",
+                    "normalization": selection.normalization,
+                    "weights": list(selection.weights),
+                    "selection_split": selection.selection_split,
+                    "inputs": [factor_id, tree_id],
+                    "pair_config": factor_config,
+                    "tree_config": tree_config,
+                    "pair_plugin": factor_plugin,
+                    "tree_plugin": tree_plugin,
+                },
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        return derived_path, (
+            artifact_ref(selection_path, "shadow_blend_selection"),
+            artifact_ref(provenance_path, "shadow_blend_provenance"),
+            artifact_ref(derived_path, "derived_experiment_config"),
+        )
+
     @staticmethod
     def _best_branch(
         repository: ExperimentRepository,
         run_id: str,
         card_ids: set[str],
+        *,
+        require_supported: bool = False,
     ) -> str:
         placeholders = ",".join("?" for _ in card_ids)
         with repository.database.connect() as connection:
@@ -940,6 +1105,14 @@ class ProductionScientificHooks(ProductionHooks):
         ranked: list[tuple[float, str]] = []
         for row in rows:
             experiment_id = str(row["experiment_id"])
+            if require_supported:
+                with repository.database.connect() as connection:
+                    supported = connection.execute(
+                        "SELECT supported FROM shadow_evaluations WHERE experiment_id=?",
+                        (experiment_id,),
+                    ).fetchone()
+                if supported is None or not bool(supported["supported"]):
+                    continue
             if set(
                 ProductionScientificHooks._full_shadow_predictions(repository, experiment_id)
             ) != {
@@ -973,7 +1146,7 @@ class ProductionScientificHooks(ProductionHooks):
                 continue
             ranked.append((mean_primary, experiment_id))
         if not ranked:
-            raise RuntimeError("E10 requires supported pairwise and tree/history branch evidence")
+            raise RuntimeError("blend requires supported, complete full-shadow branch evidence")
         return max(ranked, key=lambda item: (item[0], item[1]))[1]
 
     @staticmethod
@@ -1699,6 +1872,70 @@ class ProductionScientificHooks(ProductionHooks):
         except KeyError as error:
             raise RuntimeError(f"unknown leakage-safe recipe: {binding_name}") from error
 
+    def _partition_feedback_vault(
+        self,
+        context: ProductionContext,
+        partition: _Partition,
+        recipe: FeatureRecipe,
+    ) -> Path | None:
+        """Materialize prior-feedback capabilities aligned to a training partition."""
+
+        if recipe.builder != "multifeedback_history":
+            return None
+        detail = self._manifest()["splits"]["train"]
+        source_value = detail.get("feedback_target_path")
+        source_hash = detail.get("feedback_target_sha256")
+        if not source_value or not source_hash:
+            raise RuntimeError("train feedback capability is missing from the data manifest")
+        source = Path(str(source_value)).resolve()
+        if not source.is_file() or sha256_file(source) != source_hash:
+            raise RuntimeError("train feedback capability is missing or corrupt")
+        features = load_feature_view(partition.train_features)
+        source_rows = np.asarray(
+            features.arrays.get("fx__source_row_id", features.arrays["row_id"]),
+            dtype=np.int64,
+        )
+        if source_rows.shape != (features.rows,) or np.any(source_rows < 0):
+            raise RuntimeError("partition source rows are invalid for feedback alignment")
+        required = ("is_click", "is_like", "is_follow", "is_hate", "long_view")
+        with np.load(source, allow_pickle=False) as saved:
+            if set(required) - set(saved.files):
+                raise RuntimeError("train feedback capability has an invalid schema")
+            source_length = len(saved[required[0]])
+            if source_rows.size and int(source_rows.max()) >= source_length:
+                raise RuntimeError("partition source rows exceed the feedback capability")
+            arrays = {
+                name: np.asarray(saved[name], dtype=np.float32)[source_rows]
+                for name in required
+            }
+        identity = sha256_bytes(
+            canonical_json_bytes(
+                {
+                    "schema_version": "1.0",
+                    "source_sha256": source_hash,
+                    "partition_feature_sha256": sha256_file(partition.train_features),
+                    "source_rows_sha256": sha256_bytes(source_rows.tobytes()),
+                }
+            )
+        )
+        root = context.run_dir / "cache" / "feedback" / partition.name
+        root.mkdir(parents=True, exist_ok=True)
+        output = root / f"train-feedback-{identity[:16]}.npz"
+        if output.is_file():
+            with np.load(output, allow_pickle=False) as saved:
+                if set(saved.files) == set(required) and all(
+                    np.asarray(saved[name]).shape == (features.rows,) for name in required
+                ):
+                    return output
+        temporary = output.with_suffix(output.suffix + ".tmp")
+        with temporary.open("wb") as handle:
+            np.savez_compressed(handle, **arrays)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, output)
+        output.chmod(0o600)
+        return output
+
     def _views(
         self,
         context: ProductionContext,
@@ -1722,12 +1959,14 @@ class ProductionScientificHooks(ProductionHooks):
                 (),
             )
         selected = control_recipe(recipe) if reference else recipe
+        auxiliary_target = self._partition_feedback_vault(context, partition, selected)
         artifact: RecipeArtifact = materialize_feature_recipe(
             selected,
             partition.train_features,
             partition.train_targets,
             partition.valid_features,
             context.run_dir / "cache" / "recipes" / partition.name,
+            auxiliary_target_path=auxiliary_target,
         )
         return _PreparedViews(
             artifact.train_features,
@@ -1840,7 +2079,7 @@ class ProductionScientificHooks(ProductionHooks):
 
     @staticmethod
     def _plugin(config_path: Path, *, card_id: str) -> str:
-        if card_id == "E10":
+        if card_id in {"E10", "E25"}:
             return "rex.models.shadow_blend:ShadowBlendPlugin"
         value = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         if not isinstance(value, dict) or not isinstance(value.get("plugin"), str):
@@ -1976,6 +2215,37 @@ class ProductionScientificHooks(ProductionHooks):
                 AttemptStatus.INVALID_ARTIFACT, "prediction returned no prediction artifact"
             )
         arrays = load_prediction_artifact(prediction_ref.path, views.apply_features)
+        predicted_scores = np.asarray(arrays["score"], dtype=np.float64)
+        member_scores: tuple[np.ndarray, ...] | None = None
+        member_manifest = predict_output / "prediction_evidence.json"
+        sidecar_artifacts: list[ArtifactRef] = []
+        if member_manifest.is_file():
+            try:
+                member_matrix, aggregate, _manifest = load_member_predictions(predict_output)
+            except (ValueError, OSError, KeyError) as error:
+                raise ProductionRungFailure(
+                    AttemptStatus.INVALID_ARTIFACT,
+                    f"member prediction evidence is invalid: {error}",
+                ) from error
+            if aggregate.shape != predicted_scores.shape or not np.array_equal(
+                aggregate, predicted_scores
+            ):
+                raise ProductionRungFailure(
+                    AttemptStatus.INVALID_ARTIFACT,
+                    "member predictions do not reconstruct the emitted prediction artifact",
+                )
+            member_scores = tuple(
+                np.asarray(values, dtype=np.float64) for values in member_matrix
+            )
+            sidecar_artifacts.extend(
+                (
+                    artifact_ref(member_manifest, "member_prediction_evidence"),
+                    artifact_ref(
+                        predict_output / "member_predictions.npz",
+                        "member_predictions",
+                    ),
+                )
+            )
         component_scores: tuple[np.ndarray, np.ndarray] | None = None
         component_path = predict_output / "component_predictions.npz"
         if component_path.is_file():
@@ -1991,15 +2261,18 @@ class ProductionScientificHooks(ProductionHooks):
                     AttemptStatus.INVALID_ARTIFACT, "blend component predictions are misaligned"
                 )
             component_scores = (pair, tree)
-        artifacts = tuple((*fit_result.artifacts, *predict_result.artifacts))
+        artifacts = tuple(
+            (*fit_result.artifacts, *predict_result.artifacts, *sidecar_artifacts)
+        )
         return _ModelExecution(
             predict_result,
             Path(bundle_ref.path),
             Path(prediction_ref.path),
-            np.asarray(arrays["score"], dtype=np.float64),
+            predicted_scores,
             artifacts,
             component_scores,
             fit_result,
+            member_scores,
         )
 
     def _run_and_record(
@@ -2274,6 +2547,7 @@ class ProductionScientificHooks(ProductionHooks):
             artifacts=(*execution.artifacts, artifact_ref(event, "control_cache_event")),
             component_scores=execution.component_scores,
             fit_result=execution.fit_result,
+            member_scores=execution.member_scores,
         )
 
     def _evaluate_pair(
@@ -2325,7 +2599,7 @@ class ProductionScientificHooks(ProductionHooks):
                 candidate_views.apply_features,
             )
             reference_artifacts = (incumbent_ref,)
-        elif card_id == "E10":
+        elif card_id in {"E10", "E25"}:
             candidate = execute_candidate()
             if candidate.component_scores is None:
                 raise ProductionRungFailure(
@@ -2376,6 +2650,25 @@ class ProductionScientificHooks(ProductionHooks):
             reference_views = self._views(
                 context, partition, card_id, request.binding.feature_recipe, reference=True
             )
+            candidate_alignment = load_feature_view(candidate_views.apply_features)
+            reference_alignment = load_feature_view(reference_views.apply_features)
+            candidate_rows = np.asarray(
+                candidate_alignment.arrays.get(
+                    "fx__source_row_id", candidate_alignment.arrays["row_id"]
+                ),
+                dtype=np.int64,
+            )
+            reference_rows = np.asarray(
+                reference_alignment.arrays.get(
+                    "fx__source_row_id", reference_alignment.arrays["row_id"]
+                ),
+                dtype=np.int64,
+            )
+            if not np.array_equal(candidate_rows, reference_rows):
+                raise ProductionRungFailure(
+                    AttemptStatus.CONTRACT,
+                    "candidate and control evaluation rows are not identically aligned",
+                )
 
             def execute_reference() -> _ModelExecution:
                 return self._execute_reference_with_cache(
@@ -2438,6 +2731,16 @@ class ProductionScientificHooks(ProductionHooks):
                 )
         evaluation = load_feature_view(candidate_views.apply_features)
         labels = load_target_view(partition.valid_targets).labels
+        candidate_member_metrics = [
+            self._score_arrays(
+                evaluation,
+                labels,
+                member,
+                split=split,
+                fold=evaluation_fold,
+            )
+            for member in (candidate.member_scores or ())
+        ]
         history = load_feature_view(candidate_views.train_features)
         diagnostics = compare_diagnostics(
             evaluation,
@@ -2448,6 +2751,22 @@ class ProductionScientificHooks(ProductionHooks):
             bootstrap_samples=self.settings.bootstrap_samples,
             seed=self.settings.model_seed,
         )
+        aligned_rows = np.asarray(
+            evaluation.arrays.get("fx__source_row_id", evaluation.arrays["row_id"]),
+            dtype=np.int64,
+        )
+        diagnostics["candidate_control_rows_identical"] = True
+        diagnostics["evaluation_source_row_ids_sha256"] = sha256_bytes(aligned_rows.tobytes())
+        diagnostics["candidate_member_metrics"] = [
+            value.model_dump(mode="json", by_alias=True)
+            for value in candidate_member_metrics
+        ]
+        if candidate_member_metrics:
+            diagnostics["candidate_member_primary_range"] = {
+                "minimum": min(value.primary for value in candidate_member_metrics),
+                "maximum": max(value.primary for value in candidate_member_metrics),
+                "aggregate": candidate_metrics.primary,
+            }
         evidence_dir = (
             context.run_dir
             / "evidence"
@@ -2461,6 +2780,10 @@ class ProductionScientificHooks(ProductionHooks):
             {
                 "candidate": candidate_metrics.model_dump(mode="json", by_alias=True),
                 "reference": reference_metrics.model_dump(mode="json", by_alias=True),
+                "candidate_members": [
+                    value.model_dump(mode="json", by_alias=True)
+                    for value in candidate_member_metrics
+                ],
                 "test_scored": False,
             },
         )
@@ -2616,7 +2939,7 @@ class ProductionScientificHooks(ProductionHooks):
         if (
             not self.settings.parallel_candidate_control
             or self.settings.max_parallel_workers < 2
-            or request.method_card.card_id == "E10"
+            or request.method_card.card_id in {"E10", "E25"}
         ):
             return 1
         if request.rung == "official_valid" and self._search_champion(request.context):
@@ -2803,6 +3126,13 @@ class ProductionScientificHooks(ProductionHooks):
                 name for name, value in segment_deltas.items() if value <= -0.002
             ),
             "folds": diagnostics_by_fold,
+            "pooled_primary_delta": pool_bootstrap_delta_evidence(
+                [
+                    value["primary_delta_ci"]
+                    for value in diagnostics_by_fold.values()
+                    if isinstance(value.get("primary_delta_ci"), dict)
+                ]
+            ),
         }
 
     # ---- bounded repair handoff ------------------------------------------------

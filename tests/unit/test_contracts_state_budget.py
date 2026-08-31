@@ -4,8 +4,12 @@ import pytest
 from pydantic import ValidationError
 
 from rex.contracts import Metrics, RunRequest
-from rex.control.budget import metric_units, update_metric_trackers
-from rex.control.state_machine import EXPERIMENT_TRANSITIONS, IllegalTransition, require_experiment_transition
+from rex.control.budget import metric_units, scientific_plateau_reached, update_metric_trackers
+from rex.control.state_machine import (
+    EXPERIMENT_TRANSITIONS,
+    IllegalTransition,
+    require_experiment_transition,
+)
 from rex.contracts import ExperimentState
 
 
@@ -85,3 +89,12 @@ def test_epsilon_patience_converges_on_third_non_improvement() -> None:
         )
         best, streak = update.best_primary_units, update.non_improvement_streak
     assert update.converged is True
+
+
+def test_plateau_waits_for_three_independent_valid_families() -> None:
+    assert not scientific_plateau_reached(
+        stop_reason="epsilon_plateau", valid_family_count=2, minimum_valid_families=3
+    )
+    assert scientific_plateau_reached(
+        stop_reason="epsilon_plateau", valid_family_count=3, minimum_valid_families=3
+    )

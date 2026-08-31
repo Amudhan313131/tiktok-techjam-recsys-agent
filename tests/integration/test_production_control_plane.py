@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from rex.agents.provider import ProviderResponse
+from rex.agents.search_policy import METHOD_CARD_VERSION
 from rex.contracts import ArtifactRef, AttemptStatus, ExperimentProposal, Metrics
 from rex.control.production_supervisor import (
     BaselineGateResult,
@@ -35,9 +36,7 @@ HASH = "0" * 64
 
 
 def _git(root: Path, *args: str) -> str:
-    result = subprocess.run(
-        ["git", *args], cwd=root, capture_output=True, text=True, check=False
-    )
+    result = subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, check=False)
     assert result.returncode == 0, result.stderr
     return result.stdout.strip()
 
@@ -117,8 +116,13 @@ class ScriptedHooks:
         return BaselineGateResult(True, _metric(0.5, split="valid", fold=None), (ref,))
 
     def prepare_candidate(self, context, card, binding, proposal_context, parent_commit):
-        assert proposal_context["method_card"]["citation_id"] == "method-card:1.0:E01"
-        assert proposal_context["allowed_files"] == ["e01.yaml", "src/rex/models/experimental/pair_rank_fm.py"]
+        assert proposal_context["method_card"]["citation_id"] == (
+            f"method-card:{METHOD_CARD_VERSION}:E01"
+        )
+        assert proposal_context["allowed_files"] == [
+            "e01.yaml",
+            "src/rex/models/experimental/pair_rank_fm.py",
+        ]
         assert "src/rex/models/rank_fm.py" in proposal_context["read_only_context_files"]
         assert "src/rex/data/views.py" in proposal_context["read_only_context_files"]
         assert proposal_context["method_sources"]
@@ -398,7 +402,9 @@ def _config(tmp_path: Path) -> ProductionRunConfig:
     return ProductionRunConfig.load(config)
 
 
-def test_production_control_plane_promotes_validation_best_without_submission(tmp_path: Path) -> None:
+def test_production_control_plane_promotes_validation_best_without_submission(
+    tmp_path: Path,
+) -> None:
     config = _config(tmp_path)
     result = ProductionAutopilot(config, DiagnosisProvider(), ScriptedHooks()).run(
         run_id="production-happy"
@@ -424,10 +430,7 @@ def test_full_gate_rejection_is_diagnosed_before_terminal_rejection(tmp_path: Pa
     assert result["search_champion_experiment_id"] == "baseline"
     assert result["official_evaluation_count"] == 0
     assert result["experiments"][0]["state"] == "REJECTED"
-    diagnosis = (
-        config.runs_dir
-        / "production-full-rejected/evidence/production-e01/diagnosis.json"
-    )
+    diagnosis = config.runs_dir / "production-full-rejected/evidence/production-e01/diagnosis.json"
     assert diagnosis.is_file()
 
 
@@ -440,7 +443,7 @@ def test_global_repair_limit_stops_third_failure_and_preserves_baseline(tmp_path
     assert result["state"] == "COMPLETE"
     assert result["search_champion_experiment_id"] == "baseline"
     assert result["experiments"][0]["state"] == "FAILED_FINAL"
-    assert result["non_improvement_streak"] == 1
+    assert result["non_improvement_streak"] == 0
     assert [item["repair_number"] for item in result["repairs"]] == [1, 2]
     assert [item.plan.repair_number for item in hooks.repairs] == [1, 2]
 
@@ -563,27 +566,33 @@ def test_resume_rebuilds_same_durable_proposal_instead_of_consuming_card(tmp_pat
         evidence_artifact_ids=[],
     )
     repository.transition_run(run_id, RunState.BASELINE_VERIFYING, RunState.SEARCHING)
-    proposal = ScriptedHooks().prepare_candidate(
-        ProductionContext(run_id, run_dir, config.project_root, root_commit, deadline_epoch_ms(300)),
-        next(
-            card
-            for card in ProductionAutopilot(config, DiagnosisProvider()).search_policy.cards
-            if card.card_id == "E01"
-        ),
-        config.method_cards["E01"],
-        {
-            "method_card": {"citation_id": "method-card:1.0:E01"},
-            "allowed_files": ["e01.yaml", "src/rex/models/experimental/pair_rank_fm.py"],
-            "read_only_context_files": [
-                "src/rex/models/rank_fm.py",
-                "src/rex/data/views.py",
-            ],
-            "method_sources": [{"source_id": "ranknet"}],
-            "falsification_criteria": {"cheap_min_primary_delta": 0.001},
-            "resource_estimate": {"maximum_candidate_seconds": 150},
-        },
-        root_commit,
-    ).proposal.model_copy(update={"parent_id": None})
+    proposal = (
+        ScriptedHooks()
+        .prepare_candidate(
+            ProductionContext(
+                run_id, run_dir, config.project_root, root_commit, deadline_epoch_ms(300)
+            ),
+            next(
+                card
+                for card in ProductionAutopilot(config, DiagnosisProvider()).search_policy.cards
+                if card.card_id == "E01"
+            ),
+            config.method_cards["E01"],
+            {
+                "method_card": {"citation_id": f"method-card:{METHOD_CARD_VERSION}:E01"},
+                "allowed_files": ["e01.yaml", "src/rex/models/experimental/pair_rank_fm.py"],
+                "read_only_context_files": [
+                    "src/rex/models/rank_fm.py",
+                    "src/rex/data/views.py",
+                ],
+                "method_sources": [{"source_id": "ranknet"}],
+                "falsification_criteria": {"cheap_min_primary_delta": 0.001},
+                "resource_estimate": {"maximum_candidate_seconds": 150},
+            },
+            root_commit,
+        )
+        .proposal.model_copy(update={"parent_id": None})
+    )
     repository.create_experiment(
         run_id,
         proposal,
@@ -671,9 +680,7 @@ def test_method_dependencies_use_supported_full_evidence_not_only_global_promoti
             idempotency_key=f"{experiment_id}:rejected",
         )
 
-    card = ProductionAutopilot(config, DiagnosisProvider())._next_card(
-        repository, "dependencies"
-    )
+    card = ProductionAutopilot(config, DiagnosisProvider())._next_card(repository, "dependencies")
 
     assert card is not None
     assert card.card_id == "E10"

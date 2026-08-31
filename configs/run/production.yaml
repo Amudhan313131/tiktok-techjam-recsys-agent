@@ -12,6 +12,15 @@ scientific_execution:
   parallel_candidate_control: true
   max_memory_mb: 1536
 
+validation_policy:
+  discovery_split: shadow
+  phases: [DISCOVERY, FINALIST_LOCKED, OFFICIAL_EVALUATED]
+  official_evaluation_tokens: 1
+  minimum_valid_families_before_plateau: 6
+  cheap_sample: deterministic_stratified_complete_users
+  full_pooled_probability_positive: 0.90
+  finalization_reserve_seconds: 3600
+
 project_root: .
 runs_dir: runs
 budget_config: configs/budget.yaml
@@ -27,6 +36,51 @@ cleanup_worktrees: true
 # selectable in this phase. E10 trains its two-branch blend with weights derived
 # only from shadow evidence before any official-validation comparison.
 method_cards:
+  E16:
+    config: configs/experiments/e16_context_mean.yaml
+    feature_recipe: control
+  E17:
+    config: configs/experiments/e17_user_tab_cross.yaml
+    feature_recipe: user_tab_cross
+  E18:
+    config: configs/experiments/e18_video_tab_cross.yaml
+    feature_recipe: video_tab_cross
+  E19:
+    config: configs/experiments/e19_item_metadata.yaml
+    feature_recipe: control
+  E20:
+    config: configs/experiments/e20_user_metadata.yaml
+    feature_recipe: control
+  E21:
+    config: configs/experiments/e21_field_weighted_fm.yaml
+    feature_recipe: control
+  E22:
+    config: configs/experiments/e22_candidate_recency.yaml
+    feature_recipe: point_in_time_candidate_recency
+  E23:
+    config: configs/experiments/e23_multifeedback_history.yaml
+    feature_recipe: multifeedback_history
+  E24:
+    config: configs/experiments/e24_regularized_tree.yaml
+    feature_recipe: control
+  E25:
+    config: configs/experiments/e25_shadow_blend.yaml
+    feature_recipe: control
+  E26:
+    config: configs/experiments/e26_pointwise_tree_item_metadata.yaml
+    feature_recipe: control
+  E27:
+    config: configs/experiments/e27_pointwise_tree_full_metadata.yaml
+    feature_recipe: control
+  E28:
+    config: configs/experiments/e28_recency_bucket_fm.yaml
+    feature_recipe: candidate_recency_buckets
+  E29:
+    config: configs/experiments/e29_pointwise_tree_user_metadata.yaml
+    feature_recipe: control
+  E30:
+    config: configs/experiments/e30_item_metadata_k32.yaml
+    feature_recipe: control
   E15:
     config: configs/experiments/e15_context_ensemble.yaml
     feature_recipe: control

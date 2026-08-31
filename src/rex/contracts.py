@@ -26,6 +26,19 @@ class RunState(StrEnum):
     FATAL = "FATAL"
 
 
+class ValidationPhase(StrEnum):
+    """One-way validation lifecycle for production model selection.
+
+    Shadow data is the only source of discovery feedback.  Exactly one finalist
+    can then consume the official-validation capability, after which the phase
+    is terminal for the run.
+    """
+
+    DISCOVERY = "DISCOVERY"
+    FINALIST_LOCKED = "FINALIST_LOCKED"
+    OFFICIAL_EVALUATED = "OFFICIAL_EVALUATED"
+
+
 class ExperimentState(StrEnum):
     PROPOSED = "PROPOSED"
     WORKTREE_READY = "WORKTREE_READY"

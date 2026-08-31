@@ -1,9 +1,12 @@
 schema_version: "1.0"
 max_hypotheses: 50
-max_official_evaluations: 50
+max_official_evaluations: 1
 wall_clock_seconds: 21600
-finalization_reserve_seconds: 1200
+finalization_reserve_seconds: 3600
 convergence_epsilon: 0.002
 convergence_patience: 3
+min_valid_families_before_plateau: 6
+cheap_min_probability_positive: 0.70
+full_min_pooled_probability_positive: 0.90
 max_repairs_per_experiment: 2
 default_attempt_timeout_seconds: 600

@@ -11,6 +11,38 @@
 
 moves:
   feature:
+    - id: static_item_metadata
+      description: >
+        Add only the predeclared inference-safe item block (tag, video/upload/music
+        type, aspect and upload-age buckets), with train-fitted UNK/RARE handling.
+        Never use the supplied month-level statistic table without cutoff proof.
+      cost: low
+
+    - id: static_user_metadata
+      description: >
+        Add coarse user activity, creator/streamer, relationship-count ranges and
+        registration-age ranges as a separate matched experiment.
+      cost: low
+
+    - id: context_crosses
+      description: >
+        Test user-by-tab and video-by-tab one at a time with train-fitted rare
+        backoff. Avoid user-by-video memorization.
+      cost: low
+
+    - id: candidate_recency
+      description: >
+        Add point-in-time user-author/user-video support, prior outcome and elapsed
+        time using only rows strictly before the feature timestamp and a state
+        frozen at the apply cutoff.
+      cost: medium
+
+    - id: historical_multifeedback
+      description: >
+        Add prior-only click/like/follow/hate/long-view rate and support summaries.
+        Current-row and apply-split outcomes are always forbidden.
+      cost: medium
+
     - id: feature_crossing
       description: >
         Combine two features (e.g. user_activity_level x video_category) so the
@@ -32,6 +64,25 @@ moves:
       cost: low
 
   model:
+    - id: field_weighted_fm
+      description: >
+        Learn one scalar per field pair on the strongest supported field set while
+        keeping the deterministic FM optimizer and matched same-field FM control.
+      cost: medium
+
+    - id: regularized_tree_ranker
+      description: >
+        Establish a shallow, strongly regularized no-stat LightGBM ranker before
+        adding only feature blocks already supported by temporal evidence.
+      cost: medium
+
+    - id: temporal_oof_blend
+      description: >
+        Fit one nonnegative blend weight on aligned temporal out-of-fold predictions
+        from two supported, behaviorally diverse families. Never fit on official
+        validation predictions.
+      cost: low
+
     - id: deepfm_crossing_layer
       description: >
         Add an automatic feature-crossing layer (FM/DeepFM-style) instead of
@@ -81,6 +132,18 @@ moves:
 # Diagnosis rules: observed symptom -> recommended move(s) to try next.
 # Anchored against the real reference numbers so evidence is specific, not vague.
 diagnosis_rules:
+  - symptom: "context FM remains highly correlated with the supplied baseline"
+    suggest: [static_item_metadata, context_crosses, candidate_recency, field_weighted_fm]
+
+  - symptom: "candidate improves warm/repeat users but regresses cold users"
+    suggest: [static_item_metadata, static_user_metadata]
+
+  - symptom: "two supported branches have complementary temporal out-of-fold errors"
+    suggest: [temporal_oof_blend]
+
+  - symptom: "tree branch overfits or loses on later temporal folds"
+    suggest: [regularized_tree_ranker]
+
   - symptom: "model predicts 'not long_view' for nearly all examples; accuracy high but recall near zero"
     suggest: [class_weighting_longview]
 
@@ -111,3 +174,20 @@ diagnosis_rules:
   - symptom: "validation primary score plateaued for multiple iterations across several move categories"
     suggest: [hyperparameter_tuning]
     note: "last resort — only after feature/model moves are exhausted"
+
+# Every schedulable move is materialized as a versioned method card. These
+# fields are required even when the runtime implementation is not yet bound.
+method_card_contract:
+  required_fields:
+    - family
+    - expected_gain
+    - estimated_cost_seconds
+    - memory_mb
+    - dependencies
+    - target_segments
+    - parent
+    - falsifier
+    - diversity_target
+  validation_flow: [DISCOVERY, FINALIST_LOCKED, OFFICIAL_EVALUATED]
+  minimum_valid_families_before_plateau: 6
+  official_evaluation_tokens: 1
