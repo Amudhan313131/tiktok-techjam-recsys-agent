@@ -112,7 +112,11 @@ their patch authority is limited to the card-specific experimental allowlist.
 Each effective config is copied into durable run evidence and checked by hash so
 resume does not depend on a worktree that may have been cleaned.
 
-Method cards E01–E08 and E10 are wired to executable adapters. E04, E05, and
+Method cards E01–E08, E10, and E15 are wired to executable adapters. E15 is
+evaluated first and compares a five-initialization context-aware FM ensemble
+against a matched one-initialization control. It consumes only sanitized
+hour-of-day and randomized-exposure fields and saves every member in the
+immutable bundle. E04, E05, and
 later history/blend cards remain prerequisite-gated, so unsupported branches do
 not consume experiments. E09 and neural E11–E13 are not selectable in this
 phase. E14 confirmation remains deferred.

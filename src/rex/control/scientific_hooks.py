@@ -52,6 +52,7 @@ from rex.control.control_cache import (
     stable_environment_sha256,
 )
 from rex.control.production_supervisor import (
+    CARD_READONLY_CONTEXT_PATHS,
     BaselineGateResult,
     CandidatePreparation,
     ComparisonObservation,
@@ -187,6 +188,7 @@ RECIPE_BY_NAME: dict[str, FeatureRecipe] = {
 
 
 REFERENCE_CONFIG_BY_CARD = {
+    "E15": "configs/experiments/e15_context_control.yaml",
     "E01": "configs/experiments/e01_pointwise_control.yaml",
     "E02": "configs/experiments/e02_tree_ranker_control.yaml",
     "E03": "configs/experiments/e03_candidate_history.yaml",
@@ -1181,6 +1183,7 @@ class ProductionScientificHooks(ProductionHooks):
             },
         }
         allowed_file_snapshots = self._allowed_file_snapshots(proposal_context)
+        read_only_context_snapshots = self._read_only_context_snapshots(proposal_context)
         coordinator = PatchTransactionCoordinator(
             repository=repository,
             proposal_service=ProposalService(self.provider),
@@ -1203,6 +1206,19 @@ class ProductionScientificHooks(ProductionHooks):
                     "method_card": proposal_context["method_card"],
                     "bound_config": relative_config,
                     "allowed_file_snapshots": allowed_file_snapshots,
+                    "read_only_context_snapshots": read_only_context_snapshots,
+                    "plugin_interface_contract": {
+                        "fit": (
+                            "fit(train_features: FeatureView, train_targets: TargetView, "
+                            "config: dict, seed: int, output_dir: Path) -> Path"
+                        ),
+                        "predict": (
+                            "predict(model_artifact: Path, features: FeatureView, "
+                            "config: dict, output_dir: Path) -> numpy.ndarray"
+                        ),
+                        "feature_recipe_precomputed": binding.feature_recipe,
+                        "pandas_dataframe_interface": False,
+                    },
                     "require_executed_change": True,
                     "allowed_model_namespace": "src/rex/models/experimental/**",
                     "test_scored": False,
@@ -1421,21 +1437,39 @@ class ProductionScientificHooks(ProductionHooks):
     ) -> dict[str, str]:
         """Give read-only source text to CLI/API coders without granting filesystem authority."""
 
+        return self._file_snapshots(proposal_context.get("allowed_files", []))
+
+    def _read_only_context_snapshots(
+        self,
+        proposal_context: dict[str, object],
+    ) -> dict[str, str]:
+        """Expose interface context while keeping those paths outside the patch allowlist."""
+
+        return self._file_snapshots(proposal_context.get("read_only_context_files", []))
+
+    def _file_snapshots(
+        self,
+        paths: object,
+        *,
+        project_root: Path | None = None,
+    ) -> dict[str, str]:
+        root = (project_root or self.config.project_root).resolve()
+
         snapshots: dict[str, str] = {}
-        for raw in proposal_context.get("allowed_files", []):
+        for raw in paths if isinstance(paths, (list, tuple)) else ():
             relative = Path(str(raw))
             if relative.is_absolute() or ".." in relative.parts:
-                raise RuntimeError(f"live coding allowlist path is not repository-relative: {raw}")
-            path = (self.config.project_root / relative).resolve()
+                raise RuntimeError(f"live coding context path is not repository-relative: {raw}")
+            path = (root / relative).resolve()
             try:
-                path.relative_to(self.config.project_root)
+                path.relative_to(root)
             except ValueError as error:
-                raise RuntimeError(f"live coding allowlist escaped the project: {raw}") from error
+                raise RuntimeError(f"live coding context escaped the project: {raw}") from error
             if not path.is_file():
-                raise RuntimeError(f"live coding allowlist file is missing: {raw}")
+                raise RuntimeError(f"live coding context file is missing: {raw}")
             if path.stat().st_size > 200_000:
                 raise RuntimeError(
-                    f"live coding allowlist file is too large for bounded context: {raw}"
+                    f"live coding context file is too large for bounded context: {raw}"
                 )
             snapshots[relative.as_posix()] = path.read_text(encoding="utf-8")
         return snapshots
@@ -3297,6 +3331,15 @@ class ProductionScientificHooks(ProductionHooks):
             ["git", "status", "--porcelain", "--untracked-files=normal"], workspace.root
         ):
             raise RuntimeError("live repair requires a clean candidate worktree")
+        card_id = str(request.experiment.get("method_card_id") or "")
+        allowed_file_snapshots = self._file_snapshots(
+            proposal.files_to_change,
+            project_root=workspace.root,
+        )
+        read_only_context_snapshots = self._file_snapshots(
+            list(CARD_READONLY_CONTEXT_PATHS.get(card_id, ())),
+            project_root=workspace.root,
+        )
         decision = CodingService(self.provider).create_patch(
             proposal,
             {
@@ -3305,6 +3348,23 @@ class ProductionScientificHooks(ProductionHooks):
                 "failure_status": failure_status,
                 "phase": request.phase,
                 "allowed_files": proposal.files_to_change,
+                "allowed_file_snapshots": allowed_file_snapshots,
+                "read_only_context_snapshots": read_only_context_snapshots,
+                "plugin_interface_contract": {
+                    "fit": (
+                        "fit(train_features: FeatureView, train_targets: TargetView, "
+                        "config: dict, seed: int, output_dir: Path) -> Path"
+                    ),
+                    "predict": (
+                        "predict(model_artifact: Path, features: FeatureView, "
+                        "config: dict, output_dir: Path) -> numpy.ndarray"
+                    ),
+                    "pandas_dataframe_interface": False,
+                },
+                "previous_failure": {
+                    "status": failure_status,
+                    "phase": request.phase,
+                },
                 "instruction": "Fix only the typed failure; preserve the scientific primary change.",
                 "test_scored": False,
             },

@@ -41,6 +41,26 @@ from rex.store.repository import ExperimentRepository
 HASH = "0" * 64
 
 
+def test_tree_coder_receives_real_plugin_and_feature_interfaces(tmp_path: Path) -> None:
+    del tmp_path
+    root = Path(__file__).resolve().parents[2]
+    config = ProductionRunConfig.load(root / "configs/run/production.yaml")
+    hooks = ProductionScientificHooks(config, ProductionFixedProvider())
+    snapshots = hooks._read_only_context_snapshots(
+        {
+            "read_only_context_files": [
+                "src/rex/models/tree_ranker.py",
+                "src/rex/features/recipes.py",
+                "src/rex/data/views.py",
+            ]
+        }
+    )
+
+    assert "train_features: FeatureView" in snapshots["src/rex/models/tree_ranker.py"]
+    assert "materialize_feature_recipe" in snapshots["src/rex/features/recipes.py"]
+    assert "class FeatureView" in snapshots["src/rex/data/views.py"]
+
+
 def _write_view(path: Path, dates: list[int]) -> tuple[Path, Path]:
     rows: list[tuple[int, str, str]] = []
     for date in dates:

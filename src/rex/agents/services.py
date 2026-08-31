@@ -33,7 +33,11 @@ CODER_SYSTEM = """You are a constrained code-evolution component. Return one uni
 that implements the accepted proposal. Modify only its declared files. Do not touch the
 evaluator, data manifests, budget logic, event store, submission validator, or coordinator.
 Treat allowed_file_snapshots as the byte-exact parent contents and do not explore the local
-filesystem. Blank lines matter: compute correct hunk positions and line counts, preserve the
+filesystem. Read read_only_context_snapshots to learn the actual plugin interfaces, feature
+schemas, and already-materialized mechanisms, but never include those paths in the diff. A
+bound feature recipe is prepared by the trusted coordinator; consume its FeatureView fields
+instead of reimplementing preprocessing with pandas or inventing columns. Blank lines matter:
+compute correct hunk positions and line counts, preserve the
 terminal newline, and include at least three unchanged context lines before and after each
 change when they exist. If patch_repair is present, correct its recorded validation stage and
 error, and do not repeat the rejected patch. The change must affect executed behavior rather than

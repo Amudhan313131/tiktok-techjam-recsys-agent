@@ -59,6 +59,6 @@ def test_repair_is_bounded_to_two_attempts() -> None:
 
 def test_search_policy_enforces_evidence_gate() -> None:
     policy = SearchPolicy()
-    attempted = {"E00", "E01", "E02", "E03"}
+    attempted = {"E00", "E01", "E02", "E03", "E15"}
     assert policy.next_card(attempted, set()) is None
     assert policy.next_card(attempted, {"E01_supported"}).card_id == "E04"

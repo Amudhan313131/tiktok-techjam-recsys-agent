@@ -31,10 +31,13 @@ select one eligible method card
   -> continue with the next eligible method card
 ```
 
-The fixed queue can run without an LLM. The eligible scientific cards cover
-pairwise FM, grouped LightGBM LambdaRank and its no-stat control, candidate
-history, delta-nDCG weighting, BCE stabilization, repeat exposure,
-user-author/duration affinity, recency, and a shadow-selected two-branch blend.
+The fixed queue can run without an LLM. Its first candidate is a matched
+one-member-versus-five-member context-aware FM comparison using the
+inference-safe hour and randomized-exposure fields already present in every
+official log row. The remaining cards cover pairwise FM, grouped LightGBM
+LambdaRank and its no-stat control, candidate history, delta-nDCG weighting,
+BCE stabilization, repeat exposure, user-author/duration affinity, recency,
+and a shadow-selected two-branch blend.
 Each comparison is bound to a control so the intended scientific change is
 isolated.
 
@@ -88,6 +91,18 @@ The audit bundle is under
 `runs/production-20260830-165853-15087c/`. No confirmation sweep, hidden-test
 prediction, submission construction, or six-hour dress rehearsal was run.
 
+## Context-ensemble preflight evidence
+
+Before the next clean Docker rehearsal, the new E15 implementation was checked
+on the authorized validation split with the frozen organizer evaluator. The
+five-member mean ensemble reached GAUC `0.6702043`, nDCG@5 `0.5371096`, and
+primary `0.6036570`. That is `+0.0016198` over the strongest reproduced baseline
+seed (`0.6020372`) and `+0.0020570` over the supplied `0.6016` reference. A
+500-sample user bootstrap estimated a 99.6% probability of a positive delta
+over the strongest reproduced seed. These numbers are preflight evidence, not
+a substitute for the clean autonomous Docker run; the rehearsal must reproduce
+and record the result independently.
+
 ## Development setup
 
 Use a project-local environment. The `tree` extra installs the pinned
@@ -114,7 +129,10 @@ target vault:
 ```
 
 The bootstrap verifies the frozen raw file identities, split dates, row
-alignment, forbidden inference columns, and the absence of a test target.
+alignment, forbidden inference columns, and the absence of a test target. It
+also carries only two additional current-row context values into the sanitized
+views: hour-of-day and randomized-exposure state. Both exist for train,
+validation, and hidden-test feature rows; neither is an outcome label.
 Production startup repeats the baseline evidence gate before search begins.
 
 ## Production prerequisites

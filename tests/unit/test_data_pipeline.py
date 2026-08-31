@@ -38,6 +38,8 @@ LOG_HEADER = [
     "long_view",
     "duration_ms",
     "tab",
+    "hourmin",
+    "is_rand",
 ]
 
 
@@ -76,12 +78,15 @@ def _tiny_raw(root: Path, *, test_label: int = 0) -> dict[str, object]:
     _write_csv(
         earlier,
         LOG_HEADER,
-        [["u1", "v1", 1, 1, 10, 1], ["u2", "v2", 2, 0, 20, 1]],
+        [["u1", "v1", 1, 1, 10, 1, 900, 0], ["u2", "v2", 2, 0, 20, 1, 2200, 1]],
     )
     _write_csv(
         later,
         LOG_HEADER,
-        [["u1", "v2", 3, 1, 20, 1], ["u1", "v1", 4, test_label, 10, 1]],
+        [
+            ["u1", "v2", 3, 1, 20, 1, 1300, 0],
+            ["u1", "v1", 4, test_label, 10, 1, 2300, 1],
+        ],
     )
     return {
         "label": "long_view",
@@ -149,6 +154,9 @@ def test_test_label_poison_does_not_change_feature_view(tmp_path: Path) -> None:
     assert left["test"]["target_path"] is None
     assert right["test"]["target_path"] is None
     assert_no_test_target_artifact(tmp_path / "left")
+    train = load_feature_view(tmp_path / "left/train_features.npz")
+    assert train.arrays["fx__hour"].tolist() == [9, 22]
+    assert train.arrays["fx__is_rand"].tolist() == [0, 1]
 
 
 def test_firewall_rejects_test_fit_request(feature_target_paths, tmp_path: Path) -> None:

@@ -40,6 +40,8 @@ class RawFeatureRow:
     author_id: str
     tab: str
     duration_ms: float
+    hour: int
+    is_random: int
 
 
 @dataclass
@@ -50,6 +52,8 @@ class _SplitBuffer:
     author_ids: list[str] = field(default_factory=list)
     tabs: list[str] = field(default_factory=list)
     durations_ms: list[float] = field(default_factory=list)
+    hours: list[int] = field(default_factory=list)
+    random_exposures: list[int] = field(default_factory=list)
 
     def append(self, row: RawFeatureRow) -> None:
         self.dates.append(row.date)
@@ -58,6 +62,8 @@ class _SplitBuffer:
         self.author_ids.append(row.author_id)
         self.tabs.append(row.tab)
         self.durations_ms.append(row.duration_ms)
+        self.hours.append(row.hour)
+        self.random_exposures.append(row.is_random)
 
     def arrays(self) -> dict[str, np.ndarray]:
         return {
@@ -68,6 +74,8 @@ class _SplitBuffer:
             "author_id": _string_array(self.author_ids),
             "tab": _string_array(self.tabs),
             "duration_ms": np.asarray(self.durations_ms, dtype=np.float32),
+            "fx__hour": np.asarray(self.hours, dtype=np.int8),
+            "fx__is_rand": np.asarray(self.random_exposures, dtype=np.int8),
         }
 
 
@@ -138,6 +146,8 @@ def read_feature_rows(data_dir: str | Path) -> Iterator[RawFeatureRow]:
                     author_id=authors.get(video_id, "UNK"),
                     tab=str(raw["tab"]),
                     duration_ms=float(raw["duration_ms"]),
+                    hour=int(float(raw.get("hourmin") or 0)) // 100,
+                    is_random=int(float(raw.get("is_rand") or 0)),
                 )
 
 

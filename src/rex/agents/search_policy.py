@@ -9,6 +9,16 @@ from typing import Any
 METHOD_CARD_VERSION = "1.0"
 
 METHOD_SOURCES: dict[str, dict[str, str]] = {
+    "kuairand": {
+        "title": "KuaiRand: An Unbiased Sequential Recommendation Dataset",
+        "doi": "10.1145/3511808.3557624",
+        "url": "https://doi.org/10.1145/3511808.3557624",
+    },
+    "bagging": {
+        "title": "Bagging Predictors",
+        "doi": "10.1007/BF00058655",
+        "url": "https://doi.org/10.1007/BF00058655",
+    },
     "ranknet": {
         "title": "Learning to Rank using Gradient Descent",
         "url": "https://www.microsoft.com/en-us/research/publication/learning-to-rank-using-gradient-descent/",
@@ -38,6 +48,21 @@ METHOD_SOURCES: dict[str, dict[str, str]] = {
 }
 
 METHOD_CARD_REFERENCES: dict[str, dict[str, Any]] = {
+    "E15": {
+        "primary_change": (
+            "average five context-aware FM initializations instead of relying on one "
+            "stochastic model"
+        ),
+        "falsifier": (
+            "the five-member mean ensemble fails to beat its matched one-member control"
+        ),
+        "implementation_hint": (
+            "In the bound YAML only, change aggregation from median to mean. Preserve "
+            "ensemble_members=5, epochs=7, the plugin, and every other setting. The plugin "
+            "already consumes sanitized fx__hour and fx__is_rand fields; do not reimplement it."
+        ),
+        "citation_ids": ["kuairand", "bagging", "factorization_machines"],
+    },
     "E01": {
         "primary_change": "replace pointwise BCE with same-user fixed-K PairLogit",
         "falsifier": "cheap primary delta is below 0.001",
@@ -101,6 +126,10 @@ class ExperimentCard:
 
 DEFAULT_QUEUE = (
     ExperimentCard("E00", "reproduce five-seed official FM and set the incumbent", stage="baseline"),
+    ExperimentCard(
+        "E15",
+        "mean ensemble of context-aware FMs using inference-safe hour and exposure policy",
+    ),
     ExperimentCard("E01", "replace pointwise BCE with same-user fixed-K PairLogit"),
     ExperimentCard("E02", "tree ranker with point-in-time item/author rates and no-stat control"),
     ExperimentCard("E03", "simple candidate/history affinity summaries"),
@@ -124,6 +153,7 @@ DEFAULT_QUEUE = (
 
 
 SUPPORTED_FLAGS = {
+    "E15": {"context_ensemble_supported", "finalist_ready"},
     "E01": {"E01_supported"},
     "E02": {"tree_supported"},
     "E03": {"history_supported"},

@@ -27,6 +27,9 @@ cleanup_worktrees: true
 # selectable in this phase. E10 trains its two-branch blend with weights derived
 # only from shadow evidence before any official-validation comparison.
 method_cards:
+  E15:
+    config: configs/experiments/e15_context_ensemble.yaml
+    feature_recipe: control
   E01:
     config: configs/experiments/e01_pair_rank_fm.yaml
     feature_recipe: control

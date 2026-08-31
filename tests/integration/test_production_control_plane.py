@@ -119,6 +119,8 @@ class ScriptedHooks:
     def prepare_candidate(self, context, card, binding, proposal_context, parent_commit):
         assert proposal_context["method_card"]["citation_id"] == "method-card:1.0:E01"
         assert proposal_context["allowed_files"] == ["e01.yaml", "src/rex/models/experimental/pair_rank_fm.py"]
+        assert "src/rex/models/rank_fm.py" in proposal_context["read_only_context_files"]
+        assert "src/rex/data/views.py" in proposal_context["read_only_context_files"]
         assert proposal_context["method_sources"]
         assert proposal_context["falsification_criteria"]["cheap_min_primary_delta"] == 0.001
         assert proposal_context["resource_estimate"]["maximum_candidate_seconds"] == 150
@@ -563,11 +565,19 @@ def test_resume_rebuilds_same_durable_proposal_instead_of_consuming_card(tmp_pat
     repository.transition_run(run_id, RunState.BASELINE_VERIFYING, RunState.SEARCHING)
     proposal = ScriptedHooks().prepare_candidate(
         ProductionContext(run_id, run_dir, config.project_root, root_commit, deadline_epoch_ms(300)),
-        ProductionAutopilot(config, DiagnosisProvider()).search_policy.cards[1],
+        next(
+            card
+            for card in ProductionAutopilot(config, DiagnosisProvider()).search_policy.cards
+            if card.card_id == "E01"
+        ),
         config.method_cards["E01"],
         {
             "method_card": {"citation_id": "method-card:1.0:E01"},
             "allowed_files": ["e01.yaml", "src/rex/models/experimental/pair_rank_fm.py"],
+            "read_only_context_files": [
+                "src/rex/models/rank_fm.py",
+                "src/rex/data/views.py",
+            ],
             "method_sources": [{"source_id": "ranknet"}],
             "falsification_criteria": {"cheap_min_primary_delta": 0.001},
             "resource_estimate": {"maximum_candidate_seconds": 150},
@@ -671,7 +681,12 @@ def test_method_dependencies_use_supported_full_evidence_not_only_global_promoti
 
 def test_fixed_provider_uses_truthful_method_card_operators() -> None:
     provider = ProductionFixedProvider()
-    expected = {"E01": "LOSS", "E03": "FEATURE", "E10": "ENSEMBLE"}
+    expected = {
+        "E01": "LOSS",
+        "E03": "FEATURE",
+        "E10": "ENSEMBLE",
+        "E15": "ENSEMBLE",
+    }
     for card_id, operator in expected.items():
         response = provider.generate(
             role="proposal",

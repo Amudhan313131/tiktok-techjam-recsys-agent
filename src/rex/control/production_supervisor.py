@@ -51,6 +51,7 @@ from rex.store.repository import ExperimentRepository, RepositoryError
 
 
 CARD_CODE_PATHS: dict[str, tuple[str, ...]] = {
+    "E15": ("src/rex/models/experimental/context_fm.py",),
     "E01": ("src/rex/models/experimental/pair_rank_fm.py",),
     "E02": ("src/rex/models/experimental/tree_history.py",),
     "E03": ("src/rex/models/experimental/tree_history.py",),
@@ -60,6 +61,63 @@ CARD_CODE_PATHS: dict[str, tuple[str, ...]] = {
     "E07": ("src/rex/models/experimental/tree_history.py",),
     "E08": ("src/rex/models/experimental/tree_history.py",),
     "E10": (),
+}
+CARD_READONLY_CONTEXT_PATHS: dict[str, tuple[str, ...]] = {
+    "E15": (
+        "src/rex/models/context_fm.py",
+        "src/rex/models/official_fm.py",
+        "src/rex/data/views.py",
+    ),
+    "E01": (
+        "src/rex/models/rank_fm.py",
+        "src/rex/models/official_fm.py",
+        "src/rex/losses/ranking.py",
+        "src/rex/data/views.py",
+    ),
+    "E02": (
+        "src/rex/models/tree_ranker.py",
+        "src/rex/features/recipes.py",
+        "src/rex/data/views.py",
+    ),
+    "E03": (
+        "src/rex/models/tree_ranker.py",
+        "src/rex/features/recipes.py",
+        "src/rex/features/history_summaries.py",
+        "src/rex/data/views.py",
+    ),
+    "E04": (
+        "src/rex/models/rank_fm.py",
+        "src/rex/losses/ranking.py",
+        "src/rex/data/views.py",
+    ),
+    "E05": (
+        "src/rex/models/rank_fm.py",
+        "src/rex/losses/ranking.py",
+        "src/rex/data/views.py",
+    ),
+    "E06": (
+        "src/rex/models/tree_ranker.py",
+        "src/rex/features/recipes.py",
+        "src/rex/features/repeat_exposure.py",
+        "src/rex/data/views.py",
+    ),
+    "E07": (
+        "src/rex/models/tree_ranker.py",
+        "src/rex/features/recipes.py",
+        "src/rex/features/history_summaries.py",
+        "src/rex/data/views.py",
+    ),
+    "E08": (
+        "src/rex/models/tree_ranker.py",
+        "src/rex/features/recipes.py",
+        "src/rex/features/recency.py",
+        "src/rex/data/views.py",
+    ),
+    "E10": (
+        "src/rex/models/shadow_blend.py",
+        "src/rex/models/ensemble.py",
+        "src/rex/data/views.py",
+    ),
 }
 SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
@@ -118,7 +176,18 @@ class ProductionRunConfig:
                 or "feature_recipe" not in value
             ):
                 raise ValueError(f"method card {card_id} needs config and feature_recipe")
-            supported_cards = {"E01", "E02", "E03", "E04", "E05", "E06", "E07", "E08", "E10"}
+            supported_cards = {
+                "E01",
+                "E02",
+                "E03",
+                "E04",
+                "E05",
+                "E06",
+                "E07",
+                "E08",
+                "E10",
+                "E15",
+            }
             if card_id not in supported_cards:
                 raise ValueError(
                     f"method card {card_id} is unsupported or deferred in this implementation phase"
@@ -322,6 +391,7 @@ class ProductionFixedProvider:
             card_id = str(card["card_id"])
             detail = METHOD_CARD_REFERENCES[card_id]
             operator = {
+                "E15": "ENSEMBLE",
                 "E01": "LOSS",
                 "E02": "HYPERPARAMETER",
                 "E03": "FEATURE",
@@ -1045,6 +1115,7 @@ class ProductionAutopilot:
         except ValueError:
             binding_path = str(self.config.method_cards[card.card_id].config_path)
         allowed_files = [binding_path, *CARD_CODE_PATHS.get(card.card_id, ())]
+        read_only_context_files = list(CARD_READONLY_CONTEXT_PATHS.get(card.card_id, ()))
         timeout = self.budget.default_attempt_timeout_seconds
         return {
             "prior_experiments": prior_experiments,
@@ -1052,6 +1123,7 @@ class ProductionAutopilot:
             "prediction_correlations": prediction_correlations[-30:],
             "failure_and_repair_history": failures[:30],
             "allowed_files": allowed_files,
+            "read_only_context_files": read_only_context_files,
             "resource_estimate": {
                 "cheap_seconds": timeout,
                 "full_seconds": timeout * 3,

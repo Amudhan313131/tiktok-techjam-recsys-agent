@@ -14,6 +14,7 @@ from rex.data.manifest import repo_root
 def test_shipped_production_config_is_runnable_and_excludes_unsupported_cards() -> None:
     config = ProductionRunConfig.load(repo_root() / "configs/run/production.yaml")
     assert config.scientific_execution_enabled
+    assert config.method_cards["E15"].feature_recipe == "control"
     assert "E09" not in config.method_cards
     assert not ({"E11", "E12", "E13", "E14"} & set(config.method_cards))
     assert config.method_cards["E10"].feature_recipe == "shadow_blend"
@@ -57,7 +58,7 @@ def test_production_loader_honors_docker_capability_roots(
 
 
 def test_proposal_context_contains_versioned_method_card_and_only_evidence_ids() -> None:
-    card = SearchPolicy().cards[1]
+    card = next(item for item in SearchPolicy().cards if item.card_id == "E01")
     context = SearchPolicy.proposal_context(
         card,
         evidence_artifact_ids=["evidence-b", "evidence-a"],
