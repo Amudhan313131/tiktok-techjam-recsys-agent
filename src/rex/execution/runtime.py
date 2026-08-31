@@ -109,8 +109,11 @@ class ExecutionSpec:
     lease_path: Path
     user: str = "10001:10001"
     tmpfs_size_bytes: int = 256 * 1024 * 1024
-    output_bytes_limit: int = 512 * 1024 * 1024
-    file_size_limit_bytes: int = 256 * 1024 * 1024
+    # Six workers may run concurrently (three folds, candidate and control).
+    # Reserve enough for the model artifacts we actually emit without consuming
+    # 3 GiB in sparse reservations before useful work can start.
+    output_bytes_limit: int = 128 * 1024 * 1024
+    file_size_limit_bytes: int = 64 * 1024 * 1024
     log_bytes_limit: int = 8 * 1024 * 1024
     minimum_free_space_bytes: int = 2 * 1024 * 1024 * 1024
 

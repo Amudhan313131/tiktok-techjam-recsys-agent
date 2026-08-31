@@ -634,6 +634,17 @@ def test_runtime_verifies_bounded_logs_fsize_and_resource_labels(tmp_path: Path)
         )
 
 
+def test_default_output_reservations_fit_six_parallel_research_workers(tmp_path: Path) -> None:
+    _runtime_instance, _client, source, _data, runs = _runtime(tmp_path)
+
+    specification = _spec(source, runs)
+
+    assert specification.output_bytes_limit == 128 * 1024 * 1024
+    assert specification.file_size_limit_bytes == 64 * 1024 * 1024
+    assert 6 * specification.output_bytes_limit <= 768 * 1024 * 1024
+    assert specification.file_size_limit_bytes <= specification.output_bytes_limit
+
+
 def test_runtime_truncates_untrusted_client_logs_to_explicit_cap(tmp_path: Path) -> None:
     runtime, client, source, _data, runs = _runtime(tmp_path)
     client.stdout = b"a" * 10_000
