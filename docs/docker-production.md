@@ -1,112 +1,131 @@
-# Docker production runtime
+# Docker production guide
 
-Docker is the only supported production runtime for REX on Windows, macOS, and
-Linux. Native Python remains useful for development and for reading historical
-evidence, but it is not a production-isolation promise. A Docker failure stops
-the run; REX never falls back to an unsandboxed host process.
+Docker is the supported production runtime for REX on macOS, Windows, and
+Linux. It keeps generated model code away from your normal computer
+environment and makes every experiment reproducible.
 
-## Trust boundary
+If you only want to run REX, start with the shorter
+[four-step setup guide](how-to-run.md). This page explains the available modes,
+the files Docker can access, and the production safety rules.
 
-The versioned image is used in two roles:
+## The simple version
 
-- The trusted controller selects ideas, asks an authorized LLM for constrained
-  patches, records evidence, and controls Docker. It alone receives the Docker
-  socket and optional LLM credentials.
-- Every operation that runs candidate code happens in a fresh worker. A worker
-  has no network, API key, LLM authentication, Docker socket, added Linux
-  capabilities, or privilege escalation. Its root filesystem and exact inputs
-  are read-only. Only its experiment-specific result directory is writable.
+1. Pull a clean, committed copy of the repository.
+2. Put KuaiRand-Pure under `data/KuaiRand-Pure/data/`.
+3. Log in with Codex or Claude, or explicitly provide an OpenAI API key.
+4. Build `rex:local` and start the Docker rehearsal command.
 
-The Docker socket grants host-level control and is therefore restricted to the
-trusted controller. Never add it to the `worker` service, run a worker as
-privileged, or weaken its security options. Candidate code must never run in
-the controller. The launchers map the native-Linux socket group and account for
-Docker Desktop's root-group socket presentation without making the controller
-process root.
+The exact copy-and-paste commands are in [How to run REX with
+Docker](how-to-run.md).
 
-The controller presents three stable paths to REX:
+## Which command should I use?
 
-| Container path | Access | Purpose |
+Use `scripts/run_docker_rehearsal.py` for the complete benchmark-ready dress
+rehearsal. It performs setup checks, runs the validation autopilot, injects one
+controlled failure, proves recovery, and seals the final evidence.
+
+Use `scripts/rex` only when you need an individual low-level command such as
+`doctor`, `run`, `status`, or `report`. Windows PowerShell users can use
+`scripts/rex.ps1`. The complete rehearsal is easiest from macOS/Linux or
+Windows WSL2.
+
+## Choose the researcher
+
+| Mode | What you need | Use for the clean rehearsal? |
 |---|---|---|
-| `/source` | read-only | clean, committed source revision |
-| `/data` | read-only | verified KuaiRand inputs |
-| `/runs` | read/write | worktrees, leases, logs, models, and reports |
+| `codex_cli` | A completed Codex login in `~/.codex` | Yes |
+| `claude_cli` | A completed Claude login in `~/.claude` | Yes |
+| `openai_api` | `OPENAI_API_KEY` and `OPENAI_MODEL`; paid calls are explicitly authorized | Yes |
+| `auto` | One or both local CLI logins; optional authorized API fallback | Yes |
+| `fixed` | No LLM login | No; it is for the deterministic method queue, not live R3 research |
 
-When it creates a sibling worker, REX resolves these paths through the Docker
-daemon's controller-container inspection. Requests outside an approved root,
-including traversal and symlink escapes, fail closed.
+Explicit modes never silently switch to another provider. The LLM proposes and
+diagnoses experiments; the FM or LightGBM model is what learns ranking patterns
+and produces predictions.
+
+The Docker image already contains the pinned Codex and Claude CLI programs.
+Your host login directory is mounted read-only so the trusted controller can
+authenticate. It is never given to candidate workers.
 
 ## Build the image
 
-Requirements are separately resolved for Linux amd64 and arm64 and every wheel
-hash is locked. Regenerate them only when `requirements-linux.in` or its pinned
-inputs change:
+The easiest build command is:
 
 ```bash
-scripts/lock_linux.sh
+scripts/build_docker.sh --tag rex:local
 ```
 
-The production build helper accepts only one architecture per invocation so
-the image can record the exact architecture-specific lock hash:
+The script detects the current Docker architecture. You may also choose it
+explicitly:
 
 ```bash
 scripts/build_docker.sh --platform linux/amd64 --tag rex:local
-# Apple Silicon or ARM Linux:
 scripts/build_docker.sh --platform linux/arm64 --tag rex:local
 ```
 
-It refuses a dirty checkout. The image records the Git revision, dependency
-lock, `pyproject.toml`, Starter Kit manifest, architecture, pinned Python base
-digest, fixed Debian snapshot, and pinned Codex/Claude CLI versions. The Docker
-CLI archive itself is also checked against an architecture-specific SHA-256
-before installation.
+The build refuses a dirty checkout. The resulting image records the exact Git
+commit, platform, Python base image, dependency lock, project configuration,
+Starter Kit identity, and bundled CLI versions. Production workers use the
+immutable image ID, even if you supplied a convenient local tag.
 
-Release automation builds both architectures. Publish each architecture by
-digest, then create a multi-platform manifest in the registry; production runs
-must use the immutable digest, not only a mutable tag.
+## What Docker can access
 
-## Configure mounts and authorization
+| Container path | Access | Contains |
+|---|---|---|
+| `/source` | Read-only | The clean, committed repository |
+| `/data` | Read-only | Verified KuaiRand-Pure input files |
+| `/runs` | Read/write | Experiment worktrees, logs, models, reports, and caches |
 
-Copy `.env.example` to the untracked `.env` file and set absolute host paths:
+Always place the run output outside the source repository. Use a new run ID and
+new output directory for every clean rehearsal. Never overwrite or resume a
+sealed failed run.
+
+## What Docker protects
+
+REX uses two kinds of containers:
+
+- The trusted controller selects ideas, calls the authorized LLM, records
+  evidence, and starts workers.
+- A fresh worker runs each candidate model. It has no network, LLM credentials,
+  API key, Docker socket, privilege escalation, or writable source/data mount.
+
+Workers are non-root, resource-limited, and read-only except for their exact
+experiment result directory. A timeout, out-of-memory result, invalid metric,
+corrupt artifact, or row-alignment failure is recorded and cannot replace the
+previous validation champion.
+
+The Docker socket is available only to the trusted controller because it can
+control host containers. Never mount it into a worker, enable privileged mode,
+or run candidate code in the controller.
+
+## Secrets and login files
+
+Never put a real API key in the Dockerfile, Compose file, source tree, report,
+or model artifact. API mode passes `OPENAI_API_KEY` and `OPENAI_MODEL` only to
+the trusted controller.
+
+Codex and Claude login directories are mounted read-only. Required files are
+copied into the controller's temporary private filesystem so normal CLI state
+updates do not change the host login directory.
+
+The optional `.env` workflow is intended for the lower-level `scripts/rex`
+launcher. Copy `.env.example` to an untracked `.env` and use absolute paths:
 
 ```text
 REX_SOURCE_DIR=/absolute/path/to/repository
 REX_DATA_DIR=/absolute/path/to/KuaiRand-Pure/data
 REX_RUNS_DIR=/absolute/path/to/rex-runs
 REX_WORKER_IMAGE=rex:local
-REX_EXPECTED_IMAGE_DIGEST=sha256:...
+REX_CODEX_HOME=/absolute/path/to/.codex
+REX_CLAUDE_HOME=/absolute/path/to/.claude
 ```
 
-The launchers resolve `REX_EXPECTED_IMAGE_DIGEST` from the locally present
-image ID when it is omitted. Supplying it explicitly is recommended for a
-released registry image; either way the controller refuses to start unless it
-has an immutable `sha256:` identity. They also replace a mutable local tag with
-that image ID before worker creation. When using Compose directly, set
-`REX_WORKER_IMAGE` itself to an immutable image ID or `name@sha256:` reference.
+The four-step guide does not require an `.env` file.
 
-On Windows, use forward-slash paths such as
-`C:/Users/me/project/data/KuaiRand-Pure/data`. All three directories must be
-shared with Docker Desktop. The supported container paths remain `/source`,
-`/data`, and `/runs` on every host.
+## Low-level commands
 
-Three researcher routes are available:
-
-- `fixed` needs no credentials and consumes no LLM tokens.
-- `codex_cli` or `claude_cli` uses the pinned CLI in the image. Set
-  `REX_CODEX_HOME` or `REX_CLAUDE_HOME` to the authenticated host directory.
-  It is mounted read-only at a controller-only authentication path. The
-  entrypoint copies only the required files into private tmpfs so the CLI can
-  update ephemeral state without modifying the host credential directory.
-- `openai_api` receives `OPENAI_API_KEY` and `OPENAI_MODEL` in the controller
-  only and still requires REX's explicit paid-API authorization flag.
-
-Never put a real key in the Dockerfile, Compose file, image, source tree, run
-report, or model artifact. The checked-in `.env.example` intentionally contains
-only empty placeholders.
-
-## Cross-platform commands
-
-macOS and Linux:
+The complete Docker rehearsal runs these checks automatically. When diagnosing
+setup separately, macOS, Linux, and WSL users can run:
 
 ```bash
 scripts/rex build
@@ -114,7 +133,7 @@ scripts/rex doctor --config configs/run/production.yaml --tree --llm fixed
 scripts/rex run --config configs/run/production.yaml --llm fixed
 ```
 
-Windows PowerShell:
+Windows PowerShell equivalents are:
 
 ```powershell
 scripts/rex.ps1 build
@@ -122,47 +141,39 @@ scripts/rex.ps1 doctor --config configs/run/production.yaml --tree --llm fixed
 scripts/rex.ps1 run --config configs/run/production.yaml --llm fixed
 ```
 
-The launchers only prepare portable metadata and wrap the same Compose
-commands; Compose remains the runtime on every platform. If invoking Compose
-directly, export the Git and file-hash build arguments shown in `compose.yaml`,
-build from a clean checkout, and set both `REX_WORKER_IMAGE` and
-`REX_EXPECTED_IMAGE_DIGEST` to the immutable built identity before `compose
-run`. The launchers perform those error-prone metadata steps automatically.
+For a local CLI, replace `fixed` with `codex_cli` or `claude_cli` and configure
+the matching home directory. For direct API mode, use `--llm openai_api` with
+`--authorize-paid-api` after setting the two OpenAI environment variables.
 
-For an API-backed run, append `--llm openai_api --authorize-paid-api`. For an
-authenticated local CLI, select `codex_cli` or `claude_cli`. Explicit modes do
-not silently switch providers.
+Run `doctor` after a Docker upgrade, host upgrade, mount change, or image
+change. It checks the image identity, non-root user, read-only filesystem,
+network isolation, credential isolation, write boundaries, resource limits,
+and interrupt/recovery behavior.
 
-## Doctor and production guarantees
+## Cross-platform notes
 
-Run `doctor` before the first paid call and after any Docker, image, mount, or
-host upgrade. The Docker doctor creates a disposable worker and proves the
-expected image and labels, non-root user, read-only root, approved reads,
-protected write denial, exact output write, absent socket and credentials,
-disabled network, resource limits, non-executable temporary storage, and
-interrupt/recovery lifecycle. Any mismatch is fatal.
+- macOS: use Docker Desktop and the normal terminal commands.
+- Linux: use Docker Engine with the Buildx and Compose v2 plugins.
+- Windows: use Docker Desktop with WSL2 for the simplest complete-rehearsal
+  setup. Run the shell commands from the WSL repository checkout.
+- Docker Desktop users must allow Docker to access the source, data, and output
+  directories when prompted.
 
-Each worker follows a create, inspect, persist-lease, start, monitor, collect,
-and remove handshake. Leases bind the exact container ID, daemon, image digest,
-labels, run, experiment, attempt, and request hashes. Recovery never targets a
-container by human-readable name alone. Timeout, out-of-memory, malformed
-results, corrupted artifacts, and alignment failures are recorded without
-replacing the previous champion.
+## Advanced release notes
 
-The Compose `worker` service is under the `internal` profile and exists only as
-a visible policy/smoke-test fixture. Normal users do not start it. The
-controller creates more narrowly mounted, experiment-specific workers.
+REX locks Linux dependencies separately for amd64 and arm64. Regenerate the
+locks only when `requirements-linux.in` or its pinned inputs change:
 
-## Cross-platform release checklist
+```bash
+scripts/lock_linux.sh
+```
 
-CI verifies lock regeneration, Compose rendering, amd64 and arm64 image builds,
-metadata, non-root execution, absence of secrets, and worker-policy structure.
-Before a release, manually run build, Docker doctor, and the fixture crash
-rehearsal on Windows Docker Desktop, Apple Silicon Docker Desktop, and native
-Linux Docker Engine. At least one full scientific queue must reproduce the
-known validation baseline and canonical row identities inside Docker before
-the release image digest is approved.
+A released image should be referenced by an immutable registry digest. CI
+verifies lock regeneration, Compose rendering, both architecture builds,
+metadata, non-root execution, absence of secrets, and worker policy. Before a
+release, maintainers should also run the Docker doctor and recovery rehearsal
+on Windows Docker Desktop, Apple Silicon Docker Desktop, and native Linux.
 
-The older macOS sandbox can remain for one transition release as an explicit
-rollback backend. It is not an automatic fallback and does not change the
-Docker-only production contract.
+Native Python remains useful for development and for reading old evidence, but
+it is not a production isolation guarantee. Docker failures stop production;
+REX does not fall back to an unsandboxed host process.

@@ -4,9 +4,10 @@ REX is a guarded autonomous experiment runner for the KuaiRand-Pure
 `long_view` ranking task. It includes the production validation search, a clean
 one-command dress-rehearsal envelope, and a separately authorized final
 submission path. The small generated-fixture path remains available for fast
-tests. Docker is the supported production runtime on Windows, macOS, and Linux;
-see [`docs/docker-production.md`](docs/docker-production.md) for its trust
-boundary and cross-platform commands.
+tests. Docker is the supported production runtime on Windows, macOS, and Linux.
+New users should start with the copy-and-paste
+[`docs/how-to-run.md`](docs/how-to-run.md) guide. Security design and advanced
+runtime details are in [`docs/docker-production.md`](docs/docker-production.md).
 
 The benchmark contract is in [`docs/task_contract.md`](docs/task_contract.md).
 The exact implemented scope and exclusions are in
@@ -120,19 +121,16 @@ Production startup repeats the baseline evidence gate before search begins.
 
 Production execution uses Docker on Windows, macOS, and Linux. Native Python is
 not a production-isolation promise, and Docker failures fail closed without an
-unsandboxed fallback. Build the pinned Linux image, configure the read-only
-source and data mounts plus the writable run mount, and run the Docker doctor:
+unsandboxed fallback. The beginner guide covers pulling the code, placing the
+dataset, authenticating Codex/Claude/OpenAI, building the image, and starting a
+real run:
 
-```bash
-scripts/rex build
-scripts/rex doctor --config configs/run/production.yaml --tree --llm fixed
-```
+[`docs/how-to-run.md`](docs/how-to-run.md)
 
-Use `scripts/rex.ps1` for the same commands in Windows PowerShell. The trusted
-controller alone receives Docker and optional LLM credentials; every generated
-code path runs in a disposable, networkless, non-root worker with read-only
-inputs and bounded resources. Full setup, image provenance, CLI-auth mounts,
-digest pinning, and security guarantees are documented in
+The trusted controller alone receives Docker and optional LLM credentials;
+every generated code path runs in a disposable, networkless, non-root worker
+with read-only inputs and bounded resources. Full image provenance, mount, and
+security details are documented in
 [`docs/docker-production.md`](docs/docker-production.md).
 
 The project root must also be a **clean committed Git checkout**. This is a
@@ -164,7 +162,7 @@ non-interactive, ephemeral, JSON-schema-constrained settings. It uses the local
 CLI login; it does not attach to this Codex desktop task.
 
 ```bash
-codex login
+codex
 export REX_CODEX_HOME="$HOME/.codex"
 scripts/rex doctor \
   --config configs/run/production.yaml --llm codex_cli
@@ -181,7 +179,7 @@ commands, Chrome, MCP, settings sources, and session persistence are disabled;
 the response must match the requested JSON Schema.
 
 ```bash
-claude auth login
+claude
 export REX_CLAUDE_HOME="$HOME/.claude"
 scripts/rex doctor \
   --config configs/run/production.yaml --llm claude_cli
@@ -263,12 +261,14 @@ python3 scripts/run_docker_rehearsal.py start \
   --output-dir /absolute/path/to/rex-docker-r3 \
   --run-id rex-docker-r3 \
   --image rex:local \
-  --llm fixed
+  --llm codex_cli \
+  --codex-home "$HOME/.codex"
 ```
 
-Use `--llm codex_cli --codex-home "$HOME/.codex"`,
-`--llm claude_cli --claude-home "$HOME/.claude"`, or explicitly authorized
-API mode. The source must be clean and committed, and the image label must
+Use `--llm claude_cli --claude-home "$HOME/.claude"` for Claude, or `--llm
+openai_api` after setting `OPENAI_API_KEY` and `OPENAI_MODEL`. The clean R3
+rehearsal requires a live researcher; `fixed` is only for the deterministic
+method queue. The source must be clean and committed, and the image label must
 record that exact commit. Status is read-only:
 
 ```bash
