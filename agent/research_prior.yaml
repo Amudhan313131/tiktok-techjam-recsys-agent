@@ -1,0 +1,117 @@
+schema_version: rex.direct-research-prior.v1
+benchmark: KuaiRand-Pure
+selection_policy: shadow_only
+official_validation_used: false
+test_scored: false
+generated_from_dirty_worktree: true
+note: >-
+  These are screening priors for search ordering, not promotion evidence. Every
+  autonomous run must reproduce a candidate in its own immutable image before
+  it can be supported or selected.
+experiments:
+  E16:
+    rung: cheap
+    mean_primary_delta: 0.0005956186779224604
+    positive_folds: 1
+    folds_evaluated: 1
+    report_sha256: f57f6f14b39c840297017051425403ce9a34a2aba23a1c0cd6519440f4367bcf
+  E17:
+    rung: cheap
+    mean_primary_delta: 0.00025847817494140113
+    positive_folds: 1
+    folds_evaluated: 1
+    report_sha256: 109ad61f5d7152b7d985df8e3789aaafcfc3d7afbda31c0fe820c57f092bf798
+  E18:
+    rung: cheap
+    mean_primary_delta: -0.004053701847152591
+    positive_folds: 0
+    folds_evaluated: 1
+    report_sha256: 109ad61f5d7152b7d985df8e3789aaafcfc3d7afbda31c0fe820c57f092bf798
+  E19:
+    rung: full
+    mean_primary_delta: 0.001280815023135114
+    positive_folds: 3
+    folds_evaluated: 3
+    component_metrics_all_non_regressing: true
+    report_sha256: f35dfb61e8db90ea22afda32766ea9186c7226b0b4ce94434076df4afa568322
+  E20:
+    rung: full
+    mean_primary_delta: 0.00007343814960851051
+    positive_folds: 2
+    folds_evaluated: 3
+    component_metrics_all_non_regressing: false
+    report_sha256: e073ebba07ca674268f527db0ea3f0303a7e111c8a128d7974907094080aec18
+  E21:
+    rung: cheap
+    mean_primary_delta: -0.000005467529837321905
+    positive_folds: 0
+    folds_evaluated: 1
+    report_sha256: f270a485e25b8e780087ccc5831d47f7ac44de288c50fc0107ef377ab9fc943f
+  E22:
+    rung: cheap
+    mean_primary_delta: -0.004947032999234269
+    positive_folds: 0
+    folds_evaluated: 1
+    report_sha256: f270a485e25b8e780087ccc5831d47f7ac44de288c50fc0107ef377ab9fc943f
+  E23:
+    rung: cheap
+    mean_primary_delta: -0.0014573951502256932
+    positive_folds: 0
+    folds_evaluated: 1
+    report_sha256: f270a485e25b8e780087ccc5831d47f7ac44de288c50fc0107ef377ab9fc943f
+  E24:
+    rung: cheap
+    mean_primary_delta: 0.011132120227001163
+    positive_folds: 1
+    folds_evaluated: 1
+    note: improvement is against the weak legacy tree control; absolute score trails FM
+    report_sha256: f270a485e25b8e780087ccc5831d47f7ac44de288c50fc0107ef377ab9fc943f
+  E25:
+    rung: full_shadow_selection
+    mean_primary_delta: 0.0005097745825476
+    positive_folds: 2
+    folds_evaluated: 3
+    component_metrics_all_non_regressing: false
+    weights:
+      E19: 0.7
+      E27: 0.3
+    note: >-
+      Shadow-only regularized blend screen using aligned dirty-worktree E19 and E27
+      predictions. The immutable autonomous run must reselect its own weight.
+    report_sha256: 0f90c67cc5f621361969bac677f77d5cb2d91953ff4b60c29b301d4111984546
+  E26:
+    rung: cheap
+    mean_primary_delta: -0.000535726721064167
+    positive_folds: 0
+    folds_evaluated: 1
+    report_sha256: 72d20b7fd95521dfed1a17893fa7a20118d6dc3b7d7946c783689768c945b150
+  E27:
+    rung: full
+    mean_primary_delta: 0.0006661705830654693
+    positive_folds: 3
+    folds_evaluated: 3
+    component_metrics_all_non_regressing: true
+    note: >-
+      Full user-plus-item metadata improved over the item-tree parent on all folds;
+      the clean autonomous card compares the complete block with the core tree.
+    report_sha256: e5520abcb7e33728c2cd97833ebb00a9796615919de835a1fca2d4b561596e5e
+  E28:
+    rung: full
+    mean_primary_delta: 0.00009972220260208904
+    positive_folds: 2
+    folds_evaluated: 3
+    component_metrics_all_non_regressing: false
+    report_sha256: e5520abcb7e33728c2cd97833ebb00a9796615919de835a1fca2d4b561596e5e
+  E29:
+    rung: cheap
+    mean_primary_delta: -0.0009737663413504904
+    positive_folds: 0
+    folds_evaluated: 1
+    report_sha256: 8a3d83e376e60cf5f1dbb6c0fbd0c97429a54098fe137310c6a36cbf13d45dd1
+  E30:
+    rung: full
+    mean_primary_delta: -0.0006656783123289248
+    positive_folds: 0
+    folds_evaluated: 3
+    component_metrics_all_non_regressing: false
+    report_sha256: c7e539a602591ee892cc303906b8168553d52e4142635e38d0843b5036d2cf0c

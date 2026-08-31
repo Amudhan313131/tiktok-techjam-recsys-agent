@@ -1,14 +1,16 @@
-# Current Phase: Clean Rehearsal and Submission Release Path
+# Current Phase: Larger-Margin Research and Release Path
 
-Date: 2026-08-30
+Date: 2026-08-31
 
-Status: the validation search, clean R3 envelope, and final-submission state
-machine are implemented. Independent data/baseline evidence is recorded; the
-fixed-provider production search reached its genuine convergence stop on real
-validation data. No experimental candidate beat the selected FM baseline. A
-new R3 invocation and any final test prediction remain separate runtime actions
-whose results must be reported from their emitted evidence, not assumed from
-implementation alone.
+Status: the validation search, clean Docker R3 envelope, final-submission state
+machine, and larger-margin E16-E30 research block are implemented. The earlier
+three-card production run remains valid historical evidence, but it is not a
+description of the current queue. Direct shadow research now identifies E19
+inference-safe item metadata as the strongest new treatment: seed-0 mean primary
+delta `+0.001281`, positive on A/B/C. This is discovery evidence from an
+in-progress source tree, not a new official-validation champion. A clean
+committed Docker run, multi-seed confirmation, the single locked official
+validation, and any authorized test prediction remain separate runtime actions.
 
 ## Scope boundary
 
@@ -77,6 +79,12 @@ identities.
 
 Implemented recipes and controls include:
 
+- train-fitted static item and coarse user metadata with unknown handling;
+- train-fitted `user×tab` and `video×tab` categorical crosses;
+- strict `time_ms` ordering with globally unique source-row tie breakers;
+- candidate-conditioned user-author/user-video support and recency summaries;
+- strictly historical click/like/follow/hate/long-view aggregates from a
+  train/validation-only feedback vault;
 - point-in-time video statistics and a no-stat tree control;
 - history length / simple candidate history;
 - repeat exposure, prior outcome, and elapsed time;
@@ -85,9 +93,13 @@ Implemented recipes and controls include:
 - control recipes that preserve the same pipeline while zeroing the intended
   treatment feature.
 
-Tags are not silently synthesized when the safe source schema cannot support
-them. A method must be evaluated using the actually materialized columns, not a
-claim in its prose description.
+Equal-timestamp events are emitted before any state update, and apply views use
+state frozen at the training cutoff. The month-level outcome-statistics side
+table is forbidden. Tags are not silently synthesized when the safe source
+schema cannot support them. A method must be evaluated using the actually
+materialized columns, not a claim in its prose description. The detailed data
+capabilities, method cards, commands, and direct evidence are in
+[`larger_margin_research.md`](larger_margin_research.md).
 
 ## 3. Connected scientific supervisor
 
@@ -100,10 +112,10 @@ eligible method card
   -> isolated worktree and safety gates
   -> cheap fold A
   -> full shadow A/B/C when promising
-  -> official validation when promising
   -> diagnostics and evidence-bound diagnosis
-  -> validation champion update or rejection
-  -> next eligible card
+  -> next eligible card or lock one finalist
+  -> one atomic official-validation evaluation
+  -> validation champion update or rejection and seal
 ```
 
 The fixed provider executes versioned configs without pretending an LLM wrote a
@@ -112,14 +124,15 @@ their patch authority is limited to the card-specific experimental allowlist.
 Each effective config is copied into durable run evidence and checked by hash so
 resume does not depend on a worktree that may have been cleaned.
 
-Method cards E01–E08, E10, and E15 are wired to executable adapters. E15 is
-evaluated first and compares a five-initialization context-aware FM ensemble
-against a matched one-initialization control. It consumes only sanitized
-hour-of-day and randomized-exposure fields and saves every member in the
-immutable bundle. E04, E05, and
-later history/blend cards remain prerequisite-gated, so unsupported branches do
-not consume experiments. E09 and neural E11–E13 are not selectable in this
-phase. E14 confirmation remains deferred.
+Method cards E01–E08, E10, E15, and the larger-margin E16-E30 block are wired to
+executable adapters. E16 isolates one versus five members with mean aggregation fixed; E17/E18 test
+one context cross at a time; E19/E20 add item then user metadata; E21 tests
+field-pair weights; E22/E23 add strictly point-in-time history; E24 repairs the
+tree control; E25 derives a shadow-only blend from two supported families;
+E26/E27/E29 test pointwise metadata trees; E28 tests categorical recency buckets;
+and E30 tests FM latent capacity on the item-metadata branch.
+Prerequisite-gated cards do not consume experiments. E09 and neural E11–E13 are
+not selectable in this phase. E14 confirmation remains deferred.
 
 The trusted comparison gates enforce:
 
@@ -135,16 +148,22 @@ The trusted comparison gates enforce:
 Exactly one convergence transaction is counted for each terminal hypothesis,
 including a final failed candidate. A positive delta smaller than or equal to
 epsilon can become the best recorded validation score while still advancing the
-non-improvement streak. The loop stops on queue exhaustion, patience 3, the
-50-hypothesis/evaluation caps, or the wall-clock reserve.
+non-improvement streak. Patience 3 cannot stop the current search until at least
+six valid families have been evaluated. The loop otherwise stops on queue
+exhaustion, the 50-hypothesis/evaluation caps, or the wall-clock reserve. The
+official-validation budget contains one durable token: discovery first locks a
+finalist, then one atomic transition evaluates it and seals that result rather
+than reopening model selection.
 
 ## 4. Prediction model paths
 
 The production worker can execute:
 
 - pointwise FM controls;
+- context FM ensembles with explicit member-level evidence;
+- field-weighted FM with a matched same-field FM control;
 - experimental same-user pairwise FM variants;
-- deterministic grouped LightGBM LambdaRank variants;
+- deterministic grouped, regularized LightGBM ranking variants;
 - a two-branch pairwise/tree blend whose weights are selected using shadow
   evidence only.
 
@@ -156,13 +175,12 @@ results.
 
 ## 5. Production execution boundary
 
-Production model and candidate-gate commands run through a fail-closed sandbox.
-On the current implementation this is the macOS `/usr/bin/sandbox-exec`
-backend. It denies network access, removes credentials and the real home
-directory from the child environment, grants only explicit read/write roots,
-applies resource limits, and terminates the complete process group on timeout or
-interruption. Unsupported platforms cannot silently fall back to unsandboxed
-production execution.
+Production runs use the fail-closed Docker boundary on macOS, Windows, and
+Linux. Candidate workers are networkless, non-root, credential-free, and
+receive only explicit read/write mounts plus resource limits. Native macOS
+`sandbox-exec` remains a legacy rollback/testing path, not the cross-platform
+production promise. An unavailable Docker boundary cannot silently fall back to
+unsandboxed production execution.
 
 The root project must be a clean committed Git checkout. Candidate worktrees are
 created at exact commits; the supervisor rejects dirty worktrees, wrong commits,
@@ -267,64 +285,51 @@ Run the fault rehearsals:
 ```
 
 Phase acceptance requires the complete static and test suites, the opt-in real
-data contract test, the production sandbox doctor on macOS, R1/R2 passing, and a
-clean committed snapshot before real search. Those gates and the fixed-provider
-production run have now completed. The observed search did not establish a
-model improvement, so the baseline remains the truthful validation winner.
+data contract test, the Docker production doctor, R1/R2 passing, and a clean
+committed snapshot before real search. Direct development evidence is not a
+replacement for those gates. E19 is the current shadow-fold finalist candidate,
+but the previous sealed model remains the truthful validation winner until a
+clean autonomous run, multi-seed confirmation, and the single official
+validation establish otherwise.
 
-## 10. Clean one-command R3 envelope
+## 10. Clean one-command Docker R3 envelope
 
-`scripts/run_clean_rehearsal.py start` is the outer trust boundary for the
-release rehearsal. Its deadline begins before cloning or installing anything.
-It then:
+`scripts/run_docker_rehearsal.py start` is the supported cross-platform outer
+trust boundary. Its deadline begins before setup, and the launcher:
 
-1. requires a clean committed source and resolves one exact commit;
-2. creates a detached clone outside the operator repository and protects its
-   tracked source files from mutation;
-3. creates a fresh Python environment and installs the transitive,
-   platform-specific hash lock using binary wheels only;
-4. records Python, pip, platform, dependency inventory, source-tree, Starter
-   Kit, evaluator, and raw-data identities;
-5. bootstraps sanitized views and proves the test view has 170,588 rows and no
-   target;
-6. runs the LightGBM, sandbox, and explicitly selected live-provider doctors;
-7. starts one production run with a durable external deadline;
-8. preserves and retries an inapplicable agent diff at most twice, and permits
-   the same bounded repairs for syntax, static-gate, and fixture-test failures;
-   rejected patches are rolled back exactly before retry, and at most two
-   same-run coordinator relaunches before training are permitted only when the
-   durable preparation progress token changes;
-9. waits for a worker lease owned by that coordinator, records the exact
-   attempt/checkpoint, and injects one `SIGKILL`;
-10. resumes the same run ID and external deadline;
-11. proves the attempt exists exactly once, counters did not regress or
-    duplicate, and the pre-fault champion remains in durable evidence;
-12. audits the database, artifacts, requests, and command transcripts for any
-    test prediction or scoring work;
-13. recursively revalidates every winning checkpoint member, report artifact,
-    log, recovery file, and status snapshot before sealing the R3 manifest.
+1. requires a clean committed source and an immutable image labeled with that
+   exact commit;
+2. records the source tree, image identity, dependency inventory, Starter Kit,
+   evaluator, and raw-data identities;
+3. bootstraps sanitized views and proves the test view has 170,588 rows and no
+   target or feedback capability;
+4. runs the Docker, LightGBM, and explicitly selected live-provider doctors;
+5. starts one validation-only production run under the external deadline;
+6. injects one controlled controller failure after durable work exists, then
+   resumes the same run ID and proves its champion and counters survived;
+7. audits the database, artifacts, requests, and command transcripts for any
+   test prediction or scoring work; and
+8. recursively revalidates the winning checkpoint, reports, logs, recovery
+   evidence, hashes, source commit, and image digest before sealing the R3
+   manifest.
 
-Full folds are scheduled in canonical A/B/C order through a resource-bounded
-executor. Candidate and control pipelines may overlap, but each pipeline keeps
-fit before predict. The 8-core/16-GB rehearsal profile uses six one-thread,
-2-GB workers so all three fold pairs can execute concurrently without allowing
-LightGBM to multiply its own thread pool.
-
-Cross-run baseline and control caches live outside the clean clone and output.
-Keys cover all scientific identities, entries are locked and atomically
-published, and hits are copied into run-local evidence. Baseline hits replay the
-current official evaluator; control metrics are always recalculated. Corrupt
-entries are quarantined and ordinary training resumes. Cache evidence is part
-of the validation-only audit and final R3 seal.
+Full folds use a resource-bounded executor. Candidate and control pipelines may
+overlap, but each pipeline keeps fit before predict, and evidence is combined in
+canonical A/B/C order. Optional baseline and control caches are keyed by all
+scientific identities, atomically published outside the run, revalidated on
+every hit, and quarantined if corrupt.
 
 The envelope stops through convergence, the 50-hypothesis/evaluation caps, or
 the external deadline. The six hours are a ceiling, not a target duration. The
 success manifest is removed if contract validation or evidence sealing crosses
 the deadline.
 
-The launcher writes local hourly snapshots without an LLM call. A scheduled
-Codex heartbeat may read `status/latest.json` once per hour and report a compact
-summary; it must never edit source, restart a process, or advance an experiment.
+The launcher writes local snapshots without an LLM call. A scheduled monitor
+may run `scripts/run_docker_rehearsal.py status --output-dir OUTPUT` every 30
+minutes and report a compact summary; it must never edit source, rebuild the
+image, restart a healthy process, or advance an experiment. The previous
+`run_clean_rehearsal.py` path remains a legacy native rollback rehearsal, not
+the production isolation boundary.
 
 ## 11. Final submission state machine
 

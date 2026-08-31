@@ -24,28 +24,29 @@ select one eligible method card
   -> compile and test the candidate in its exact Git worktree
   -> run a cheap temporal shadow experiment
   -> run all three shadow folds only if the cheap gate passes
-  -> run the trusted official evaluator on validation only if the full gate passes
-  -> record metrics, resources, hashes, diagnostics, and failures
-  -> keep the validation champion or reject the candidate
+  -> compare uncertainty and temporal support across discovery candidates
   -> obtain an evidence-bound diagnosis
-  -> continue with the next eligible method card
+  -> continue with the next eligible method card or lock one finalist
+  -> consume one atomic official-validation evaluation for that finalist
+  -> record metrics, resources, hashes, diagnostics, and failures
+  -> seal the validation champion or preserve the prior champion
 ```
 
-The fixed queue can run without an LLM. Its first candidate is a matched
-one-member-versus-five-member context-aware FM comparison using the
-inference-safe hour and randomized-exposure fields already present in every
-official log row. The remaining cards cover pairwise FM, grouped LightGBM
-LambdaRank and its no-stat control, candidate history, delta-nDCG weighting,
-BCE stabilization, repeat exposure, user-author/duration affinity, recency,
-and a shadow-selected two-branch blend.
-Each comparison is bound to a control so the intended scientific change is
-isolated.
+The fixed queue can run without an LLM. In addition to the earlier FM, history,
+and tree controls, its larger-margin block covers ensemble isolation,
+`user×tab` and `video×tab` crosses, inference-safe item and user metadata,
+field-weighted FM, candidate-conditioned recency, strictly historical feedback,
+a regularized tree ranker, and a shadow-OOF blend. Each comparison is bound to
+a control so the intended scientific change is isolated. The complete method
+cards and current direct evidence are documented in
+[`docs/larger_margin_research.md`](docs/larger_margin_research.md).
 
 The loop stops at the first applicable condition: the method queue is
-exhausted, three consecutive transactions fail to improve by the configured
-0.002 threshold, 50 hypotheses/evaluations are consumed, or the configured
-six-hour upper bound reaches its finalization reserve. That upper bound is a
-safety budget, not a requirement to keep running for six hours.
+exhausted, 50 hypotheses/evaluations are consumed, or the configured six-hour
+upper bound reaches its finalization reserve. The three-transaction `0.002`
+epsilon plateau is also available, but cannot stop discovery until at least
+six valid research families have been evaluated. The upper bound is a safety
+budget, not a requirement to keep running for six hours.
 
 Every run is durable in SQLite plus a hash-chained event ledger. Candidate
 code executes from an exact clean Git worktree. Model workers receive only
@@ -73,9 +74,9 @@ The five-seed FM reproduction on validation produced mean primary
 No hidden-test target was loaded or scored. The generated test feature view has
 no target path, and no hidden-test score is claimed.
 
-## Verified production validation search
+## Historical production validation search
 
-The fixed-provider production loop was executed from an isolated clean source
+The earlier fixed-provider production loop was executed from an isolated clean source
 snapshot as run `production-20260830-165853-15087c`. It stopped automatically
 after three non-improving transactions (`epsilon_plateau`) and preserved the
 best FM seed as the validation champion:
@@ -88,20 +89,31 @@ best FM seed as the validation champion:
 | E03 history length, cheap delta | `+0.0005442` | rejected below the `+0.001` gate |
 
 The audit bundle is under
-`runs/production-20260830-165853-15087c/`. No confirmation sweep, hidden-test
-prediction, submission construction, or six-hour dress rehearsal was run.
+`runs/production-20260830-165853-15087c/`. That three-card result is historical;
+the current queue includes the larger-margin E16-E30 block and family-aware
+plateau guard described above. No hidden-test prediction or scoring was run.
 
-## Context-ensemble preflight evidence
+## Current larger-margin development evidence
 
-Before the next clean Docker rehearsal, the new E15 implementation was checked
+The E15 implementation was checked
 on the authorized validation split with the frozen organizer evaluator. The
 five-member mean ensemble reached GAUC `0.6702043`, nDCG@5 `0.5371096`, and
 primary `0.6036570`. That is `+0.0016198` over the strongest reproduced baseline
 seed (`0.6020372`) and `+0.0020570` over the supplied `0.6016` reference. A
 500-sample user bootstrap estimated a 99.6% probability of a positive delta
 over the strongest reproduced seed. These numbers are preflight evidence, not
-a substitute for the clean autonomous Docker run; the rehearsal must reproduce
-and record the result independently.
+a substitute for a clean autonomous Docker run.
+
+The current direct shadow runner subsequently found its strongest transferable
+signal in E19: inference-safe item metadata improved seed-0 primary by a mean
+`+0.001281` over its matched context-FM control and was positive on all three
+temporal folds. E20 user metadata was nearly flat (`+0.000073`) with one
+negative fold; the cross, FwFM, candidate-recency, and multi-feedback treatments
+were weak or rejected in their current forms. These runs did not open official
+validation, were produced from an in-progress source tree, and do not establish
+a new sealed champion or a `0.613` score. See
+[`docs/larger_margin_research.md`](docs/larger_margin_research.md) for the full
+table and interpretation.
 
 ## Development setup
 
@@ -129,11 +141,13 @@ target vault:
 ```
 
 The bootstrap verifies the frozen raw file identities, split dates, row
-alignment, forbidden inference columns, and the absence of a test target. It
-also carries only two additional current-row context values into the sanitized
-views: hour-of-day and randomized-exposure state. Both exist for train,
-validation, and hidden-test feature rows; neither is an outcome label.
-Production startup repeats the baseline evidence gate before search begins.
+alignment, forbidden inference columns, and the absence of a test target. Safe
+views contain prediction-time context, deterministic temporal keys, and
+allow-listed basic user/video metadata. Outcome-derived monthly video
+statistics are explicitly forbidden. Train/validation-only auxiliary feedback
+is stored in a separate vault for strictly historical recipes; no test feedback
+vault is created. Production startup repeats the baseline evidence gate before
+search begins.
 
 ## Production prerequisites
 
