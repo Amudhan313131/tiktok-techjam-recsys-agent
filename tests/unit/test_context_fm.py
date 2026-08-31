@@ -7,7 +7,12 @@ import numpy as np
 import pytest
 
 from rex.data.views import FeatureView, TargetView
-from rex.models.context_fm import ContextCategoricalEncoder, ContextEnsembleFMPlugin
+from rex.models.context_fm import (
+    ContextCategoricalEncoder,
+    ContextEnsembleFMPlugin,
+    load_member_predictions,
+    reconstruct_member_predictions,
+)
 from rex.models.bundle import create_model_bundle, validate_model_bundle
 
 
@@ -47,11 +52,23 @@ def test_context_ensemble_round_trip_is_deterministic(tmp_path: Path) -> None:
     plugin = ContextEnsembleFMPlugin()
     first = plugin.fit(features, targets, config, 7, tmp_path / "first")
     second = plugin.fit(features, targets, config, 7, tmp_path / "second")
-    first_scores = plugin.predict(first, features, config, tmp_path / "predict-first")
+    prediction_root = tmp_path / "predict-first"
+    first_scores = plugin.predict(first, features, config, prediction_root)
     second_scores = plugin.predict(second, features, config, tmp_path / "predict-second")
 
     assert np.array_equal(first_scores, second_scores)
     assert np.isfinite(first_scores).all()
+    member_scores, persisted, evidence = load_member_predictions(prediction_root)
+    assert member_scores.shape == (3, features.rows)
+    assert member_scores.dtype == np.float32
+    assert np.array_equal(first_scores, persisted)
+    assert np.array_equal(first_scores, np.mean(member_scores, axis=0).astype(np.float64))
+    assert np.array_equal(first_scores, reconstruct_member_predictions(member_scores, "mean"))
+    assert evidence["member_names"] == [
+        "model-000.npz",
+        "model-001.npz",
+        "model-002.npz",
+    ]
     training = json.loads((first.parent / "training.json").read_text(encoding="utf-8"))
     assert training["members"] == ["model-000.npz", "model-001.npz", "model-002.npz"]
     bundle_path = create_model_bundle(
@@ -95,3 +112,53 @@ def test_context_ensemble_rejects_unbounded_member_count(tmp_path: Path) -> None
             0,
             tmp_path,
         )
+
+
+def test_context_encoder_audits_constant_and_unknown_fields(tmp_path: Path) -> None:
+    features, targets = _views()
+    arrays = dict(features.arrays)
+    arrays["fx__is_rand"] = np.zeros(features.rows, dtype=np.int8)
+    train = FeatureView(features.path, arrays, features.sha256)
+    plugin = ContextEnsembleFMPlugin()
+    config = {"epochs": 1, "batch_size": 4, "ensemble_members": 1}
+    artifact = plugin.fit(train, targets, config, 0, tmp_path / "model")
+
+    training_audit = json.loads(
+        (artifact.parent / "feature_audit.json").read_text(encoding="utf-8")
+    )
+    is_rand = next(item for item in training_audit["fields"] if item["field"] == "is_rand")
+    assert is_rand == {
+        "constant": True,
+        "constant_value": "0",
+        "field": "is_rand",
+        "unique_count": 1,
+        "unknown_count": 0,
+        "unknown_rate": 0.0,
+    }
+
+    apply_arrays = dict(arrays)
+    apply_arrays["user_id"] = np.asarray(["never-seen"] * features.rows)
+    apply = FeatureView(features.path, apply_arrays, features.sha256)
+    plugin.predict(artifact, apply, config, tmp_path / "prediction")
+    _, _, evidence = load_member_predictions(tmp_path / "prediction")
+    user = next(item for item in evidence["feature_audit"]["fields"] if item["field"] == "user_id")
+    assert user["unknown_count"] == features.rows
+    assert user["unknown_rate"] == 1.0
+
+
+def test_context_encoder_supports_explicit_engineered_categorical_fields() -> None:
+    features, _ = _views()
+    arrays = dict(features.arrays)
+    arrays["fx__user_tab"] = np.arange(features.rows, dtype=np.int32) % 3
+    extended = FeatureView(features.path, arrays, features.sha256)
+    fields = ("user_id", "video_id", "user_tab")
+    encoder = ContextCategoricalEncoder.fit(extended, fields)
+
+    assert encoder.fields == fields
+    assert encoder.transform(extended).shape == (features.rows, 3)
+    assert ContextCategoricalEncoder.from_json(encoder.to_json()).fields == fields
+
+
+def test_member_prediction_reconstruction_rejects_non_finite_values() -> None:
+    with pytest.raises(FloatingPointError, match="NaN or Inf"):
+        reconstruct_member_predictions(np.asarray([[1.0, np.nan]]), "mean")

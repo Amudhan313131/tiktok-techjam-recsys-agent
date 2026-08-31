@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from statistics import NormalDist
 from typing import Any, Iterable
 
 import numpy as np
@@ -136,8 +137,72 @@ def user_bootstrap_delta_ci(
         "high": float(np.quantile(deltas, 1 - alpha / 2)),
         "mean": float(np.mean(deltas)),
         "probability_positive": float(np.mean(deltas > 0)),
+        "std": float(np.std(deltas, ddof=1)) if samples > 1 else 0.0,
+        "users": len(candidate),
         "samples": samples,
     }
+
+
+def pool_bootstrap_delta_evidence(
+    intervals: Iterable[dict[str, float | int]],
+    *,
+    alpha: float = 0.05,
+) -> dict[str, float | int]:
+    """Pool independent temporal-fold bootstrap summaries with support weights.
+
+    The raw folds remain available for inspection; this summary is only a
+    discovery gate.  It never turns official-validation observations into
+    tuning feedback.
+    """
+
+    values = [item for item in intervals if int(item.get("samples", 0)) > 0]
+    if not values:
+        return {
+            "low": 0.0,
+            "high": 0.0,
+            "mean": 0.0,
+            "std": 0.0,
+            "probability_positive": 0.0,
+            "folds": 0,
+            "users": 0,
+        }
+    supports = np.asarray([max(1, int(item.get("users", 1))) for item in values], dtype=float)
+    weights = supports / supports.sum()
+    means = np.asarray([float(item["mean"]) for item in values], dtype=float)
+    stds = np.asarray(
+        [
+            float(item.get("std", 0.0)) or max(0.0, float(item["high"]) - float(item["low"])) / 3.92
+            for item in values
+        ],
+        dtype=float,
+    )
+    mean = float(np.dot(weights, means))
+    std = float(np.sqrt(np.sum(np.square(weights * stds))))
+    normal = NormalDist(mu=mean, sigma=std) if std > 0 else None
+    probability = float(1.0 - normal.cdf(0.0)) if normal is not None else float(mean > 0)
+    critical = NormalDist().inv_cdf(1 - alpha / 2)
+    return {
+        "low": mean - critical * std,
+        "high": mean + critical * std,
+        "mean": mean,
+        "std": std,
+        "probability_positive": probability,
+        "folds": len(values),
+        "users": int(supports.sum()),
+    }
+
+
+def passes_uncertainty_gate(
+    evidence: dict[str, float | int] | None,
+    *,
+    minimum_probability_positive: float,
+) -> bool:
+    """Fail closed when paired uncertainty evidence is absent or malformed."""
+
+    if not evidence or int(evidence.get("samples", evidence.get("folds", 0))) <= 0:
+        return False
+    probability = float(evidence.get("probability_positive", -1.0))
+    return np.isfinite(probability) and probability >= minimum_probability_positive
 
 
 def segment_report(
@@ -151,8 +216,14 @@ def segment_report(
         mask = np.asarray(mask, dtype=bool)
         if mask.shape != labels.shape:
             raise ValueError(f"segment {name!r} has shape {mask.shape}, expected {labels.shape}")
-        metrics = aggregate_user_metrics(per_user_metrics(user_ids[mask], labels[mask], scores[mask]))
-        report[name] = {**metrics, "rows": int(mask.sum()), "users": len(set(user_ids[mask].tolist()))}
+        metrics = aggregate_user_metrics(
+            per_user_metrics(user_ids[mask], labels[mask], scores[mask])
+        )
+        report[name] = {
+            **metrics,
+            "rows": int(mask.sum()),
+            "users": len(set(user_ids[mask].tolist())),
+        }
     return report
 
 
@@ -204,7 +275,10 @@ def standard_segments(
             count=rows,
         )
         author_affinity = np.fromiter(
-            ((user, author) in history_authors for user, author in zip(users, authors, strict=True)),
+            (
+                (user, author) in history_authors
+                for user, author in zip(users, authors, strict=True)
+            ),
             bool,
             count=rows,
         )
@@ -245,7 +319,9 @@ def standard_segments(
         else np.asarray(arrays["duration_ms"], dtype=np.float64)
     )
     duration = np.asarray(arrays["duration_ms"], dtype=np.float64)
-    edges = np.quantile(reference_duration, [0.25, 0.5, 0.75]) if len(reference_duration) else [0, 0, 0]
+    edges = (
+        np.quantile(reference_duration, [0.25, 0.5, 0.75]) if len(reference_duration) else [0, 0, 0]
+    )
     buckets = np.searchsorted(edges, duration, side="right")
     for index in range(4):
         segments[f"duration:q{index + 1}"] = buckets == index
@@ -302,8 +378,14 @@ def compare_diagnostics(
         name: float(candidate_segments[name]["primary"])
         - float(reference_segments[name]["primary"])
         for name in candidate_segments
-        if int(candidate_segments[name]["rows"]) > 0
-        and int(reference_segments[name]["rows"]) > 0
+        if int(candidate_segments[name]["rows"]) > 0 and int(reference_segments[name]["rows"]) > 0
+    }
+    segment_support = {
+        name: {
+            "rows": int(candidate_segments[name]["rows"]),
+            "users": int(candidate_segments[name]["users"]),
+        }
+        for name in segment_deltas
     }
     return {
         "candidate": candidate,
@@ -324,6 +406,7 @@ def compare_diagnostics(
         "candidate_segments": candidate_segments,
         "reference_segments": reference_segments,
         "segment_primary_deltas": segment_deltas,
+        "segment_support": segment_support,
         "segment_wins": sorted(
             name for name, delta in segment_deltas.items() if delta >= segment_threshold
         ),

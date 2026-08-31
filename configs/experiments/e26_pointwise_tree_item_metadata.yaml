@@ -1,0 +1,30 @@
+plugin: rex.models.experimental.tree_classifier:ExperimentalTreeClassifierPlugin
+categorical_fields:
+  - user_id
+  - video_id
+  - author_id
+  - tab
+  - fx__hour
+  - fx__is_rand
+  - meta__video_type
+  - meta__upload_type
+  - meta__tag
+  - meta__music_type
+  - meta__aspect_bucket
+  - meta__upload_age_bucket
+  - meta__duration_consistency_bucket
+numeric_fields: []
+n_estimators: 500
+inner_validation_days: 2
+early_stopping_rounds: 40
+learning_rate: 0.03
+num_leaves: 23
+min_child_samples: 100
+reg_alpha: 0.5
+reg_lambda: 5.0
+feature_fraction: 0.85
+bagging_fraction: 0.9
+cat_smooth: 20.0
+cat_l2: 10.0
+min_data_per_group: 100
+n_jobs: 1

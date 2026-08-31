@@ -1,0 +1,30 @@
+plugin: rex.models.experimental.context_fm:ExperimentalContextEnsembleFMPlugin
+k: 16
+lr: 0.001
+l2: 0.000001
+epochs: 7
+batch_size: 8192
+ensemble_members: 5
+aggregation: mean
+categorical_fields:
+  - user_id
+  - video_id
+  - author_id
+  - tab
+  - dur_bucket
+  - hour
+  - is_rand
+  - meta__video_type
+  - meta__upload_type
+  - meta__tag
+  - meta__music_type
+  - meta__aspect_bucket
+  - meta__upload_age_bucket
+  - meta__duration_consistency_bucket
+  - meta__user_active_degree
+  - meta__is_live_streamer
+  - meta__is_video_author
+  - meta__follow_user_num_range
+  - meta__fans_user_num_range
+  - meta__friend_user_num_range
+  - meta__register_days_range

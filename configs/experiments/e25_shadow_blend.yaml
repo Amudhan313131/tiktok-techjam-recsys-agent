@@ -1,0 +1,28 @@
+plugin: rex.models.shadow_blend:ShadowBlendPlugin
+normalization: percentile
+weights: [0.8, 0.2]
+selection_split: shadow_only
+pair_plugin: rex.models.experimental.context_fm:ExperimentalContextEnsembleFMPlugin
+tree_plugin: rex.models.experimental.tree_history:ExperimentalTreeHistoryPlugin
+pair_config:
+  k: 16
+  lr: 0.001
+  l2: 0.000001
+  epochs: 7
+  batch_size: 8192
+  ensemble_members: 3
+  aggregation: mean
+tree_config:
+  objective: rank_xendcg
+  truncation_level: 8
+  n_estimators: 500
+  early_stopping_rounds: 40
+  inner_validation_days: 2
+  learning_rate: 0.03
+  num_leaves: 23
+  min_child_samples: 100
+  reg_alpha: 0.1
+  reg_lambda: 2.0
+  feature_fraction: 0.9
+  bagging_fraction: 0.9
+  n_jobs: 1

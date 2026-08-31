@@ -1,0 +1,12 @@
+plugin: rex.models.experimental.field_weighted_fm:ExperimentalFieldWeightedFMPlugin
+k: 16
+lr: 0.001
+pair_lr: 0.0005
+l2_embeddings: 0.000001
+l2_linear: 0.000001
+l2_pairs: 0.00001
+pair_weight_clip: 4.0
+epochs: 7
+batch_size: 8192
+ensemble_members: 1
+aggregation: mean

@@ -8,10 +8,16 @@ from rex.evaluation.diagnostics import (
     compare_diagnostics,
     per_user_metrics,
     prediction_correlation,
+    pool_bootstrap_delta_evidence,
+    passes_uncertainty_gate,
     user_bootstrap_ci,
     user_bootstrap_delta_ci,
 )
-from rex.execution.artifacts import ArtifactError, load_prediction_artifact, write_prediction_artifact
+from rex.execution.artifacts import (
+    ArtifactError,
+    load_prediction_artifact,
+    write_prediction_artifact,
+)
 
 
 def test_prediction_roundtrip_and_alignment(feature_target_paths, tmp_path) -> None:
@@ -71,3 +77,35 @@ def test_paired_bootstrap_and_comparison_detect_improvement(feature_target_paths
     )
     assert comparison["delta"]["primary"] > 0
     assert comparison["primary_delta_ci"]["probability_positive"] == 1.0
+    assert comparison["primary_delta_ci"]["std"] >= 0.0
+    assert comparison["segment_support"]["all"]["rows"] == len(labels)
+
+
+def test_temporal_bootstrap_pooling_is_support_weighted_and_gateable() -> None:
+    pooled = pool_bootstrap_delta_evidence(
+        [
+            {
+                "mean": 0.002,
+                "low": 0.001,
+                "high": 0.003,
+                "std": 0.0005,
+                "probability_positive": 0.99,
+                "samples": 500,
+                "users": 100,
+            },
+            {
+                "mean": 0.001,
+                "low": 0.0002,
+                "high": 0.0018,
+                "std": 0.0004,
+                "probability_positive": 0.98,
+                "samples": 500,
+                "users": 200,
+            },
+        ]
+    )
+    assert pooled["folds"] == 2
+    assert pooled["users"] == 300
+    assert 0.001 < pooled["mean"] < 0.002
+    assert passes_uncertainty_gate(pooled, minimum_probability_positive=0.90)
+    assert not passes_uncertainty_gate({}, minimum_probability_positive=0.90)
