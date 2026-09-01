@@ -459,5 +459,35 @@ items remain optional follow-up work and do not reduce the required Pure score:
 - censored watch-time modeling;
 - an optional demo video and richer visualizations.
 
+## Limitations and future improvements
+
+- The final autonomous run converged after three scored iterations. It produced
+  a verified improvement, but did not exhaust the broader feature and model
+  queue.
+- The winning model is a five-member deterministic ensemble, but the complete
+  run was not repeated under several independent outer-run seeds. A longer
+  confirmation study would provide stronger variance estimates.
+- Only KuaiRand-Pure was submitted. KuaiRand-1k and KuaiRand-27k remain
+  unattempted optional benchmarks.
+- The result measures offline GAUC and nDCG@5. It does not establish that the
+  same improvement would transfer unchanged to an online recommendation system.
+
+With more time, we would extend the controlled search across inference-safe
+metadata, temporal history, multi-feedback objectives, sequence models, and
+censored watch-time losses; confirm finalists across additional seeds; and run
+the same sealed workflow on the two bonus benchmarks.
+
+## Team member contributions
+
+- **Thangaraju Sibiraj** (also recorded as **Sibi** in earlier commits): built
+  the production control plane, Docker isolation, scientific experiment and
+  model/feature systems, fault recovery, evidence reporting, documentation,
+  and final submission workflow.
+- **Amudhan**: created the initial autonomous harness, including convergence and
+  budget logic, the first training/orchestration path, schemas, and submission
+  validation.
+
+The Git history is the source of truth for these contribution summaries.
+
 The compatibility entrypoints `training/train.py`, `agent/orchestrator.py`, and
 `scripts/run_agent.sh` remain, while maintained code lives under `src/rex/`.
